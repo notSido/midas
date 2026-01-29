@@ -185,6 +185,15 @@ impl Unpacker {
             // Log execution periodically
             if *count % 100000 == 0 {
                 log::debug!("Executed {} instructions, current: 0x{:x}", *count, addr);
+                
+                // Log RSI if we're in the hot loop
+                if addr >= 0x14038d070 && addr <= 0x14038d0b0 {
+                    if let Ok(rsi) = emu.reg_read(RegisterX86::RSI) {
+                        if let Ok(rdi) = emu.reg_read(RegisterX86::RDI) {
+                            log::debug!("  RSI=0x{:x}, RDI=0x{:x}", rsi, rdi);
+                        }
+                    }
+                }
             }
             
             // Log more frequently in verbose mode for debugging
@@ -300,6 +309,14 @@ impl Unpacker {
         // Start emulation
         log::info!("Starting emulation from 0x{:x}", entry_point);
         
+        // Log initial register state for debugging
+        if let Ok(rsi) = engine.read_reg(RegisterX86::RSI) {
+            log::debug!("Initial RSI: 0x{:x}", rsi);
+        }
+        if let Ok(rdi) = engine.read_reg(RegisterX86::RDI) {
+            log::debug!("Initial RDI: 0x{:x}", rdi);
+        }
+        
         // Emulate until we hit an error or reach max instructions
         let result = engine.emu_mut().emu_start(
             entry_point,
@@ -324,9 +341,15 @@ impl Unpacker {
         
         log::info!("Emulation stopped after {} instructions", final_count);
         
-        // It's normal for emulation to error out - we just need to reach OEP
+        // Check emulation result
         if let Err(e) = result {
-            log::debug!("Emulation error (expected): {:?}", e);
+            log::warn!("Emulation error: {:?}", e);
+            log::info!("This is often expected - emulation hit an edge case");
+            
+            // Get final RIP to see where it crashed
+            if let Ok(rip) = engine.get_rip() {
+                log::info!("Stopped at RIP: 0x{:x}", rip);
+            }
         }
         
         // Update workspace from both registry and syscall handler
