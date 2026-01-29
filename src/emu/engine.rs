@@ -5,13 +5,13 @@ use unicorn_engine::{Unicorn, RegisterX86};
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 
 /// Emulation engine managing the Unicorn instance
-pub struct EmulationEngine {
-    emu: Unicorn<()>,
+pub struct EmulationEngine<'a> {
+    emu: Unicorn<'a, ()>,
     pub image_base: u64,
     pub instruction_count: u64,
 }
 
-impl EmulationEngine {
+impl<'a> EmulationEngine<'a> {
     /// Create a new 64-bit x86 emulation engine
     pub fn new(image_base: u64) -> Result<Self> {
         let emu = Unicorn::new(Arch::X86, Mode::MODE_64)
@@ -25,12 +25,12 @@ impl EmulationEngine {
     }
     
     /// Get mutable reference to Unicorn instance
-    pub fn emu_mut(&mut self) -> &mut Unicorn<()> {
+    pub fn emu_mut(&mut self) -> &mut Unicorn<'a, ()> {
         &mut self.emu
     }
     
     /// Get reference to Unicorn instance
-    pub fn emu(&self) -> &Unicorn<()> {
+    pub fn emu(&self) -> &Unicorn<'a, ()> {
         &self.emu
     }
     
@@ -81,7 +81,7 @@ impl EmulationEngine {
     }
     
     /// Map memory region
-    pub fn map_memory(&mut self, addr: u64, size: usize, perms: Prot) -> Result<()> {
+    pub fn map_memory(&mut self, addr: u64, size: u64, perms: Prot) -> Result<()> {
         self.emu.mem_map(addr, size, perms)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map memory at 0x{:x}: {:?}", addr, e)))
     }

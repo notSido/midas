@@ -4,7 +4,7 @@ use crate::Result;
 use unicorn_engine::{Unicorn, RegisterX86};
 
 /// NtQueryInformationProcess - Anti-debug bypass
-pub fn nt_query_information_process(emu: &mut Unicorn<()>) -> Result<()> {
+pub fn nt_query_information_process(emu: &mut Unicorn<'_, ()>) -> Result<()> {
     let _process_handle = emu.reg_read(RegisterX86::RCX)?;
     let process_information_class = emu.reg_read(RegisterX86::RDX)?;
     let process_information = emu.reg_read(RegisterX86::R8)?;
@@ -31,7 +31,7 @@ pub fn nt_query_information_process(emu: &mut Unicorn<()>) -> Result<()> {
 }
 
 /// NtSetInformationThread - Anti-debug bypass
-pub fn nt_set_information_thread(emu: &mut Unicorn<()>) -> Result<()> {
+pub fn nt_set_information_thread(emu: &mut Unicorn<'_, ()>) -> Result<()> {
     let _thread_handle = emu.reg_read(RegisterX86::RCX)?;
     let thread_information_class = emu.reg_read(RegisterX86::RDX)?;
     
@@ -49,7 +49,7 @@ pub fn nt_set_information_thread(emu: &mut Unicorn<()>) -> Result<()> {
 }
 
 /// NtQuerySystemInformation stub
-pub fn nt_query_system_information(emu: &mut Unicorn<()>) -> Result<()> {
+pub fn nt_query_system_information(emu: &mut Unicorn<'_, ()>) -> Result<()> {
     let system_information_class = emu.reg_read(RegisterX86::RCX)?;
     
     log::debug!("NtQuerySystemInformation: class={}", system_information_class);

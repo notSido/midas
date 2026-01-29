@@ -5,9 +5,13 @@ echo "=== Building midas in Docker container ==="
 
 docker run --rm -v "$(pwd):/midas" -w /midas rust:latest bash -c '
   echo "Installing dependencies..."
-  apt-get update -qq && apt-get install -y -qq libclang-dev cmake > /dev/null 2>&1
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq libclang-dev clang cmake
   
+  echo ""
   echo "Building project..."
+  export LIBCLANG_PATH=/usr/lib/llvm-14/lib
   cargo build --release 2>&1 | grep -E "(Compiling|Finished|error)" || true
   
   if [ -f target/release/themida-unpack ]; then

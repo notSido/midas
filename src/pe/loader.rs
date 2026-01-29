@@ -16,25 +16,22 @@ impl PeLoader {
     }
     
     /// Load PE into Unicorn emulator
-    pub fn load_into_unicorn(&self, emu: &mut Unicorn<()>) -> Result<u64> {
+    pub fn load_into_unicorn(&self, emu: &mut Unicorn<'_, ()>) -> Result<u64> {
         log::info!("Loading PE into emulator at base: 0x{:x}", self.pe.image_base);
         
         // Map the entire image
         let aligned_size = align_up(self.pe.size_of_image, 0x1000);
-        emu.mem_map(self.pe.image_base, aligned_size as usize, Prot::ALL)
+        emu.mem_map(self.pe.image_base, aligned_size, Prot::ALL)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map image: {:?}", e)))?;
         
         // Write PE headers
-        let header_size = self.pe.pe.header.optional_header
-            .ok_or(UnpackError::PeError("No optional header".into()))?
-            .windows_fields
-            .size_of_headers as usize;
+        let header_size = self.pe.size_of_headers as usize;
         
         emu.mem_write(self.pe.image_base, &self.pe.data[..header_size])
             .map_err(|e| UnpackError::MemoryError(format!("Failed to write headers: {:?}", e)))?;
         
         // Load sections
-        for section in &self.pe.pe.sections {
+        for section in self.pe.sections() {
             let section_name = String::from_utf8_lossy(&section.name);
             log::debug!("Loading section: {}", section_name);
             
@@ -53,7 +50,7 @@ impl PeLoader {
         
         // Allocate stack
         let stack_base = 0x00100000u64;
-        let stack_size = 0x00100000usize; // 1MB stack
+        let stack_size = 0x00100000u64; // 1MB stack
         emu.mem_map(stack_base, stack_size, Prot::READ | Prot::WRITE)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map stack: {:?}", e)))?;
         

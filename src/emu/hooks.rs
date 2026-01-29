@@ -27,7 +27,7 @@ impl HookManager {
     }
     
     /// Setup basic hooks on the emulator
-    pub fn setup_hooks(&mut self, emu: &mut Unicorn<()>) -> Result<()> {
+    pub fn setup_hooks(&mut self, _emu: &mut Unicorn<'_, ()>) -> Result<()> {
         // TODO: Add instruction and memory hooks
         log::debug!("Hooks setup (placeholder)");
         Ok(())

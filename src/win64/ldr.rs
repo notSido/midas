@@ -39,7 +39,7 @@ impl Default for PebLdrData {
 }
 
 /// Setup LDR data in emulator memory
-pub fn setup_ldr(emu: &mut unicorn_engine::Unicorn<()>) -> crate::Result<()> {
+pub fn setup_ldr(emu: &mut unicorn_engine::Unicorn<'_, ()>) -> crate::Result<()> {
     use unicorn_engine::unicorn_const::Prot;
     
     emu.mem_map(LDR_BASE, 0x1000, Prot::READ | Prot::WRITE)

@@ -15,7 +15,7 @@ pub fn detect_themida(pe: &PeFile) -> Result<ThemidaVersion> {
     // Look for Themida sections
     let mut has_themida_section = false;
     
-    for section in &pe.pe.sections {
+    for section in pe.sections() {
         let name = String::from_utf8_lossy(&section.name);
         if name.contains(".themida") || name.contains("themida") {
             has_themida_section = true;

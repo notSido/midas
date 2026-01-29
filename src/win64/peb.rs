@@ -95,7 +95,7 @@ impl Teb {
 
 /// Setup PEB and TEB in emulator memory
 pub fn setup_peb_teb(
-    emu: &mut unicorn_engine::Unicorn<()>,
+    emu: &mut unicorn_engine::Unicorn<'_, ()>,
     image_base: u64,
     ldr_address: u64,
     stack_base: u64,
