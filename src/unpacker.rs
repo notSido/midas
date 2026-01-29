@@ -6,6 +6,8 @@ use crate::emu::{EmulationEngine, EmulationState};
 use crate::themida::{OepDetector, detect_themida};
 use crate::win64::{peb, ldr};
 use crate::win64::{api::{self, ApiRegistry}, syscall};
+use crate::cpu_features::{self, CpuState};
+use crate::tracer::ExecutionTracer;
 use unicorn_engine::{RegisterX86, Unicorn};
 use unicorn_engine::unicorn_const::HookType;
 use std::path::Path;
@@ -127,6 +129,12 @@ impl Unpacker {
         // Create API registry
         let mut api_registry = ApiRegistry::new(API_HOOK_BASE, *workspace);
         
+        // Create CPU state for RDTSC/CPUID
+        let cpu_state = Arc::new(Mutex::new(CpuState::new()));
+        
+        // Create execution tracer
+        let tracer = Arc::new(Mutex::new(ExecutionTracer::new()));
+        
         // Shared state for hooks
         let instruction_count = Arc::new(Mutex::new(0u64));
         let max_instructions = self.max_instructions;
@@ -139,6 +147,8 @@ impl Unpacker {
         let instr_count_clone = instruction_count.clone();
         let oep_found_clone = oep_found.clone();
         let api_registry_clone = api_registry_shared.clone();
+        let cpu_state_clone = cpu_state.clone();
+        let tracer_clone = tracer.clone();
         
         // Shared workspace for syscall handler
         let workspace_shared = Arc::new(Mutex::new(*workspace));
@@ -149,9 +159,25 @@ impl Unpacker {
             let mut count = instr_count_clone.lock().unwrap();
             *count += 1;
             
+            // Track execution
+            {
+                let mut trace = tracer_clone.lock().unwrap();
+                trace.record(addr);
+                
+                // Check for loops and log stats periodically
+                if *count % 1000000 == 0 {
+                    log::info!("Execution stats: {}", trace.stats());
+                    if trace.is_looping() {
+                        log::warn!("Detected execution loop!");
+                    }
+                }
+            }
+            
             // Check instruction limit
             if *count >= max_instructions {
                 log::warn!("Reached maximum instruction count");
+                let trace = tracer_clone.lock().unwrap();
+                log::warn!("Final stats: {}", trace.stats());
                 let _ = emu.emu_stop();
                 return;
             }
@@ -166,21 +192,50 @@ impl Unpacker {
                 log::trace!("At 0x{:x} after {} instructions", addr, *count);
             }
             
-            // Check for syscall instruction (0x0F 0x05)
+            // Check for special instructions (0x0F prefix)
             if size >= 2 {
                 if let Ok(bytes) = emu.mem_read_as_vec(addr, 2) {
-                    if bytes[0] == 0x0F && bytes[1] == 0x05 {
-                        // Syscall detected!
-                        let mut ws = workspace_clone_for_hook.lock().unwrap();
-                        match syscall::handle_syscall(emu, &mut *ws) {
-                            Ok(_) => {
-                                // Syscall handled, continue
+                    if bytes[0] == 0x0F {
+                        match bytes[1] {
+                            // Syscall (0x0F 0x05)
+                            0x05 => {
+                                let mut ws = workspace_clone_for_hook.lock().unwrap();
+                                match syscall::handle_syscall(emu, &mut *ws) {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        log::error!("Syscall handler error: {}", e);
+                                    }
+                                }
+                                return; // Syscall handler already advanced RIP
                             }
-                            Err(e) => {
-                                log::error!("Syscall handler error: {}", e);
+                            // CPUID (0x0F 0xA2)
+                            0xA2 => {
+                                log::debug!("CPUID at 0x{:x}", addr);
+                                match cpu_features::handle_cpuid(emu) {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        log::error!("CPUID handler error: {}", e);
+                                    }
+                                }
+                                // CPUID is 2 bytes, Unicorn will auto-advance
+                                return;
                             }
+                            // RDTSC (0x0F 0x31)
+                            0x31 => {
+                                let mut cpu = cpu_state_clone.lock().unwrap();
+                                match cpu_features::handle_rdtsc(emu, &mut *cpu) {
+                                    Ok(_) => {
+                                        log::trace!("RDTSC at 0x{:x} -> 0x{:x}", addr, cpu.rdtsc_counter);
+                                    }
+                                    Err(e) => {
+                                        log::error!("RDTSC handler error: {}", e);
+                                    }
+                                }
+                                // RDTSC is 2 bytes, Unicorn will auto-advance
+                                return;
+                            }
+                            _ => {} // Other 0x0F instructions, continue normally
                         }
-                        return; // Syscall handler already advanced RIP
                     }
                 }
             }
