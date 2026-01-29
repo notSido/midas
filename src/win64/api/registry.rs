@@ -45,24 +45,51 @@ impl ApiRegistry {
     fn register_kernel32_apis(&mut self) {
         use super::kernel32::*;
         
+        // Memory management
         self.register("kernel32.dll", "VirtualAlloc", virtual_alloc);
         self.register("kernel32.dll", "VirtualProtect", virtual_protect);
         self.register("kernel32.dll", "VirtualFree", virtual_free);
         self.register("kernel32.dll", "VirtualQuery", virtual_query);
+        self.register("kernel32.dll", "FlushInstructionCache", flush_instruction_cache);
+        
+        // Module/Library management
         self.register("kernel32.dll", "LoadLibraryA", load_library_a);
         self.register("kernel32.dll", "LoadLibraryW", load_library_w);
         self.register("kernel32.dll", "GetProcAddress", get_proc_address);
         self.register("kernel32.dll", "GetModuleHandleA", get_module_handle_a);
         self.register("kernel32.dll", "GetModuleHandleW", get_module_handle_w);
         self.register("kernel32.dll", "GetModuleFileNameA", get_module_filename_a);
+        
+        // Timing
         self.register("kernel32.dll", "GetTickCount", get_tick_count);
         self.register("kernel32.dll", "GetTickCount64", get_tick_count64);
         self.register("kernel32.dll", "QueryPerformanceCounter", query_performance_counter);
         self.register("kernel32.dll", "GetSystemTimeAsFileTime", get_system_time_as_file_time);
+        
+        // Process/Thread
         self.register("kernel32.dll", "GetCurrentProcessId", get_current_process_id);
         self.register("kernel32.dll", "GetCurrentThreadId", get_current_thread_id);
         self.register("kernel32.dll", "GetCurrentProcess", get_current_process);
         self.register("kernel32.dll", "GetCurrentThread", get_current_thread);
+        
+        // System info
+        self.register("kernel32.dll", "GetSystemInfo", get_system_info);
+        
+        // Anti-debug
+        self.register("kernel32.dll", "IsDebuggerPresent", is_debugger_present);
+        self.register("kernel32.dll", "CheckRemoteDebuggerPresent", check_remote_debugger_present);
+        
+        // Debug output
+        self.register("kernel32.dll", "OutputDebugStringA", output_debug_string_a);
+        
+        // Error handling
+        self.register("kernel32.dll", "GetLastError", get_last_error);
+        self.register("kernel32.dll", "SetLastError", set_last_error);
+        
+        // Handles
+        self.register("kernel32.dll", "CloseHandle", close_handle);
+        
+        // Utility
         self.register("kernel32.dll", "Sleep", sleep);
         self.register("kernel32.dll", "ExitProcess", exit_process);
     }
@@ -71,12 +98,27 @@ impl ApiRegistry {
     fn register_ntdll_apis(&mut self) {
         use super::ntdll::*;
         
+        // System information
         self.register("ntdll.dll", "RtlGetVersion", rtl_get_version);
-        self.register("ntdll.dll", "NtQueryInformationProcess", nt_query_information_process);
         self.register("ntdll.dll", "NtQuerySystemInformation", nt_query_system_information);
-        self.register("ntdll.dll", "NtClose", nt_close);
+        
+        // Process/Thread information (anti-debug)
+        self.register("ntdll.dll", "NtQueryInformationProcess", nt_query_information_process);
+        self.register("ntdll.dll", "NtSetInformationThread", nt_set_information_thread);
+        
+        // Memory management
         self.register("ntdll.dll", "NtAllocateVirtualMemory", nt_allocate_virtual_memory);
+        self.register("ntdll.dll", "NtProtectVirtualMemory", nt_protect_virtual_memory);
+        
+        // Exception handling (SEH)
+        self.register("ntdll.dll", "RtlUnwindEx", rtl_unwind_ex);
+        self.register("ntdll.dll", "RtlVirtualUnwind", rtl_virtual_unwind);
+        self.register("ntdll.dll", "RtlCaptureContext", rtl_capture_context);
+        self.register("ntdll.dll", "RtlLookupFunctionEntry", rtl_lookup_function_entry);
         self.register("ntdll.dll", "RtlAddFunctionTable", rtl_add_function_table);
+        
+        // Handles
+        self.register("ntdll.dll", "NtClose", nt_close);
     }
     
     /// Get API info by address

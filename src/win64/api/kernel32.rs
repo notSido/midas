@@ -295,3 +295,138 @@ pub fn exit_process(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<(
     
     Ok(())
 }
+
+/// FlushInstructionCache stub
+pub fn flush_instruction_cache(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    let hprocess = emu.reg_read(RegisterX86::RCX)?;
+    let lpbaseaddress = emu.reg_read(RegisterX86::RDX)?;
+    let dwsize = emu.reg_read(RegisterX86::R8)?;
+    
+    log::debug!("FlushInstructionCache: process=0x{:x}, addr=0x{:x}, size=0x{:x}", 
+                hprocess, lpbaseaddress, dwsize);
+    
+    // Return success
+    emu.reg_write(RegisterX86::RAX, 1)?;
+    Ok(())
+}
+
+/// GetLastError stub
+pub fn get_last_error(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    log::debug!("GetLastError");
+    
+    // Return ERROR_SUCCESS (0)
+    emu.reg_write(RegisterX86::RAX, 0)?;
+    Ok(())
+}
+
+/// SetLastError stub
+pub fn set_last_error(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    let dwerrcode = emu.reg_read(RegisterX86::RCX)?;
+    
+    log::debug!("SetLastError: code=0x{:x}", dwerrcode);
+    
+    // No return value (void function)
+    Ok(())
+}
+
+/// GetSystemInfo stub
+pub fn get_system_info(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    let lpsysteminfo = emu.reg_read(RegisterX86::RCX)?;
+    
+    log::debug!("GetSystemInfo: buffer=0x{:x}", lpsysteminfo);
+    
+    // SYSTEM_INFO structure (48 bytes on x64)
+    let mut system_info = vec![0u8; 48];
+    
+    // wProcessorArchitecture (WORD) - PROCESSOR_ARCHITECTURE_AMD64 = 9
+    system_info[0..2].copy_from_slice(&9u16.to_le_bytes());
+    
+    // dwPageSize (DWORD) - 4096
+    system_info[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    
+    // lpMinimumApplicationAddress (LPVOID) - 0x10000
+    system_info[8..16].copy_from_slice(&0x10000u64.to_le_bytes());
+    
+    // lpMaximumApplicationAddress (LPVOID) - 0x7FFFFFFFFFFF
+    system_info[16..24].copy_from_slice(&0x7FFFFFFFFFFFu64.to_le_bytes());
+    
+    // dwActiveProcessorMask (DWORD_PTR) - 0xFF (8 cores)
+    system_info[24..32].copy_from_slice(&0xFFu64.to_le_bytes());
+    
+    // dwNumberOfProcessors (DWORD) - 8
+    system_info[32..36].copy_from_slice(&8u32.to_le_bytes());
+    
+    // dwProcessorType (DWORD) - PROCESSOR_AMD_X8664 = 8664
+    system_info[36..40].copy_from_slice(&8664u32.to_le_bytes());
+    
+    // dwAllocationGranularity (DWORD) - 65536
+    system_info[40..44].copy_from_slice(&65536u32.to_le_bytes());
+    
+    // wProcessorLevel (WORD) - 6
+    system_info[44..46].copy_from_slice(&6u16.to_le_bytes());
+    
+    // wProcessorRevision (WORD) - 0
+    system_info[46..48].copy_from_slice(&0u16.to_le_bytes());
+    
+    emu.mem_write(lpsysteminfo, &system_info)?;
+    
+    // No return value (void function)
+    Ok(())
+}
+
+/// IsDebuggerPresent - Anti-debug check (always return false)
+pub fn is_debugger_present(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    log::debug!("IsDebuggerPresent: returning FALSE");
+    
+    // Return FALSE (0)
+    emu.reg_write(RegisterX86::RAX, 0)?;
+    Ok(())
+}
+
+/// CheckRemoteDebuggerPresent - Anti-debug check (always return false)
+pub fn check_remote_debugger_present(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    let _hprocess = emu.reg_read(RegisterX86::RCX)?;
+    let pbdebuggerpresent = emu.reg_read(RegisterX86::RDX)?;
+    
+    log::debug!("CheckRemoteDebuggerPresent: returning FALSE");
+    
+    // Write FALSE (0) to output parameter
+    emu.mem_write(pbdebuggerpresent, &0u32.to_le_bytes())?;
+    
+    // Return success (TRUE)
+    emu.reg_write(RegisterX86::RAX, 1)?;
+    Ok(())
+}
+
+/// OutputDebugStringA - Debug output (ignore)
+pub fn output_debug_string_a(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    let lpoutputstring = emu.reg_read(RegisterX86::RCX)?;
+    
+    // Try to read the debug string
+    let mut string_bytes = Vec::new();
+    for i in 0..256 {
+        let byte = emu.mem_read_as_vec(lpoutputstring + i, 1)
+            .unwrap_or(vec![0])[0];
+        if byte == 0 {
+            break;
+        }
+        string_bytes.push(byte);
+    }
+    
+    let debug_string = String::from_utf8_lossy(&string_bytes);
+    log::debug!("OutputDebugStringA: {}", debug_string);
+    
+    // No return value (void function)
+    Ok(())
+}
+
+/// CloseHandle stub - Handle closing (always succeeds)
+pub fn close_handle(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
+    let hobject = emu.reg_read(RegisterX86::RCX)?;
+    
+    log::debug!("CloseHandle: handle=0x{:x}", hobject);
+    
+    // Return TRUE (success)
+    emu.reg_write(RegisterX86::RAX, 1)?;
+    Ok(())
+}
