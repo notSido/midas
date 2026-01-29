@@ -2,6 +2,7 @@ use clap::Parser;
 use midas::*;
 use std::path::PathBuf;
 use std::process;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "midas")]
@@ -34,6 +35,14 @@ struct Args {
     /// Output results in JSON format
     #[arg(long)]
     json: bool,
+    
+    /// Timeout in seconds (0 = no timeout)
+    #[arg(long, default_value = "0")]
+    timeout: u64,
+    
+    /// Show progress during emulation
+    #[arg(long)]
+    progress: bool,
     
     /// Workspace base address for allocations
     #[arg(long, default_value = "0x20000000")]
@@ -114,23 +123,40 @@ fn run() -> Result<()> {
     }
     
     // Create unpacker and run
+    let start_time = Instant::now();
     let mut unpacker = unpacker::Unpacker::new(pe, args.max_instructions, args.verbose);
     
-    match unpacker.unpack(&output_path) {
+    let unpack_result = unpacker.unpack(&output_path);
+    let elapsed = start_time.elapsed();
+    
+    match unpack_result {
         Ok(()) => {
             if args.json {
-                println!("{{\"success\": true, \"output\": \"{}\", \"themida_version\": \"{:?}\"}}", 
-                    output_path.display(), version);
+                let result = UnpackResult::success(
+                    None, // OEP not tracked yet
+                    format!("{:?}", version),
+                    args.max_instructions, // TODO: track actual instructions
+                    output_path.clone(),
+                );
+                println!("{}", result.to_json().unwrap_or_else(|_| 
+                    format!("{{\"success\": true, \"output\": \"{}\"}}", output_path.display())
+                ));
             } else if !args.quiet {
                 // Success message to stdout
-                println!("Unpacking completed successfully");
+                println!("Unpacking completed successfully in {:.2}s", elapsed.as_secs_f64());
                 println!("Output: {:?}", output_path);
             }
             Ok(())
         }
         Err(e) => {
             if args.json {
-                println!("{{\"success\": false, \"error\": \"{}\"}}", e);
+                let result = UnpackResult::failure(
+                    e.to_string(),
+                    Some(format!("{:?}", version)),
+                );
+                println!("{}", result.to_json().unwrap_or_else(|_| 
+                    format!("{{\"success\": false, \"error\": \"{}\"}}", e)
+                ));
             }
             Err(e)
         }

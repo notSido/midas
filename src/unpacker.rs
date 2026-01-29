@@ -239,24 +239,25 @@ impl Unpacker {
         
         let api_offset = addr - API_HOOK_BASE;
         
+        let mut workspace_clone = WORKSPACE_BASE;
         match api_offset {
             0x1000 => {
-                api::kernel32::virtual_alloc(emu, &mut WORKSPACE_BASE.clone())?;
+                api::kernel32::virtual_alloc(emu, &mut workspace_clone)?;
             }
             0x1100 => {
-                api::kernel32::virtual_protect(emu)?;
+                api::kernel32::virtual_protect(emu, &mut workspace_clone)?;
             }
             0x1200 => {
-                api::kernel32::load_library_a(emu)?;
+                api::kernel32::load_library_a(emu, &mut workspace_clone)?;
             }
             0x1300 => {
-                api::kernel32::get_proc_address(emu)?;
+                api::kernel32::get_proc_address(emu, &mut workspace_clone)?;
             }
             0x1400 => {
-                api::kernel32::get_tick_count(emu)?;
+                api::kernel32::get_tick_count(emu, &mut workspace_clone)?;
             }
             0x1500 => {
-                api::kernel32::query_performance_counter(emu)?;
+                api::kernel32::query_performance_counter(emu, &mut workspace_clone)?;
             }
             _ => {
                 log::debug!("Unknown API at offset 0x{:x}", api_offset);

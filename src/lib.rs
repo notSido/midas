@@ -9,6 +9,9 @@ pub mod win64;
 pub mod themida;
 pub mod utils;
 pub mod unpacker;
+pub mod result;
+
+pub use result::UnpackResult;
 
 use thiserror::Error;
 
