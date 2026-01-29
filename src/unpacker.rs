@@ -5,7 +5,7 @@ use crate::pe::{PeFile, PeLoader, PeDumper};
 use crate::emu::{EmulationEngine, EmulationState};
 use crate::themida::{OepDetector, detect_themida};
 use crate::win64::{peb, ldr};
-use crate::win64::api;
+use crate::win64::api::{self, ApiRegistry};
 use unicorn_engine::{RegisterX86, Unicorn};
 use unicorn_engine::unicorn_const::HookType;
 use std::path::Path;
@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 /// API hook range
 const API_HOOK_BASE: u64 = 0xFEED_0000;
-const API_HOOK_END: u64 = 0xFEEF_0000;
 
 /// Workspace for allocations
 const WORKSPACE_BASE: u64 = 0x20000000;
@@ -125,16 +124,21 @@ impl Unpacker {
         oep_detector: &mut OepDetector,
         entry_point: u64,
     ) -> Result<()> {
+        // Create API registry
+        let mut api_registry = ApiRegistry::new(API_HOOK_BASE, *workspace);
+        
         // Shared state for hooks
         let instruction_count = Arc::new(Mutex::new(0u64));
         let max_instructions = self.max_instructions;
         let oep_found = Arc::new(Mutex::new(false));
         let code_start = oep_detector.code_start;
         let code_end = oep_detector.code_end;
+        let api_registry_shared = Arc::new(Mutex::new(api_registry));
         
         // Clone Arcs for hook closures
         let instr_count_clone = instruction_count.clone();
         let oep_found_clone = oep_found.clone();
+        let api_registry_clone = api_registry_shared.clone();
         
         // Add instruction hook
         let _code_hook = engine.emu_mut().add_code_hook(0, u64::MAX, move |emu, addr, _size| {
@@ -153,6 +157,11 @@ impl Unpacker {
                 log::debug!("Executed {} instructions, current: 0x{:x}", *count, addr);
             }
             
+            // Log more frequently in verbose mode for debugging
+            if *count % 10000 == 0 {
+                log::trace!("At 0x{:x} after {} instructions", addr, *count);
+            }
+            
             // Check for OEP
             if addr >= code_start && addr < code_end {
                 // Potential OEP
@@ -164,11 +173,26 @@ impl Unpacker {
                 }
             }
             
-            // Check for API calls in hook range
-            if addr >= API_HOOK_BASE && addr < API_HOOK_END {
-                log::debug!("API hook hit at: 0x{:x}", addr);
-                // Handle API call
-                let _ = Self::handle_api_call(emu, addr);
+            // Check for API calls using registry
+            let mut registry = api_registry_clone.lock().unwrap();
+            if registry.is_api_hook(addr) {
+                match registry.dispatch(addr, emu) {
+                    Ok(true) => {
+                        // API handled successfully, simulate return
+                        match Self::simulate_api_return(emu) {
+                            Ok(_) => {},
+                            Err(e) => {
+                                log::error!("Failed to simulate API return: {}", e);
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        log::warn!("Unknown API at 0x{:x}", addr);
+                    }
+                    Err(e) => {
+                        log::error!("API dispatch error at 0x{:x}: {}", addr, e);
+                    }
+                }
             }
         }).map_err(|e| UnpackError::EmulationError(format!("Failed to add code hook: {:?}", e)))?;
         
@@ -227,46 +251,15 @@ impl Unpacker {
             log::debug!("Emulation error (expected): {:?}", e);
         }
         
-        *workspace = workspace_val;
+        // Update workspace from registry
+        let registry = api_registry_shared.lock().unwrap();
+        *workspace = registry.workspace;
         
         Ok(())
     }
     
-    /// Handle API call
-    fn handle_api_call(emu: &mut Unicorn<()>, addr: u64) -> Result<()> {
-        // Determine which API based on address
-        // This is a simplified version - real implementation would have a map
-        
-        let api_offset = addr - API_HOOK_BASE;
-        
-        let mut workspace_clone = WORKSPACE_BASE;
-        match api_offset {
-            0x1000 => {
-                api::kernel32::virtual_alloc(emu, &mut workspace_clone)?;
-            }
-            0x1100 => {
-                api::kernel32::virtual_protect(emu, &mut workspace_clone)?;
-            }
-            0x1200 => {
-                api::kernel32::load_library_a(emu, &mut workspace_clone)?;
-            }
-            0x1300 => {
-                api::kernel32::get_proc_address(emu, &mut workspace_clone)?;
-            }
-            0x1400 => {
-                api::kernel32::get_tick_count(emu, &mut workspace_clone)?;
-            }
-            0x1500 => {
-                api::kernel32::query_performance_counter(emu, &mut workspace_clone)?;
-            }
-            _ => {
-                log::debug!("Unknown API at offset 0x{:x}", api_offset);
-                // Return success by default
-                let _ = emu.reg_write(RegisterX86::RAX, 0);
-            }
-        }
-        
-        // Simulate return by popping return address and jumping to it
+    /// Simulate API return by popping return address and jumping to it
+    fn simulate_api_return(emu: &mut Unicorn<()>) -> Result<()> {
         let rsp = emu.reg_read(RegisterX86::RSP)?;
         let ret_addr_bytes = emu.mem_read_as_vec(rsp, 8)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to read return address: {:?}", e)))?;
