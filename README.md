@@ -20,36 +20,23 @@ PE File → Parser → Unicorn Loader → Emulation → OEP Detection → Dump
                    (PEB, TEB, APIs)
 ```
 
-## Current Status
+## Status
 
-✅ **BUILDS SUCCESSFULLY IN DOCKER/LINUX** - Tested on Rust latest with Debian
+⚠️ **Work in Progress** - This is a foundational implementation. Core unpacking logic is under development.
 
-**Phase 1: Foundation** ✅ (COMPLETED)
-- [x] Project structure
-- [x] PE64 parser
-- [x] Unicorn engine wrapper (API compatibility fixed)
-- [x] Basic Windows structures (PEB, TEB, LDR)
-- [x] Core module interfaces
-- [x] Successfully compiles and runs
-- [x] Detects `.themida` section in protected binaries
+**What's Working:**
+- ✅ PE64 parsing and section detection
+- ✅ Themida version detection
+- ✅ Unicorn emulation setup
+- ✅ Windows structure emulation (PEB, TEB, LDR)
+- ✅ Basic API hooks framework
 
-**Phase 2: API Emulation** 🚧 (IN PROGRESS)
-- [x] kernel32.dll basic hooks (VirtualAlloc, GetProcAddress, etc.)
-- [x] ntdll.dll anti-debug hooks
-- [ ] Complete API coverage
-- [ ] API call tracing
-
-**Phase 3: Themida Logic** ⏳ (PENDING)
-- [x] Version detection (basic)
-- [x] OEP detector structure
-- [ ] Full emulation loop
-- [ ] Memory monitoring
-- [ ] OEP heuristics
-
-**Phase 4: Output** ⏳ (PENDING)
-- [ ] IAT reconstruction
-- [ ] PE rebuilding
-- [ ] Import directory creation
+**In Development:**
+- 🚧 Full emulation loop
+- 🚧 Memory write tracking
+- 🚧 OEP detection heuristics
+- 🚧 IAT reconstruction
+- 🚧 Output generation
 
 ## Building
 
@@ -161,6 +148,6 @@ Based on research of existing tools:
 
 GPL-3.0 - See LICENSE file
 
-## Author
+## Contributing
 
-Created with OpenCode Assistant
+Contributions welcome! This is an active development project.

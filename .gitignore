@@ -1,1 +1,4 @@
 /target
+*.exe
+*.zip
+.DS_Store
