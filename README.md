@@ -1,0 +1,146 @@
+# Themida Unpacker
+
+A Themida 3.x unpacker for Linux, written in Rust, using Unicorn CPU emulation.
+
+## Features
+
+- **Pure Linux operation**: No Windows required
+- **Unicorn-based emulation**: Emulates x86-64 instruction execution
+- **Windows API emulation**: Implements critical Windows APIs
+- **OEP detection**: Automatically finds the original entry point
+- **IAT reconstruction**: Recovers import table (basic implementation)
+- **Anti-debug bypasses**: Handles common anti-debugging techniques
+
+## Architecture
+
+```
+PE File → Parser → Unicorn Loader → Emulation → OEP Detection → Dump
+                         ↓
+                   Windows API Hooks
+                   (PEB, TEB, APIs)
+```
+
+## Current Status
+
+**Phase 1: Foundation** ✅ (COMPLETED)
+- [x] Project structure
+- [x] PE64 parser
+- [x] Unicorn engine wrapper
+- [x] Basic Windows structures (PEB, TEB, LDR)
+- [x] Core module interfaces
+
+**Phase 2: API Emulation** 🚧 (IN PROGRESS)
+- [x] kernel32.dll basic hooks (VirtualAlloc, GetProcAddress, etc.)
+- [x] ntdll.dll anti-debug hooks
+- [ ] Complete API coverage
+- [ ] API call tracing
+
+**Phase 3: Themida Logic** ⏳ (PENDING)
+- [x] Version detection (basic)
+- [x] OEP detector structure
+- [ ] Full emulation loop
+- [ ] Memory monitoring
+- [ ] OEP heuristics
+
+**Phase 4: Output** ⏳ (PENDING)
+- [ ] IAT reconstruction
+- [ ] PE rebuilding
+- [ ] Import directory creation
+
+## Building
+
+```bash
+cargo build --release
+```
+
+## Usage
+
+```bash
+# Basic usage
+./target/release/themida-unpack -i protected.exe -o unpacked.exe
+
+# Verbose output
+./target/release/themida-unpack -i protected.exe -o unpacked.exe -v
+
+# Custom instruction limit
+./target/release/themida-unpack -i protected.exe -o unpacked.exe --max-instructions 50000000
+```
+
+## Limitations
+
+- **64-bit only**: Currently supports only PE64 files
+- **Themida 3.x focus**: Optimized for Themida 3.x
+- **No virtualization**: Cannot unvirtualize VM-protected code
+- **Non-runnable dumps**: Dumps are for analysis, not execution
+- **API coverage**: Limited to ~20 critical APIs initially
+
+## How It Works
+
+1. **Parse PE**: Load and analyze the protected PE file
+2. **Setup Emulation**: 
+   - Map PE sections into Unicorn memory
+   - Create fake PEB/TEB structures
+   - Setup IAT with hook addresses
+3. **Emulate**:
+   - Execute from entry point
+   - Hook Windows APIs as they're called
+   - Monitor code section for writes
+4. **Detect OEP**:
+   - Watch for execution leaving Themida section
+   - Identify transition to original code
+5. **Dump**:
+   - Extract decrypted memory
+   - Reconstruct imports
+   - Generate output PE
+
+## Technical Details
+
+### API Hooking
+
+APIs are hooked by:
+1. Mapping fake API addresses (e.g., 0xFEED_0000 range)
+2. Detecting when execution reaches these addresses
+3. Executing emulated implementation
+4. Returning control to caller
+
+### OEP Detection
+
+OEP is detected by monitoring:
+- Execution entering code section from outside
+- Pattern of memory writes to code
+- API call sequences typical of unpacked code
+
+### Memory Layout
+
+```
+0x7FFF_F000: PEB (Process Environment Block)
+0x7FFF_E000: TEB (Thread Environment Block)  
+0x7FFF_D000: LDR_DATA
+0x00100000: Stack (1MB)
+0x00400000: PE Image (typical)
+0x20000000: Workspace (allocations)
+0xFEED_0000: Fake API addresses
+```
+
+## Dependencies
+
+- **unicorn-engine**: CPU emulation
+- **iced-x86**: x86/x64 disassembler
+- **goblin**: PE parsing
+- **clap**: CLI argument parsing
+
+## Inspiration
+
+Based on research of existing tools:
+- **Magicmida**: Windows-native Themida unpacker (Delphi)
+- **unlicense**: Python Themida unpacker using Frida
+- **mwemu**: Rust malware emulator framework
+- **unicorn_pe**: PE emulation with Unicorn
+
+## License
+
+GPL-3.0 - See LICENSE file
+
+## Author
+
+Created with OpenCode Assistant

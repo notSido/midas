@@ -1,0 +1,24 @@
+[package]
+name = "themida-unpack"
+version = "0.1.0"
+edition = "2021"
+authors = ["OpenCode Assistant"]
+description = "Themida 3.x unpacker for Linux using Unicorn emulation"
+license = "GPL-3.0"
+
+[dependencies]
+unicorn-engine = "2.1"
+iced-x86 = "1.21"
+goblin = "0.8"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1.0"
+byteorder = "1.5"
+memmap2 = "0.9"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
