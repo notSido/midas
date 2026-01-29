@@ -351,6 +351,7 @@ dependencies = [
  "iced-x86",
  "log",
  "memmap2",
+ "scroll",
  "thiserror",
  "unicorn-engine",
 ]

@@ -14,7 +14,7 @@ pub fn virtual_alloc(emu: &mut Unicorn<'_, ()>, workspace: &mut u64) -> Result<u
     log::debug!("VirtualAlloc: size=0x{:x}", dwsize);
     
     // Allocate memory at workspace address
-    let aligned_size = ((dwsize + 0xFFF) & !0xFFF);
+    let aligned_size = (dwsize + 0xFFF) & !0xFFF;
     let address = *workspace;
     
     emu.mem_map(address, aligned_size, unicorn_engine::unicorn_const::Prot::ALL)

@@ -3,7 +3,7 @@
 use crate::pe::PeFile;
 use crate::{Result, UnpackError};
 use unicorn_engine::Unicorn;
-use unicorn_engine::unicorn_const::{Prot, Arch, Mode};
+use unicorn_engine::unicorn_const::Prot;
 
 /// PE loader that maps sections into Unicorn memory
 pub struct PeLoader {

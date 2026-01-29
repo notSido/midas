@@ -24,21 +24,25 @@ PE File → Parser → Unicorn Loader → Emulation → OEP Detection → Dump
 
 ## Status
 
-⚠️ **Work in Progress** - This is a foundational implementation. Core unpacking logic is under development.
+✅ **Phase 2 Complete** - Core unpacking functionality implemented!
 
 **What's Working:**
 - ✅ PE64 parsing and section detection
 - ✅ Themida version detection
-- ✅ Unicorn emulation setup
+- ✅ Unicorn emulation setup with full execution loop
 - ✅ Windows structure emulation (PEB, TEB, LDR)
-- ✅ Basic API hooks framework
+- ✅ API hooks framework with ~6 critical APIs
+- ✅ Memory write tracking for code sections
+- ✅ OEP detection heuristics
+- ✅ Memory dumping and basic PE output
+- ✅ JSON output mode for automation
+- ✅ Detect-only mode for version identification
 
 **In Development:**
-- 🚧 Full emulation loop
-- 🚧 Memory write tracking
-- 🚧 OEP detection heuristics
-- 🚧 IAT reconstruction
-- 🚧 Output generation
+- 🚧 IAT reconstruction (advanced)
+- 🚧 PE reconstruction with proper imports
+- 🚧 Additional API implementations
+- 🚧 Testing with real Themida samples
 
 ## Building
 
@@ -71,9 +75,29 @@ midas -i protected.exe -o unpacked.exe
 # Verbose output
 midas -i protected.exe -o unpacked.exe -v
 
+# Quiet mode (only errors)
+midas -i protected.exe -o unpacked.exe -q
+
+# JSON output (for automation)
+midas -i protected.exe -o unpacked.exe --json
+
+# Detect Themida version only (no unpacking)
+midas -i protected.exe --detect-only
+
 # Custom instruction limit
 midas -i protected.exe -o unpacked.exe --max-instructions 50000000
 ```
+
+### Exit Codes
+
+- `0`: Success
+- `1`: Failure
+
+### Output Routing
+
+- Success messages → stdout
+- Logs and errors → stderr
+- JSON output → stdout
 
 ## Limitations
 

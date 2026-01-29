@@ -2,6 +2,7 @@
 
 /// PEB_LDR_DATA address
 pub const LDR_BASE: u64 = 0x7FFF_D000;
+pub const LDR_DATA_BASE: u64 = LDR_BASE;
 
 /// PEB_LDR_DATA structure (simplified)
 #[repr(C)]
@@ -40,6 +41,11 @@ impl Default for PebLdrData {
 
 /// Setup LDR data in emulator memory
 pub fn setup_ldr(emu: &mut unicorn_engine::Unicorn<'_, ()>) -> crate::Result<()> {
+    setup_ldr_data(emu, 0) // Dummy image_base, not used
+}
+
+/// Setup LDR data in emulator memory with image base
+pub fn setup_ldr_data(emu: &mut unicorn_engine::Unicorn<'_, ()>, _image_base: u64) -> crate::Result<()> {
     use unicorn_engine::unicorn_const::Prot;
     
     emu.mem_map(LDR_BASE, 0x1000, Prot::READ | Prot::WRITE)

@@ -11,8 +11,15 @@ docker run --rm -v "$(pwd):/midas" -w /midas rust:latest bash -c '
   
   echo ""
   echo "Building project..."
-  export LIBCLANG_PATH=/usr/lib/llvm-14/lib
-  cargo build --release 2>&1 | grep -E "(Compiling|Finished|error)" || true
+  # Find the LLVM version available
+  if [ -d /usr/lib/llvm-19/lib ]; then
+    export LIBCLANG_PATH=/usr/lib/llvm-19/lib
+  elif [ -d /usr/lib/llvm-18/lib ]; then
+    export LIBCLANG_PATH=/usr/lib/llvm-18/lib
+  elif [ -d /usr/lib/llvm-14/lib ]; then
+    export LIBCLANG_PATH=/usr/lib/llvm-14/lib
+  fi
+  cargo build --release 2>&1 | grep -E "(Compiling|Finished|error|warning:)" || true
   
   if [ -f target/release/midas ]; then
     echo ""

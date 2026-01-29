@@ -1,9 +1,7 @@
 //! Hook manager for emulation callbacks
 
 use crate::Result;
-use unicorn_engine::{Unicorn, RegisterX86};
-use unicorn_engine::unicorn_const::{HookType, MemType};
-use std::sync::{Arc, Mutex};
+use unicorn_engine::Unicorn;
 
 /// Manages hooks for the emulator
 pub struct HookManager {

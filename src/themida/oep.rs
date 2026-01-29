@@ -1,7 +1,5 @@
 //! OEP (Original Entry Point) detection
 
-use crate::Result;
-
 /// OEP detector tracks execution to find the original entry point
 pub struct OepDetector {
     /// Code section boundaries

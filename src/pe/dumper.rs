@@ -1,6 +1,6 @@
 //! PE dumper for creating unpacked binaries
 
-use crate::{Result, UnpackError};
+use crate::Result;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;

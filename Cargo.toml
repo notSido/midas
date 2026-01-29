@@ -10,6 +10,7 @@ license = "GPL-3.0"
 unicorn-engine = "2.1"
 iced-x86 = "1.21"
 goblin = "0.8"
+scroll = "0.12"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

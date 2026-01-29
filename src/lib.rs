@@ -8,6 +8,7 @@ pub mod emu;
 pub mod win64;
 pub mod themida;
 pub mod utils;
+pub mod unpacker;
 
 use thiserror::Error;
 
