@@ -40,9 +40,9 @@ impl Default for PebLdrData {
 
 /// Setup LDR data in emulator memory
 pub fn setup_ldr(emu: &mut unicorn_engine::Unicorn<()>) -> crate::Result<()> {
-    use unicorn_engine::unicorn_const::Permission;
+    use unicorn_engine::unicorn_const::Prot;
     
-    emu.mem_map(LDR_BASE, 0x1000, Permission::READ | Permission::WRITE)
+    emu.mem_map(LDR_BASE, 0x1000, Prot::READ | Prot::WRITE)
         .map_err(|e| crate::UnpackError::MemoryError(format!("Failed to map LDR: {:?}", e)))?;
     
     let ldr = PebLdrData::new();

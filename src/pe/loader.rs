@@ -3,7 +3,7 @@
 use crate::pe::PeFile;
 use crate::{Result, UnpackError};
 use unicorn_engine::Unicorn;
-use unicorn_engine::unicorn_const::{Permission, Arch, Mode};
+use unicorn_engine::unicorn_const::{Prot, Arch, Mode};
 
 /// PE loader that maps sections into Unicorn memory
 pub struct PeLoader {
@@ -21,7 +21,7 @@ impl PeLoader {
         
         // Map the entire image
         let aligned_size = align_up(self.pe.size_of_image, 0x1000);
-        emu.mem_map(self.pe.image_base, aligned_size as usize, Permission::ALL)
+        emu.mem_map(self.pe.image_base, aligned_size as usize, Prot::ALL)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map image: {:?}", e)))?;
         
         // Write PE headers
@@ -54,7 +54,7 @@ impl PeLoader {
         // Allocate stack
         let stack_base = 0x00100000u64;
         let stack_size = 0x00100000usize; // 1MB stack
-        emu.mem_map(stack_base, stack_size, Permission::READ | Permission::WRITE)
+        emu.mem_map(stack_base, stack_size, Prot::READ | Prot::WRITE)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map stack: {:?}", e)))?;
         
         let stack_pointer = stack_base + (stack_size as u64) - 0x1000;

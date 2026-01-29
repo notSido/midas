@@ -100,14 +100,14 @@ pub fn setup_peb_teb(
     ldr_address: u64,
     stack_base: u64,
 ) -> Result<()> {
-    use unicorn_engine::unicorn_const::Permission;
+    use unicorn_engine::unicorn_const::Prot;
     
     // Map PEB memory
-    emu.mem_map(PEB_BASE, 0x1000, Permission::READ | Permission::WRITE)
+    emu.mem_map(PEB_BASE, 0x1000, Prot::READ | Prot::WRITE)
         .map_err(|e| crate::UnpackError::MemoryError(format!("Failed to map PEB: {:?}", e)))?;
     
     // Map TEB memory
-    emu.mem_map(TEB_BASE, 0x1000, Permission::READ | Permission::WRITE)
+    emu.mem_map(TEB_BASE, 0x1000, Prot::READ | Prot::WRITE)
         .map_err(|e| crate::UnpackError::MemoryError(format!("Failed to map TEB: {:?}", e)))?;
     
     // Create and write PEB

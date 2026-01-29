@@ -2,11 +2,11 @@
 
 use crate::{Result, UnpackError};
 use unicorn_engine::{Unicorn, RegisterX86};
-use unicorn_engine::unicorn_const::{Arch, Mode, Permission};
+use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 
 /// Emulation engine managing the Unicorn instance
 pub struct EmulationEngine {
-    emu: Unicorn<'static, ()>,
+    emu: Unicorn<()>,
     pub image_base: u64,
     pub instruction_count: u64,
 }
@@ -25,12 +25,12 @@ impl EmulationEngine {
     }
     
     /// Get mutable reference to Unicorn instance
-    pub fn emu_mut(&mut self) -> &mut Unicorn<'static, ()> {
+    pub fn emu_mut(&mut self) -> &mut Unicorn<()> {
         &mut self.emu
     }
     
     /// Get reference to Unicorn instance
-    pub fn emu(&self) -> &Unicorn<'static, ()> {
+    pub fn emu(&self) -> &Unicorn<()> {
         &self.emu
     }
     
@@ -81,7 +81,7 @@ impl EmulationEngine {
     }
     
     /// Map memory region
-    pub fn map_memory(&mut self, addr: u64, size: usize, perms: Permission) -> Result<()> {
+    pub fn map_memory(&mut self, addr: u64, size: usize, perms: Prot) -> Result<()> {
         self.emu.mem_map(addr, size, perms)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map memory at 0x{:x}: {:?}", addr, e)))
     }

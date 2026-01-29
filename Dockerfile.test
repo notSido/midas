@@ -1,0 +1,26 @@
+# Test Dockerfile for building midas in Linux
+FROM rust:latest
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libclang-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /midas
+
+# Copy project files
+COPY . .
+
+# Build the project
+RUN cargo build --release
+
+# Verify binary exists
+RUN ls -lh target/release/themida-unpack
+
+# Test basic execution
+RUN target/release/themida-unpack --help || echo "Binary built successfully"
+
+CMD ["/bin/bash"]

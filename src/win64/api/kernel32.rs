@@ -17,7 +17,7 @@ pub fn virtual_alloc(emu: &mut Unicorn<()>, workspace: &mut u64) -> Result<u64> 
     let aligned_size = ((dwsize + 0xFFF) & !0xFFF) as usize;
     let address = *workspace;
     
-    emu.mem_map(address, aligned_size, unicorn_engine::unicorn_const::Permission::ALL)
+    emu.mem_map(address, aligned_size, unicorn_engine::unicorn_const::Prot::ALL)
         .map_err(|e| UnpackError::ApiError(format!("VirtualAlloc map failed: {:?}", e)))?;
     
     *workspace += aligned_size as u64;
