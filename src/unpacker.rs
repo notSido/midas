@@ -5,7 +5,7 @@ use crate::pe::{PeFile, PeLoader, PeDumper};
 use crate::emu::{EmulationEngine, EmulationState};
 use crate::themida::{OepDetector, detect_themida};
 use crate::win64::{peb, ldr};
-use crate::win64::api::{self, ApiRegistry};
+use crate::win64::{api::{self, ApiRegistry}, syscall};
 use unicorn_engine::{RegisterX86, Unicorn};
 use unicorn_engine::unicorn_const::HookType;
 use std::path::Path;
@@ -140,8 +140,12 @@ impl Unpacker {
         let oep_found_clone = oep_found.clone();
         let api_registry_clone = api_registry_shared.clone();
         
+        // Shared workspace for syscall handler
+        let workspace_shared = Arc::new(Mutex::new(*workspace));
+        let workspace_clone_for_hook = workspace_shared.clone();
+        
         // Add instruction hook
-        let _code_hook = engine.emu_mut().add_code_hook(0, u64::MAX, move |emu, addr, _size| {
+        let _code_hook = engine.emu_mut().add_code_hook(0, u64::MAX, move |emu, addr, size| {
             let mut count = instr_count_clone.lock().unwrap();
             *count += 1;
             
@@ -160,6 +164,25 @@ impl Unpacker {
             // Log more frequently in verbose mode for debugging
             if *count % 10000 == 0 {
                 log::trace!("At 0x{:x} after {} instructions", addr, *count);
+            }
+            
+            // Check for syscall instruction (0x0F 0x05)
+            if size >= 2 {
+                if let Ok(bytes) = emu.mem_read_as_vec(addr, 2) {
+                    if bytes[0] == 0x0F && bytes[1] == 0x05 {
+                        // Syscall detected!
+                        let mut ws = workspace_clone_for_hook.lock().unwrap();
+                        match syscall::handle_syscall(emu, &mut *ws) {
+                            Ok(_) => {
+                                // Syscall handled, continue
+                            }
+                            Err(e) => {
+                                log::error!("Syscall handler error: {}", e);
+                            }
+                        }
+                        return; // Syscall handler already advanced RIP
+                    }
+                }
             }
             
             // Check for OEP
@@ -251,9 +274,10 @@ impl Unpacker {
             log::debug!("Emulation error (expected): {:?}", e);
         }
         
-        // Update workspace from registry
+        // Update workspace from both registry and syscall handler
         let registry = api_registry_shared.lock().unwrap();
-        *workspace = registry.workspace;
+        let syscall_workspace = workspace_shared.lock().unwrap();
+        *workspace = std::cmp::max(registry.workspace, *syscall_workspace);
         
         Ok(())
     }
