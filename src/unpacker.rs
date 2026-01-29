@@ -307,38 +307,27 @@ impl Unpacker {
             }
         ).map_err(|e| UnpackError::EmulationError(format!("Failed to add mem hook: {:?}", e)))?;
         
-        // Add unmapped memory fetch hook to catch and fix addressing issues
-        let _mem_fetch_unmapped_hook = engine.emu_mut().add_mem_hook(
+        // Add unmapped memory read/fetch hooks for debugging
+        let _mem_read_unmapped = engine.emu_mut().add_mem_hook(
+            HookType::MEM_READ_UNMAPPED,
+            0,
+            u64::MAX,
+            move |_emu, _mem_type, addr, size, _value| {
+                log::error!("READ_UNMAPPED at 0x{:x} (size: {})", addr, size);
+                false // Stop on unmapped reads
+            }
+        ).map_err(|e| UnpackError::EmulationError(format!("Failed to add read unmapped hook: {:?}", e)))?;
+        
+        let _mem_fetch_unmapped = engine.emu_mut().add_mem_hook(
             HookType::MEM_FETCH_UNMAPPED,
             0,
             u64::MAX,
-            move |emu, _mem_type, addr, size, _value| {
-                log::warn!("Attempted to execute unmapped memory at 0x{:x} (size: {})", addr, size);
-                
-                // Check if this looks like a relative address that should have image base
-                if addr < 0x10000000 {
-                    let fixed_addr = image_base + addr;
-                    log::info!("Fixing relative address: 0x{:x} -> 0x{:x}", addr, fixed_addr);
-                    
-                    // Check if fixed address is in a valid range
-                    if fixed_addr >= image_base && fixed_addr < image_base + 0x1000000 {
-                        // Update RIP to corrected address
-                        match emu.reg_write(RegisterX86::RIP, fixed_addr) {
-                            Ok(_) => {
-                                log::info!("Successfully redirected to 0x{:x}", fixed_addr);
-                                return true; // Continue execution
-                            }
-                            Err(e) => {
-                                log::error!("Failed to update RIP: {:?}", e);
-                            }
-                        }
-                    }
-                }
-                
-                log::error!("Cannot fix unmapped address 0x{:x}, stopping", addr);
-                false // Stop execution
+            move |_emu, _mem_type, addr, size, _value| {
+                log::error!("FETCH_UNMAPPED at 0x{:x} (size: {})", addr, size);
+                log::error!("This address should be mapped if decompression worked correctly");
+                false // Stop on unmapped fetch
             }
-        ).map_err(|e| UnpackError::EmulationError(format!("Failed to add unmapped fetch hook: {:?}", e)))?;
+        ).map_err(|e| UnpackError::EmulationError(format!("Failed to add fetch unmapped hook: {:?}", e)))?;
         
         // Start emulation
         log::info!("Starting emulation from 0x{:x}", entry_point);

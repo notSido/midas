@@ -49,36 +49,45 @@ impl PeLoader {
         }
         
         // Map low memory FIRST for RVA addressing (before stack)
-        // Themida jumps to RVA addresses (0x6c00d) expecting them to be mapped
-        let low_mem_start = 0x1000u64;
+        // Themida jumps to RVA addresses expecting them to be mapped
+        // Include address 0 for null pointer reads that might be valid in packer code
+        let low_mem_start = 0x0u64;
         let low_mem_end = 0x1000000u64; // Up to 16MB
         
-        emu.mem_map(low_mem_start, low_mem_end - low_mem_start, Prot::ALL)
+        emu.mem_map(low_mem_start, low_mem_end, Prot::ALL)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map low memory: {:?}", e)))?;
         
         log::info!("Mapped low memory for RVA addressing: 0x{:x} - 0x{:x}", low_mem_start, low_mem_end);
         
         // Mirror PE sections to low memory (for RVA addressing)
-        // Write headers at offset 0x1000 (can't write to address 0)
-        if header_size > 0 {
-            emu.mem_write(low_mem_start, &self.pe.data[..header_size])?;
+        // Write headers (if any)
+        if header_size > 0 && header_size <= self.pe.data.len() {
+            // Write headers starting at 0
+            emu.mem_write(0, &self.pe.data[..header_size])?;
+            log::debug!("Wrote PE headers to address 0");
         }
         
         for section in self.pe.sections() {
             let virtual_addr = section.virtual_address as u64;
             let raw_ptr = section.pointer_to_raw_data as usize;
             let raw_size = section.size_of_raw_data as usize;
+            let virtual_size = section.virtual_size as u64;
+            let section_name = String::from_utf8_lossy(&section.name);
             
             if raw_size > 0 && raw_ptr + raw_size <= self.pe.data.len() && virtual_addr < low_mem_end {
                 emu.mem_write(virtual_addr, &self.pe.data[raw_ptr..raw_ptr + raw_size])?;
-                log::debug!("Mirrored section to RVA 0x{:x}", virtual_addr);
+                log::info!("Mirrored section {} to RVA 0x{:x} (raw: 0x{:x}, virt: 0x{:x})", 
+                    section_name.trim_end_matches('\0'), virtual_addr, raw_size, virtual_size);
+            } else if virtual_addr < low_mem_end {
+                log::warn!("Section {} at RVA 0x{:x} has no raw data (virtual size: 0x{:x})",
+                    section_name.trim_end_matches('\0'), virtual_addr, virtual_size);
             }
         }
         
         log::info!("Mirrored PE to low memory (RVA mode)");
         
         // Allocate stack at higher address to avoid conflict
-        let stack_base = 0x10000000u64; // 256MB
+        let stack_base = 0x10000000u64; // 256MB  
         let stack_size = 0x00100000u64; // 1MB stack
         emu.mem_map(stack_base, stack_size, Prot::READ | Prot::WRITE)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map stack: {:?}", e)))?;
@@ -86,56 +95,6 @@ impl PeLoader {
         let stack_pointer = stack_base + (stack_size as u64) - 0x1000;
         
         log::info!("Stack allocated at 0x{:x}, RSP: 0x{:x}", stack_base, stack_pointer);
-        
-        // Map low memory region as a catch-all for relative addressing issues
-        // Themida sometimes jumps to RVA addresses without image base
-        // Map memory starting from 0x1000 to handle this
-        let low_mem_start = 0x1000u64;
-        let low_mem_size = 0x1000000u64; // 16MB should be enough for the entire image
-        
-        // Check if this will conflict with stack
-        if low_mem_start + low_mem_size <= stack_base {
-            match emu.mem_map(low_mem_start, low_mem_size, Prot::ALL) {
-                Ok(_) => {
-                    log::info!("Mapped low memory region: 0x{:x} - 0x{:x}", low_mem_start, low_mem_start + low_mem_size);
-                    
-                    // Mirror the entire PE to low memory
-                    // This handles packers that use RVA addressing
-                    
-                    // Write headers at RVA 0
-                    if let Err(e) = emu.mem_write(0, &self.pe.data[..header_size]) {
-                        log::warn!("Could not write headers to low memory: {:?}", e);
-                    }
-                    
-                    // Write each section at its RVA
-                    for section in self.pe.sections() {
-                        let virtual_addr = section.virtual_address as u64;
-                        let raw_ptr = section.pointer_to_raw_data as usize;
-                        let raw_size = section.size_of_raw_data as usize;
-                        
-                        if raw_size > 0 && raw_ptr + raw_size <= self.pe.data.len() {
-                            if virtual_addr < low_mem_size {
-                                match emu.mem_write(virtual_addr, &self.pe.data[raw_ptr..raw_ptr + raw_size]) {
-                                    Ok(_) => {
-                                        log::debug!("Mirrored section at RVA 0x{:x}", virtual_addr);
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Could not mirror section at 0x{:x}: {:?}", virtual_addr, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    log::info!("Mirrored PE to low memory (RVA addressing support)");
-                }
-                Err(e) => {
-                    log::warn!("Could not map low memory: {:?}", e);
-                }
-            }
-        } else {
-            log::warn!("Low memory mapping would overlap with stack, skipping");
-        }
         
         Ok(stack_pointer)
     }
