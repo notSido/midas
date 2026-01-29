@@ -1,10 +1,10 @@
 use clap::Parser;
-use themida_unpack::*;
+use midas::*;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "themida-unpack")]
-#[command(about = "Themida 3.x unpacker for Linux", long_about = None)]
+#[command(name = "midas")]
+#[command(about = "Midas - Themida 3.x unpacker for Linux", long_about = None)]
 struct Args {
     /// Input PE file (Themida-protected)
     #[arg(short, long)]
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         .format_timestamp(None)
         .init();
     
-    log::info!("Themida Unpacker v{}", env!("CARGO_PKG_VERSION"));
+    log::info!("Midas v{} - Themida Unpacker", env!("CARGO_PKG_VERSION"));
     log::info!("Input: {:?}", args.input);
     
     // Load PE

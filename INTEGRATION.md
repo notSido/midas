@@ -13,25 +13,25 @@ WORKDIR /build/midas
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-COPY --from=midas-builder /build/midas/target/release/themida-unpack /usr/local/bin/
+COPY --from=midas-builder /build/midas/target/release/midas /usr/local/bin/
 RUN apt-get update && apt-get install -y libgcc-s1 && rm -rf /var/lib/apt/lists/*
 ```
 
 ### Usage
 
 ```bash
-themida-unpack -i protected.exe -o unpacked.exe -v
+midas -i protected.exe -o unpacked.exe -v
 ```
 
 ## As a Library
 
 ```toml
 [dependencies]
-themida-unpack = { git = "https://github.com/notSido/midas.git" }
+midas = { git = "https://github.com/notSido/midas.git" }
 ```
 
 ```rust
-use themida_unpack::*;
+use midas::*;
 
 fn main() -> Result<()> {
     let pe = pe::PeFile::load("protected.exe")?;

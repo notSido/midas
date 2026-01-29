@@ -18,9 +18,9 @@ COPY . .
 RUN cargo build --release
 
 # Verify binary exists
-RUN ls -lh target/release/themida-unpack
+RUN ls -lh target/release/midas
 
 # Test basic execution
-RUN target/release/themida-unpack --help || echo "Binary built successfully"
+RUN target/release/midas --help || echo "Binary built successfully"
 
 CMD ["/bin/bash"]

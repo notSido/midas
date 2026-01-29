@@ -340,6 +340,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "midas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "clap",
+ "env_logger",
+ "goblin",
+ "iced-x86",
+ "log",
+ "memmap2",
+ "thiserror",
+ "unicorn-engine",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -512,22 +528,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "themida-unpack"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "byteorder",
- "clap",
- "env_logger",
- "goblin",
- "iced-x86",
- "log",
- "memmap2",
- "thiserror",
- "unicorn-engine",
 ]
 
 [[package]]

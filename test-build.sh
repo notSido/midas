@@ -14,14 +14,14 @@ docker run --rm -v "$(pwd):/midas" -w /midas rust:latest bash -c '
   export LIBCLANG_PATH=/usr/lib/llvm-14/lib
   cargo build --release 2>&1 | grep -E "(Compiling|Finished|error)" || true
   
-  if [ -f target/release/themida-unpack ]; then
+  if [ -f target/release/midas ]; then
     echo ""
     echo "✅ Build SUCCESS!"
     echo ""
-    ls -lh target/release/themida-unpack
+    ls -lh target/release/midas
     echo ""
     echo "Testing binary..."
-    target/release/themida-unpack --help
+    target/release/midas --help
   else
     echo ""
     echo "❌ Build FAILED!"

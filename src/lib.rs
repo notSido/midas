@@ -1,4 +1,4 @@
-//! Themida 3.x unpacker for Linux
+//! Midas - Themida 3.x unpacker for Linux
 //! 
 //! This library provides functionality to unpack Themida-protected PE64 executables
 //! using Unicorn CPU emulation on Linux systems.

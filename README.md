@@ -1,6 +1,8 @@
-# Themida Unpacker
+# Midas
 
 A Themida 3.x unpacker for Linux, written in Rust, using Unicorn CPU emulation.
+
+**Midas** turns Themida-protected binaries into analyzable code through CPU emulation.
 
 ## Features
 
@@ -48,7 +50,7 @@ docker run --rm -v "$(pwd):/midas" -w /midas rust:latest bash -c '
   cargo build --release
 '
 
-# Binary will be at: target/release/themida-unpack
+# Binary will be at: target/release/midas
 ```
 
 ### Or use the test script
@@ -64,13 +66,13 @@ Due to Unicorn build requirements, this must be built on Linux. Use Docker as sh
 
 ```bash
 # Basic usage
-./target/release/themida-unpack -i protected.exe -o unpacked.exe
+midas -i protected.exe -o unpacked.exe
 
 # Verbose output
-./target/release/themida-unpack -i protected.exe -o unpacked.exe -v
+midas -i protected.exe -o unpacked.exe -v
 
 # Custom instruction limit
-./target/release/themida-unpack -i protected.exe -o unpacked.exe --max-instructions 50000000
+midas -i protected.exe -o unpacked.exe --max-instructions 50000000
 ```
 
 ## Limitations
