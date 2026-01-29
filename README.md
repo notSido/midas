@@ -22,12 +22,16 @@ PE File → Parser → Unicorn Loader → Emulation → OEP Detection → Dump
 
 ## Current Status
 
+✅ **BUILDS SUCCESSFULLY IN DOCKER/LINUX** - Tested on Rust latest with Debian
+
 **Phase 1: Foundation** ✅ (COMPLETED)
 - [x] Project structure
 - [x] PE64 parser
-- [x] Unicorn engine wrapper
+- [x] Unicorn engine wrapper (API compatibility fixed)
 - [x] Basic Windows structures (PEB, TEB, LDR)
 - [x] Core module interfaces
+- [x] Successfully compiles and runs
+- [x] Detects `.themida` section in protected binaries
 
 **Phase 2: API Emulation** 🚧 (IN PROGRESS)
 - [x] kernel32.dll basic hooks (VirtualAlloc, GetProcAddress, etc.)
@@ -49,9 +53,25 @@ PE File → Parser → Unicorn Loader → Emulation → OEP Detection → Dump
 
 ## Building
 
+### In Docker/Linux (Recommended)
 ```bash
-cargo build --release
+docker run --rm -v "$(pwd):/midas" -w /midas rust:latest bash -c '
+  apt-get update && apt-get install -y libclang-dev clang cmake
+  export LIBCLANG_PATH=/usr/lib/llvm-19/lib
+  cargo build --release
+'
+
+# Binary will be at: target/release/themida-unpack
 ```
+
+### Or use the test script
+```bash
+chmod +x test-build.sh
+./test-build.sh
+```
+
+### macOS Note
+Due to Unicorn build requirements, this must be built on Linux. Use Docker as shown above.
 
 ## Usage
 
