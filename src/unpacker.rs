@@ -134,6 +134,7 @@ impl Unpacker {
         
         // Create execution tracer
         let tracer = Arc::new(Mutex::new(ExecutionTracer::new()));
+        let last_unique_count = Arc::new(Mutex::new(0usize));
         
         // Shared state for hooks
         let instruction_count = Arc::new(Mutex::new(0u64));
@@ -149,6 +150,7 @@ impl Unpacker {
         let api_registry_clone = api_registry_shared.clone();
         let cpu_state_clone = cpu_state.clone();
         let tracer_clone = tracer.clone();
+        let last_unique_clone = last_unique_count.clone();
         
         // Shared workspace for syscall handler
         let workspace_shared = Arc::new(Mutex::new(*workspace));
@@ -166,7 +168,21 @@ impl Unpacker {
                 
                 // Check for loops and log stats periodically
                 if *count % 1000000 == 0 {
+                    let current_unique = trace.unique_count();
                     log::info!("Execution stats: {}", trace.stats());
+                    
+                    // Check for breakout (OEP transition)
+                    let mut last_count = last_unique_clone.lock().unwrap();
+                    if trace.detect_breakout(*last_count) {
+                        log::info!("🎯 BREAKOUT DETECTED! Unique addresses jumped from {} to {}", *last_count, current_unique);
+                        log::info!("🎯 This is likely the OEP transition!");
+                        
+                        // Mark OEP as found
+                        let mut oep = oep_found_clone.lock().unwrap();
+                        *oep = true;
+                    }
+                    *last_count = current_unique;
+                    
                     if trace.is_looping() {
                         log::warn!("Detected execution loop!");
                     }
@@ -355,11 +371,12 @@ impl Unpacker {
         let oep_reached = *oep_found.lock().unwrap();
         if oep_reached {
             state.mark_oep_reached();
-            // Set OEP in detector
+            // Set OEP in detector - use whatever RIP we have when breakout was detected
             let rip = engine.get_rip()?;
-            if rip >= code_start && rip < code_end {
-                oep_detector.on_execute(rip);
-            }
+            log::info!("OEP transition detected, current RIP: 0x{:x}", rip);
+            
+            // Set this as the OEP regardless of which section it's in
+            oep_detector.oep = Some(rip);
         }
         
         log::info!("Emulation stopped after {} instructions", final_count);

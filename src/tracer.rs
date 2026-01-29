@@ -62,6 +62,27 @@ impl ExecutionTracer {
         false
     }
     
+    /// Check if execution just broke out of a loop (OEP transition)
+    /// Returns true if unique address count increased dramatically
+    pub fn detect_breakout(&self, last_unique_count: usize) -> bool {
+        let current = self.unique_count();
+        
+        // If unique addresses increased by 100x or more, we broke out!
+        if last_unique_count > 0 && last_unique_count < 1000 {
+            let increase_factor = current / last_unique_count;
+            if increase_factor >= 100 {
+                return true;
+            }
+        }
+        
+        // Or if we jumped from <1000 to >100000 unique addresses
+        if last_unique_count < 1000 && current > 100000 {
+            return true;
+        }
+        
+        false
+    }
+    
     /// Get execution statistics
     pub fn stats(&self) -> String {
         let total: u64 = self.address_counts.values().sum();
