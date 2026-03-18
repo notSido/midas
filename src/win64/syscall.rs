@@ -3,7 +3,7 @@
 //! Modern packers like Themida use direct syscalls to bypass API hooks.
 //! This module intercepts syscall instructions and emulates NT kernel functions.
 
-use crate::{Result, UnpackError};
+use crate::Result;
 use unicorn_engine::{Unicorn, RegisterX86};
 
 /// Syscall dispatcher - handles syscall instruction
@@ -90,8 +90,8 @@ fn nt_allocate_virtual_memory(emu: &mut Unicorn<'_, ()>, workspace: &mut u64) ->
 /// NtProtectVirtualMemory - Syscall 0x50
 fn nt_protect_virtual_memory(emu: &mut Unicorn<'_, ()>) -> Result<u64> {
     let _process_handle = emu.reg_read(RegisterX86::RCX)?;
-    let base_address_ptr = emu.reg_read(RegisterX86::RDX)?;
-    let region_size_ptr = emu.reg_read(RegisterX86::R8)?;
+    let _base_address_ptr = emu.reg_read(RegisterX86::RDX)?;
+    let _region_size_ptr = emu.reg_read(RegisterX86::R8)?;
     let new_protect = emu.reg_read(RegisterX86::R9)?;
     
     // Read from stack for 5th parameter (old protect pointer)

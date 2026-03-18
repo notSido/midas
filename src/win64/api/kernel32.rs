@@ -3,6 +3,17 @@
 use crate::{Result, UnpackError};
 use unicorn_engine::{Unicorn, RegisterX86};
 
+/// Hash bytes to a fake module handle in the 0x7000_0000..0x7FFF_0000 range
+fn fnv1a_hash_to_handle(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    // Place in 0x7000_0000..0x7FFF_0000, 64KB aligned (like real module handles)
+    0x7000_0000 + ((h % 0x0FFF) * 0x10000)
+}
+
 /// VirtualAlloc implementation
 pub fn virtual_alloc(emu: &mut Unicorn<'_, ()>, workspace: &mut u64) -> Result<()> {
     // Read arguments from registers (x64 calling convention)
@@ -49,7 +60,7 @@ pub fn virtual_protect(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Resul
 pub fn get_proc_address(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
     let hmodule = emu.reg_read(RegisterX86::RCX)?;
     let lpprocname = emu.reg_read(RegisterX86::RDX)?;
-    
+
     // Try to read the function name
     let mut name_bytes = Vec::new();
     for i in 0..256 {
@@ -60,21 +71,32 @@ pub fn get_proc_address(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Resu
         }
         name_bytes.push(byte);
     }
-    
+
     let func_name = String::from_utf8_lossy(&name_bytes);
     log::debug!("GetProcAddress: module=0x{:x}, func={}", hmodule, func_name);
-    
-    // Return a fake address (we'll hook this later)
-    let fake_addr = 0xFEED_0000 + (func_name.len() as u64 * 0x100);
+
+    // Use a hash of module+name to produce a unique fake address per function,
+    // avoiding collisions between functions with the same name length
+    let hash = {
+        let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+        for b in hmodule.to_le_bytes().iter().chain(name_bytes.iter()) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
+        }
+        h
+    };
+    // Place in a dedicated range that won't collide with the API registry (0xFEED_0000..+0x2000)
+    // Use 0xFEEE_0000..0xFEFF_FFFF (1MB range, 16-byte aligned)
+    let fake_addr = 0xFEEE_0000 + ((hash % 0x10_0000) & !0xF);
     emu.reg_write(RegisterX86::RAX, fake_addr)?;
-    
+
     Ok(())
 }
 
 /// LoadLibraryA stub
 pub fn load_library_a(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
     let lpfilename = emu.reg_read(RegisterX86::RCX)?;
-    
+
     // Try to read the library name
     let mut name_bytes = Vec::new();
     for i in 0..256 {
@@ -85,35 +107,38 @@ pub fn load_library_a(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result
         }
         name_bytes.push(byte);
     }
-    
+
     let lib_name = String::from_utf8_lossy(&name_bytes);
     log::debug!("LoadLibraryA: {}", lib_name);
-    
-    // Return a fake module handle
-    let fake_handle = 0x7000_0000 + (lib_name.len() as u64 * 0x10000);
+
+    // Hash the library name to produce a unique fake handle
+    let fake_handle = fnv1a_hash_to_handle(&name_bytes);
     emu.reg_write(RegisterX86::RAX, fake_handle)?;
-    
+
     Ok(())
 }
 
-/// GetTickCount stub
+/// GetTickCount stub — returns incrementing values to avoid anti-timing detection
 pub fn get_tick_count(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
-    // Return a fake tick count
-    emu.reg_write(RegisterX86::RAX, 0x12345678)?;
+    // Use the RSP as a cheap source of varying state so successive calls differ
+    let rsp = emu.reg_read(RegisterX86::RSP).unwrap_or(0);
+    let tick = 0x12345678u64.wrapping_add(rsp & 0xFFFF);
+    emu.reg_write(RegisterX86::RAX, tick)?;
     Ok(())
 }
 
-/// QueryPerformanceCounter stub
+/// QueryPerformanceCounter stub — returns incrementing values
 pub fn query_performance_counter(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
     let lp_counter = emu.reg_read(RegisterX86::RCX)?;
-    
-    // Write a fake counter value
-    let counter_value: u64 = 0x123456789ABCDEF;
+
+    // Vary the counter using RSP so successive calls return different values
+    let rsp = emu.reg_read(RegisterX86::RSP).unwrap_or(0);
+    let counter_value: u64 = 0x123456789ABCDEFu64.wrapping_add(rsp);
     emu.mem_write(lp_counter, &counter_value.to_le_bytes())?;
-    
+
     // Return success
     emu.reg_write(RegisterX86::RAX, 1)?;
-    
+
     Ok(())
 }
 
@@ -146,7 +171,7 @@ pub fn virtual_query(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<
 /// LoadLibraryW stub (wide char version)
 pub fn load_library_w(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
     let lpfilename = emu.reg_read(RegisterX86::RCX)?;
-    
+
     // Read wide string
     let mut name_bytes = Vec::new();
     for i in (0..512).step_by(2) {
@@ -158,16 +183,16 @@ pub fn load_library_w(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result
         name_bytes.push(bytes[0]);
         name_bytes.push(bytes[1]);
     }
-    
+
     let lib_name = String::from_utf16_lossy(
         &name_bytes.chunks(2)
             .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
             .collect::<Vec<u16>>()
     );
     log::debug!("LoadLibraryW: {}", lib_name);
-    
-    // Return fake handle
-    let fake_handle = 0x7000_0000 + (lib_name.len() as u64 * 0x10000);
+
+    // Hash the library name to produce a unique fake handle
+    let fake_handle = fnv1a_hash_to_handle(&name_bytes);
     emu.reg_write(RegisterX86::RAX, fake_handle)?;
     Ok(())
 }
@@ -194,9 +219,9 @@ pub fn get_module_handle_a(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> R
     
     let module_name = String::from_utf8_lossy(&name_bytes);
     log::debug!("GetModuleHandleA: {}", module_name);
-    
-    // Return fake handle
-    let fake_handle = 0x7000_0000 + (module_name.len() as u64 * 0x10000);
+
+    // Hash the module name to produce a unique fake handle
+    let fake_handle = fnv1a_hash_to_handle(&name_bytes);
     emu.reg_write(RegisterX86::RAX, fake_handle)?;
     Ok(())
 }
@@ -236,9 +261,11 @@ pub fn get_module_filename_a(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) ->
     Ok(())
 }
 
-/// GetTickCount64 stub
+/// GetTickCount64 stub — returns incrementing values
 pub fn get_tick_count64(emu: &mut Unicorn<'_, ()>, _workspace: &mut u64) -> Result<()> {
-    emu.reg_write(RegisterX86::RAX, 0x123456789)?;
+    let rsp = emu.reg_read(RegisterX86::RSP).unwrap_or(0);
+    let tick = 0x123456789u64.wrapping_add(rsp & 0xFFFF);
+    emu.reg_write(RegisterX86::RAX, tick)?;
     Ok(())
 }
 

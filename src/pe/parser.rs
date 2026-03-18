@@ -1,7 +1,6 @@
 //! PE64 file parser
 
 use crate::{Result, UnpackError};
-use goblin::pe::PE;
 use std::fs;
 use std::path::Path;
 
@@ -56,7 +55,7 @@ impl PeFile {
         let mut cursor = Cursor::new(&data[pe_offset + 4..]);
         
         // Parse COFF header (20 bytes)
-        let machine = cursor.read_u16::<LittleEndian>()?;
+        let _machine = cursor.read_u16::<LittleEndian>()?;
         let number_of_sections = cursor.read_u16::<LittleEndian>()?;
         cursor.read_u32::<LittleEndian>()?; // time_date_stamp
         cursor.read_u32::<LittleEndian>()?; // pointer_to_symbol_table
