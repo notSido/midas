@@ -5,7 +5,7 @@ use crate::pe::{PeFile, PeLoader, PeDumper};
 use crate::emu::{EmulationEngine, EmulationState};
 use crate::themida::{OepDetector, detect_themida};
 use crate::win64::{peb, ldr};
-use crate::win64::{api::{self, ApiRegistry}, syscall};
+use crate::win64::{api::ApiRegistry, syscall};
 use crate::cpu_features::{self, CpuState};
 use crate::tracer::ExecutionTracer;
 use unicorn_engine::{RegisterX86, Unicorn};
@@ -23,6 +23,7 @@ const WORKSPACE_BASE: u64 = 0x20000000;
 pub struct Unpacker {
     pe: PeFile,
     max_instructions: u64,
+    #[allow(dead_code)]
     verbose: bool,
 }
 
@@ -127,7 +128,7 @@ impl Unpacker {
         entry_point: u64,
     ) -> Result<()> {
         // Create API registry
-        let mut api_registry = ApiRegistry::new(API_HOOK_BASE, *workspace);
+        let api_registry = ApiRegistry::new(API_HOOK_BASE, *workspace);
         
         // Create CPU state for RDTSC/CPUID
         let cpu_state = Arc::new(Mutex::new(CpuState::new()));
@@ -161,55 +162,45 @@ impl Unpacker {
             let mut count = instr_count_clone.lock().unwrap();
             *count += 1;
             
-            // Track execution
+            // Track execution and check limits
             {
                 let mut trace = tracer_clone.lock().unwrap();
                 trace.record(addr);
-                
+
+                // Check instruction limit (inside same lock scope to avoid deadlock)
+                if *count >= max_instructions {
+                    log::warn!("Reached maximum instruction count");
+                    log::warn!("Final stats: {}", trace.stats());
+                    let _ = emu.emu_stop();
+                    return;
+                }
+
                 // Check for loops and log stats periodically
                 if *count % 1000000 == 0 {
                     let current_unique = trace.unique_count();
                     log::info!("Execution stats: {}", trace.stats());
-                    
+
                     // Check for breakout (OEP transition)
                     let mut last_count = last_unique_clone.lock().unwrap();
                     if trace.detect_breakout(*last_count) {
-                        log::info!("🎯 BREAKOUT DETECTED! Unique addresses jumped from {} to {}", *last_count, current_unique);
-                        log::info!("🎯 This is likely the OEP transition!");
-                        
+                        log::info!("BREAKOUT DETECTED! Unique addresses jumped from {} to {}", *last_count, current_unique);
+                        log::info!("This is likely the OEP transition!");
+
                         // Mark OEP as found
                         let mut oep = oep_found_clone.lock().unwrap();
                         *oep = true;
                     }
                     *last_count = current_unique;
-                    
+
                     if trace.is_looping() {
                         log::warn!("Detected execution loop!");
                     }
                 }
             }
             
-            // Check instruction limit
-            if *count >= max_instructions {
-                log::warn!("Reached maximum instruction count");
-                let trace = tracer_clone.lock().unwrap();
-                log::warn!("Final stats: {}", trace.stats());
-                let _ = emu.emu_stop();
-                return;
-            }
-            
             // Log execution periodically
             if *count % 100000 == 0 {
                 log::debug!("Executed {} instructions, current: 0x{:x}", *count, addr);
-                
-                // Log RSI if we're in the hot loop
-                if addr >= 0x14038d070 && addr <= 0x14038d0b0 {
-                    if let Ok(rsi) = emu.reg_read(RegisterX86::RSI) {
-                        if let Ok(rdi) = emu.reg_read(RegisterX86::RDI) {
-                            log::debug!("  RSI=0x{:x}, RDI=0x{:x}", rsi, rdi);
-                        }
-                    }
-                }
             }
             
             // Log more frequently in verbose mode for debugging
@@ -265,17 +256,6 @@ impl Unpacker {
                 }
             }
             
-            // Check for OEP
-            if addr >= code_start && addr < code_end {
-                // Potential OEP
-                let mut oep = oep_found_clone.lock().unwrap();
-                if !*oep {
-                    log::info!("Potential OEP reached at: 0x{:x}", addr);
-                    *oep = true;
-                    // Continue for a bit more to ensure unpacking is complete
-                }
-            }
-            
             // Check for API calls using registry
             let mut registry = api_registry_clone.lock().unwrap();
             if registry.is_api_hook(addr) {
@@ -299,13 +279,9 @@ impl Unpacker {
             }
         }).map_err(|e| UnpackError::EmulationError(format!("Failed to add code hook: {:?}", e)))?;
         
-        // Save workspace value
-        let workspace_val = *workspace;
-        
         // Add memory write hook to track code modifications
         let write_count = Arc::new(Mutex::new(0u64));
         let write_count_clone = write_count.clone();
-        let image_base = self.pe.image_base;
         
         let _mem_write_hook = engine.emu_mut().add_mem_hook(
             HookType::MEM_WRITE,

@@ -1,6 +1,6 @@
 //! Execution tracer for debugging infinite loops
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Tracks execution patterns to detect loops
 pub struct ExecutionTracer {
@@ -9,7 +9,7 @@ pub struct ExecutionTracer {
     /// Address execution frequency
     address_counts: HashMap<u64, u64>,
     /// Last N addresses (for pattern detection)
-    recent_addresses: Vec<u64>,
+    recent_addresses: VecDeque<u64>,
     /// Max recent addresses to track
     recent_limit: usize,
 }
@@ -19,19 +19,19 @@ impl ExecutionTracer {
         Self {
             unique_addresses: HashSet::new(),
             address_counts: HashMap::new(),
-            recent_addresses: Vec::new(),
+            recent_addresses: VecDeque::new(),
             recent_limit: 1000,
         }
     }
-    
+
     /// Record an executed address
     pub fn record(&mut self, addr: u64) {
         self.unique_addresses.insert(addr);
         *self.address_counts.entry(addr).or_insert(0) += 1;
-        
-        self.recent_addresses.push(addr);
+
+        self.recent_addresses.push_back(addr);
         if self.recent_addresses.len() > self.recent_limit {
-            self.recent_addresses.remove(0);
+            self.recent_addresses.pop_front();
         }
     }
     
