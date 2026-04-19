@@ -185,6 +185,85 @@ following:
   re-scoped. See the open question logged in HANDOFF's "when to
   check in" list.
 
+## Sample 1 recon — the VM *is* the dominant layer
+
+Same `--dump-region` analysis on `s1_check.jsonl` (1.73M post-OEP
+events, OEP 0x140eb084e):
+
+- **Top-5 dispatcher candidates are all `jmp r<reg>`.** Same
+  threaded-dispatch pattern as sample 2. Fan-outs 9–16, exec
+  counts 76–625. Top candidate: `0x140e9b848 jmp r8`.
+
+- **The real VM interpreter is at `0x140f82a80 ..`.** Canonical
+  pattern, heavily mutated but unmistakable:
+  ```
+  ; load VM_PC from [rbp + 0x15C]
+  mov r12, rbp
+  add r12, 0x15C
+  movzx r12, word ptr [r12]      ; fetch 16-bit opcode at VM_PC
+  add   r12w, 0x7F90              ; 16-bit decrypt
+  ; aux state dereference via [rbp + 0x58]
+  mov r8, rbp
+  add r8, 0x58
+  mov r8, [r8]
+  ...
+  (further mutation + handler-table lookup + dispatch)
+  ```
+  VM state offsets:
+  - `+0x15C` — VM_PC
+  - `+0x15F` — adjacent slot (possibly a 3-byte-packed sub-field)
+  - `+0x58`  — secondary state (handler-table-related)
+
+- **Critical quantitative difference from sample 2.** In the
+  1.73M-event trace, the VM interpreter region (0x140f82a80 ..
+  0x140f82c00 — ~256 bytes) saw roughly **20,000 hits across
+  71 unique RIPs**. Compared to sample 2's 3-hit slice, the VM
+  on sample 1 is actively driving execution — dispatching many
+  hundreds of VM opcodes across the recorded trace window.
+
+### Sample 1 vs sample 2 summary
+
+| Aspect                        | Sample 1          | Sample 2             |
+| ----------------------------- | ----------------- | -------------------- |
+| VM interpreter entry          | 0x140f82a80       | 0x141048839          |
+| VM_PC                         | `[rbp+0x15C]`     | `[rbp+0x9A]`         |
+| Aux state                     | `+0x58, +0x15F`   | `+0x26, +0xD4`       |
+| Decryption                    | `add r12w, 0x7F90` | `sub+sub+xor rolling` |
+| VM fire count (10M / 1.73M)  | ~20,000 hits      | 3 hits               |
+| Threaded-dispatch presence    | yes, dozens       | yes, dozens          |
+| Dominant execution layer      | **VM**            | **threaded dispatch**|
+
+### Strategic implication
+
+The two samples require different primary strategies.
+
+- **Sample 1.** Classical M5 is the right big lever: a bytecode-
+  stream lifter walking from the VM_PC at OEP, substituting
+  lifted handler semantics, producing a reconstructed native
+  program. The VM is active and observable.
+
+- **Sample 2.** Non-VM native deobfuscation (HANDOFF item 5) on
+  the threaded-dispatch layer is the bigger lever. M5 on sample 2
+  would clean up a tiny tail-called VM slice only.
+
+- **Shared infrastructure.** Both approaches use the same lifter
+  + simplifier pipeline on lifted IR. Building M5 for sample 1
+  gives us the bytecode-walker and handler-effect composer; we
+  can apply the handler-effect piece to sample 2's 3-hit slice
+  essentially for free.
+
+Recommended ordering for Deliverable B:
+
+1. Build M5 as a general tool using **sample 1** as the testbed
+   (VM is active, ground truth easy to validate).
+2. Apply M5 to sample 2 as-is — produces a small cleaned region.
+3. Build the non-VM native deobfuscation pass for sample 2's
+   threaded-dispatch layer — reuses the same lifter + simplifier
+   infrastructure on static basic blocks from the OEP dump.
+
+Open scope negotiations with the user before committing to
+either (1) or (3); both are multi-day pieces of work.
+
 ## Earlier finding — sample 2 *is* VM'd; 2M events was too short
 
 **Retraction of earlier finding.** An earlier version of this doc
