@@ -18,4 +18,4 @@ pub mod vm;
 
 pub use trace::TraceBuilder;
 pub use trace_events::Event;
-pub use vm::{DispatcherCandidate, TraceAnalysis};
+pub use vm::{DispatcherCandidate, Handler, HandlerCatalog, TraceAnalysis};

@@ -5,6 +5,8 @@
 //! which means they are cheap to iterate on and easy to unit-test with
 //! synthetic traces.
 
+pub mod handlers;
 pub mod regions;
 
+pub use handlers::{Handler, HandlerCatalog};
 pub use regions::{DispatcherCandidate, TraceAnalysis};
