@@ -12,6 +12,7 @@ pub mod unpacker;
 pub mod result;
 pub mod cpu_features;
 pub mod tracer;
+pub mod devirt;
 
 pub use result::UnpackResult;
 pub use cpu_features::CpuState;
