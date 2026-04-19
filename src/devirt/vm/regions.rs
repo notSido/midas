@@ -79,6 +79,10 @@ impl TraceAnalysis {
                     oep_rip = Some(rip);
                     prev = None;
                 }
+                Event::RegsAtRip { .. } => {
+                    // register snapshot — ignored by the flat
+                    // dispatcher-candidate scan.
+                }
                 Event::Exec { rip, .. } => {
                     total_events += 1;
                     let entry = per_addr.entry(rip).or_default();

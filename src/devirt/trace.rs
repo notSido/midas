@@ -5,6 +5,7 @@
 //! unpack-phase instruction storm (millions of decompression-loop steps)
 //! doesn't bloat the trace. Arm it at breakout/OEP.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,10 @@ pub struct TraceBuilder {
     tick: u64,
     armed: bool,
     limit: u64,
+    /// RIPs at which a one-shot register snapshot should be emitted
+    /// the first time each RIP is executed post-OEP. Entries are
+    /// removed on capture so repeated firings don't spam the trace.
+    capture_regs_at: HashSet<u64>,
 }
 
 impl TraceBuilder {
@@ -36,7 +41,39 @@ impl TraceBuilder {
             tick: 0,
             armed: false,
             limit,
+            capture_regs_at: HashSet::new(),
         })
+    }
+
+    /// Register a RIP at which a one-shot register snapshot should
+    /// be emitted the first time that RIP fires post-OEP. Multiple
+    /// RIPs may be registered; each fires once.
+    pub fn add_capture_rip(&mut self, rip: u64) {
+        self.capture_regs_at.insert(rip);
+    }
+
+    /// Called from the hook on every post-arm instruction. Returns
+    /// true if this RIP is registered for a one-shot capture and
+    /// hasn't yet fired — the caller should snapshot registers and
+    /// pass them to `record_regs_at_rip`.
+    pub fn should_capture_regs(&self, rip: u64) -> bool {
+        self.armed && self.capture_regs_at.contains(&rip)
+    }
+
+    /// Record a RegsAtRip event. Removes the RIP from the pending
+    /// set so subsequent firings don't re-emit.
+    pub fn record_regs_at_rip(&mut self, rip: u64, regs: RegSnapshot) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.capture_regs_at.remove(&rip);
+        let event = Event::RegsAtRip {
+            tick: self.tick,
+            rip,
+            regs,
+        };
+        self.write_event(&event)?;
+        Ok(())
     }
 
     /// Switch recording on and emit a synthetic `OepReached` marker so

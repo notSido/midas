@@ -59,6 +59,24 @@ struct Args {
     /// `--devirt-trace` is set. Beyond this, emulation stops cleanly.
     #[arg(long, default_value = "1000000")]
     devirt_trace_limit: u64,
+
+    /// Emit a one-shot register snapshot the first time this RIP
+    /// fires post-OEP. Repeatable. Used by the offline bytecode
+    /// walker to recover register state at a specific point (e.g.
+    /// dispatcher entry) without a full register-delta trace.
+    /// Requires `--devirt-trace`.
+    #[arg(long, value_parser = parse_rip)]
+    devirt_capture_regs_at: Vec<u64>,
+}
+
+fn parse_rip(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    let (radix, body) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        (16, rest)
+    } else {
+        (10, s)
+    };
+    u64::from_str_radix(body, radix).map_err(|e| format!("bad RIP {:?}: {}", s, e))
 }
 
 fn main() {
@@ -139,6 +157,13 @@ fn run() -> Result<()> {
     let mut unpacker = unpacker::Unpacker::new(pe, args.max_instructions, args.verbose);
     if let Some(trace_path) = args.devirt_trace.clone() {
         unpacker.set_devirt_trace(trace_path, args.devirt_trace_limit);
+        if !args.devirt_capture_regs_at.is_empty() {
+            unpacker.set_devirt_capture_regs_at(args.devirt_capture_regs_at.clone());
+        }
+    } else if !args.devirt_capture_regs_at.is_empty() {
+        log::warn!(
+            "--devirt-capture-regs-at ignored because --devirt-trace was not set"
+        );
     }
     
     let unpack_result = unpacker.unpack(&output_path);

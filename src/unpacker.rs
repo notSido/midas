@@ -26,6 +26,10 @@ const WORKSPACE_BASE: u64 = 0x20000000;
 pub struct DevirtTraceConfig {
     pub path: PathBuf,
     pub limit: u64,
+    /// RIPs at which the unpacker should emit a one-shot register
+    /// snapshot the first time each fires post-OEP. Populated by
+    /// `set_devirt_capture_regs_at`. Empty by default.
+    pub capture_regs_at: Vec<u64>,
 }
 
 /// Main unpacker that coordinates all components
@@ -55,7 +59,21 @@ impl Unpacker {
         self.devirt_trace = Some(DevirtTraceConfig {
             path: path.into(),
             limit,
+            capture_regs_at: Vec::new(),
         });
+    }
+
+    /// Register one or more RIPs at which the unpacker should emit a
+    /// one-shot register snapshot the first time each fires post-OEP.
+    /// Requires `set_devirt_trace` to have been called first.
+    pub fn set_devirt_capture_regs_at(&mut self, rips: Vec<u64>) {
+        if let Some(cfg) = &mut self.devirt_trace {
+            cfg.capture_regs_at = rips;
+        } else if !rips.is_empty() {
+            log::warn!(
+                "set_devirt_capture_regs_at ignored — devirt trace not configured"
+            );
+        }
     }
     
     /// Run the unpacking process
@@ -171,7 +189,19 @@ impl Unpacker {
         // Shared with the code hook behind an Arc<Mutex<_>>; armed at
         // breakout, written to per-instruction until the configured limit.
         let devirt_trace: Option<Arc<Mutex<TraceBuilder>>> = match &self.devirt_trace {
-            Some(cfg) => Some(Arc::new(Mutex::new(TraceBuilder::new(&cfg.path, cfg.limit)?))),
+            Some(cfg) => {
+                let mut tb = TraceBuilder::new(&cfg.path, cfg.limit)?;
+                for rip in &cfg.capture_regs_at {
+                    tb.add_capture_rip(*rip);
+                }
+                if !cfg.capture_regs_at.is_empty() {
+                    log::info!(
+                        "Devirt trace registered {} capture-regs-at RIPs",
+                        cfg.capture_regs_at.len()
+                    );
+                }
+                Some(Arc::new(Mutex::new(tb)))
+            }
             None => None,
         };
 
@@ -268,6 +298,29 @@ impl Unpacker {
             if let Some(tb) = &devirt_trace_clone {
                 let mut tb = tb.lock().unwrap();
                 if tb.is_armed() {
+                    // One-shot register capture: if this RIP is
+                    // registered via --devirt-capture-regs-at, emit a
+                    // RegsAtRip event before the Exec. Removed from the
+                    // pending set on success so repeated firings don't
+                    // spam the trace.
+                    if tb.should_capture_regs(addr) {
+                        match snapshot_gprs(emu) {
+                            Ok(regs) => {
+                                if let Err(e) = tb.record_regs_at_rip(addr, regs) {
+                                    log::warn!(
+                                        "regs-at-rip record failed at 0x{:x}: {}",
+                                        addr,
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "regs snapshot failed at 0x{:x}: {}",
+                                addr,
+                                e
+                            ),
+                        }
+                    }
                     let read_size = (size as usize).min(15);
                     let bytes = emu.mem_read_as_vec(addr, read_size).unwrap_or_default();
                     match tb.record_exec(addr, &bytes) {

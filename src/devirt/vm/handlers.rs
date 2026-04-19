@@ -90,8 +90,8 @@ impl HandlerCatalog {
                 UnpackError::DumpError(format!("bad trace line: {}", e))
             })?;
             match event {
-                Event::OepReached { .. } => {
-                    // marker — ignore for segmentation
+                Event::OepReached { .. } | Event::RegsAtRip { .. } => {
+                    // markers / register snapshots — ignore for segmentation
                 }
                 Event::Exec { rip, bytes, .. } => {
                     if rip == dispatcher_rip {

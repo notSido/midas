@@ -33,6 +33,18 @@ pub enum Event {
         #[serde(with = "hex_bytes")]
         bytes: Vec<u8>,
     },
+
+    /// Register snapshot captured the first time a specific RIP is
+    /// executed post-OEP. Triggered by `--devirt-capture-regs-at`;
+    /// used to recover register state at known-interesting points
+    /// (e.g. VM dispatcher entry) so the offline bytecode walker
+    /// can resolve `[rbp + X]`-style VM-state pointers without a
+    /// second emulator run.
+    RegsAtRip {
+        tick: u64,
+        rip: u64,
+        regs: RegSnapshot,
+    },
 }
 
 /// Full 16-GPR + RIP snapshot. Stored in JSONL as a flat object so
