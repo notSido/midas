@@ -9,7 +9,7 @@ use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use midas::devirt::{
     detect_vm, group_into_contexts, lift_instruction, resolve_vm_addresses, HandlerCatalog,
-    LiftError, RegSnapshot, TraceAnalysis,
+    LiftError, OepDump, RegSnapshot, TraceAnalysis,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -74,6 +74,18 @@ struct Args {
     /// specific parameters.
     #[arg(long)]
     detect_vm: bool,
+}
+
+/// Turn `<stem>.trace.jsonl` (the path midas writes) into
+/// `<stem>.exe` (the OEP dump path midas writes alongside). Returns
+/// `None` for non-matching suffixes — user can still view the
+/// detector output without a dump.
+fn derive_oep_dump_path(trace_path: &PathBuf) -> Option<PathBuf> {
+    let file_name = trace_path.file_name()?.to_str()?;
+    let stem = file_name.strip_suffix(".trace.jsonl")?;
+    let mut p = trace_path.clone();
+    p.set_file_name(format!("{}.exe", stem));
+    Some(p)
 }
 
 fn parse_hex_or_dec(s: &str) -> std::result::Result<u64, String> {
@@ -148,6 +160,22 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
 
     let mut descriptors = detect_vm(&instructions);
     resolve_vm_addresses(&mut descriptors, &reg_captures);
+
+    // Auto-derive the OEP dump path from the trace path: the unpacker
+    // writes the trace as `<stem>.trace.jsonl` alongside the PE at
+    // `<stem>.exe`. No flag — zero-config, same layout as the
+    // unpacker produces.
+    let dump = derive_oep_dump_path(&args.input)
+        .and_then(|p| match OepDump::load(&p) {
+            Ok(d) => {
+                eprintln!("analyze-trace: loaded OEP dump {:?}", p);
+                Some(d)
+            }
+            Err(e) => {
+                eprintln!("analyze-trace: OEP dump {:?} not loaded: {}", p, e);
+                None
+            }
+        });
     let contexts = group_into_contexts(&descriptors);
     let resolved_count = descriptors.iter().filter(|d| d.vm_pc_addr.is_some()).count();
     println!("== VM detector ==");
@@ -191,11 +219,29 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
             None => println!("  handler_table_offset: (unresolved)"),
         }
         match d.vm_pc_addr {
-            Some(a) => println!("  vm_pc_addr:           0x{:x}", a),
+            Some(a) => {
+                let val = dump.as_ref().and_then(|d| d.read_u64_at_va(a));
+                match val {
+                    Some(v) => println!(
+                        "  vm_pc_addr:           0x{:x}  *(u64*) = 0x{:x}",
+                        a, v
+                    ),
+                    None => println!("  vm_pc_addr:           0x{:x}  (no dump read)", a),
+                }
+            }
             None => println!("  vm_pc_addr:           (no capture / unresolved)"),
         }
         match d.handler_table_addr {
-            Some(a) => println!("  handler_table_addr:   0x{:x}", a),
+            Some(a) => {
+                let val = dump.as_ref().and_then(|d| d.read_u64_at_va(a));
+                match val {
+                    Some(v) => println!(
+                        "  handler_table_addr:   0x{:x}  *(u64*) = 0x{:x}",
+                        a, v
+                    ),
+                    None => println!("  handler_table_addr:   0x{:x}  (no dump read)", a),
+                }
+            }
             None => println!("  handler_table_addr:   (no capture / unresolved)"),
         }
         if d.rbp_state_offsets.is_empty() {

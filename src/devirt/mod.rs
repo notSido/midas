@@ -13,11 +13,13 @@
 //! - **M4**: per-handler semantics via simplification.
 
 pub mod ir;
+pub mod oep_dump;
 pub mod trace;
 pub mod trace_events;
 pub mod vm;
 
 pub use ir::{lift_instruction, Effect, Expr, LiftError, RegId};
+pub use oep_dump::OepDump;
 pub use trace::TraceBuilder;
 pub use trace_events::{Event, RegSnapshot};
 pub use vm::{
