@@ -26,8 +26,11 @@
 //! present and future, without per-sample code paths.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+
+use crate::devirt::trace_events::RegSnapshot;
 
 /// A single VM dispatcher located in the input. Multiple VMs in one
 /// binary produce multiple descriptors; each one is independent.
@@ -55,6 +58,15 @@ pub struct VmDescriptor {
     /// through its most recent `mov target, [base]` load, then the
     /// base register's most recent `rbp + IMM` definition.
     pub handler_table_offset: Option<i64>,
+    /// Resolved absolute address of the VM_PC pointer cell —
+    /// `rbp + vm_pc_offset` evaluated using the RBP snapshot
+    /// captured at `dispatch_rip`. `None` when there's no capture
+    /// for this dispatcher in the supplied reg-capture map, or
+    /// when `vm_pc_offset` is unresolved.
+    pub vm_pc_addr: Option<u64>,
+    /// Resolved absolute address of the handler-table-base pointer
+    /// cell — same derivation, paired with `handler_table_offset`.
+    pub handler_table_addr: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +193,8 @@ pub fn detect_vm(instructions: &BTreeMap<u64, Vec<u8>>) -> Vec<VmDescriptor> {
                 rbp_state_offsets,
                 vm_pc_offset: None,
                 handler_table_offset: None,
+                vm_pc_addr: None,
+                handler_table_addr: None,
             };
             d.vm_pc_offset = classify_vm_pc(&d, instructions);
             d.handler_table_offset = classify_handler_table(&d, instructions);
@@ -189,6 +203,29 @@ pub fn detect_vm(instructions: &BTreeMap<u64, Vec<u8>>) -> Vec<VmDescriptor> {
     }
 
     descriptors
+}
+
+/// Fill in `vm_pc_addr` and `handler_table_addr` on each descriptor
+/// whose `dispatch_rip` matches an entry in `reg_captures`. RBP at
+/// dispatcher entry is read from the captured snapshot; the addresses
+/// are `rbp.wrapping_add_signed(offset)`. No-ops for descriptors
+/// whose dispatcher didn't fire in the trace, or whose offsets
+/// weren't resolved.
+pub fn resolve_vm_addresses(
+    descriptors: &mut [VmDescriptor],
+    reg_captures: &HashMap<u64, RegSnapshot>,
+) {
+    for d in descriptors.iter_mut() {
+        let Some(regs) = reg_captures.get(&d.dispatch_rip) else {
+            continue;
+        };
+        if let Some(off) = d.vm_pc_offset {
+            d.vm_pc_addr = Some(regs.rbp.wrapping_add_signed(off));
+        }
+        if let Some(off) = d.handler_table_offset {
+            d.handler_table_addr = Some(regs.rbp.wrapping_add_signed(off));
+        }
+    }
 }
 
 /// Return the RBP-relative offset that feeds the opcode fetch's

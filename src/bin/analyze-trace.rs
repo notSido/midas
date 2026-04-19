@@ -8,7 +8,8 @@
 use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use midas::devirt::{
-    detect_vm, group_into_contexts, lift_instruction, HandlerCatalog, LiftError, TraceAnalysis,
+    detect_vm, group_into_contexts, lift_instruction, resolve_vm_addresses, HandlerCatalog,
+    LiftError, RegSnapshot, TraceAnalysis,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -118,13 +119,14 @@ fn run(args: Args) -> midas::Result<()> {
 
 fn run_detect_vm(args: &Args) -> midas::Result<()> {
     use midas::devirt::Event;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
     let file = File::open(&args.input)?;
     let reader = BufReader::new(file);
     let mut instructions: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut reg_captures: HashMap<u64, RegSnapshot> = HashMap::new();
     for line in reader.lines().flatten() {
         if line.trim().is_empty() {
             continue;
@@ -133,17 +135,30 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if let Event::Exec { rip, bytes, .. } = event {
-            instructions.entry(rip).or_insert(bytes);
+        match event {
+            Event::Exec { rip, bytes, .. } => {
+                instructions.entry(rip).or_insert(bytes);
+            }
+            Event::RegsAtRip { rip, regs, .. } => {
+                reg_captures.entry(rip).or_insert(regs);
+            }
+            Event::OepReached { .. } => {}
         }
     }
 
-    let descriptors = detect_vm(&instructions);
+    let mut descriptors = detect_vm(&instructions);
+    resolve_vm_addresses(&mut descriptors, &reg_captures);
     let contexts = group_into_contexts(&descriptors);
+    let resolved_count = descriptors.iter().filter(|d| d.vm_pc_addr.is_some()).count();
     println!("== VM detector ==");
-    println!("input:              {:?}", args.input);
-    println!("unique instructions:{}", instructions.len());
-    println!("descriptors found:  {}", descriptors.len());
+    println!("input:                 {:?}", args.input);
+    println!("unique instructions:   {}", instructions.len());
+    println!("reg captures:          {}", reg_captures.len());
+    println!("descriptors found:     {}", descriptors.len());
+    println!(
+        "descriptors with addrs:{}  (RegsAtRip captures matched to dispatcher RIP)",
+        resolved_count
+    );
     println!(
         "unique VM contexts: {}  (dedup by (vm_pc_offset, handler_table_offset))",
         contexts.len()
@@ -174,6 +189,14 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
         match d.handler_table_offset {
             Some(o) => println!("  handler_table_offset: rbp + 0x{:x}", o),
             None => println!("  handler_table_offset: (unresolved)"),
+        }
+        match d.vm_pc_addr {
+            Some(a) => println!("  vm_pc_addr:           0x{:x}", a),
+            None => println!("  vm_pc_addr:           (no capture / unresolved)"),
+        }
+        match d.handler_table_addr {
+            Some(a) => println!("  handler_table_addr:   0x{:x}", a),
+            None => println!("  handler_table_addr:   (no capture / unresolved)"),
         }
         if d.rbp_state_offsets.is_empty() {
             println!("  rbp_state_offsets: (none observed in window)");
