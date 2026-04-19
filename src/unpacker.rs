@@ -377,6 +377,46 @@ impl Unpacker {
             }
         ).map_err(|e| UnpackError::EmulationError(format!("Failed to add mem hook: {:?}", e)))?;
         
+        // Mirror-sync hook: when code writes to image_base+RVA, replicate
+        // the write to low_mem+RVA. The low-memory mirror is populated at
+        // PE load with raw file bytes; later runtime writes to image_base
+        // (e.g. Themida's decompression output) would otherwise leave the
+        // mirror stale, and any subsequent bare-RVA jump/read would hit
+        // out-of-date data. This hook is defensive hygiene — it is NOT
+        // what fixes the observed INSN_INVALID crashes on either sample
+        // (those are caused by fake-import pointers resolving into the
+        // PE's own import-name strings, which is a separate and larger
+        // fix; see task #10 and docs/DEVIRT.md).
+        let image_base = self.pe.image_base;
+        let image_end = image_base + self.pe.size_of_image;
+        let low_mem_end = std::cmp::max(
+            (self.pe.size_of_image + 0xFFF) & !0xFFF,
+            0x1000000u64,
+        );
+        let mirror_write_count = Arc::new(Mutex::new(0u64));
+        let mirror_count_clone = mirror_write_count.clone();
+        let _mirror_hook = engine.emu_mut().add_mem_hook(
+            HookType::MEM_WRITE,
+            image_base,
+            image_end,
+            move |emu, _mem_type, addr, size, value| {
+                let rva = addr - image_base;
+                if rva >= low_mem_end {
+                    return true;
+                }
+                let n = size.min(8);
+                // Unicorn delivers value as i64 for writes up to 8 bytes;
+                // for rare larger writes we take the low 8 bytes (good
+                // enough in practice for Themida's decompression, which
+                // uses byte/word/dword/qword stores).
+                let le = value.to_le_bytes();
+                if emu.mem_write(rva, &le[..n]).is_ok() {
+                    *mirror_count_clone.lock().unwrap() += 1;
+                }
+                true
+            },
+        ).map_err(|e| UnpackError::EmulationError(format!("Failed to add mirror hook: {:?}", e)))?;
+
         // Add unmapped memory read/fetch hooks for debugging
         let _mem_read_unmapped = engine.emu_mut().add_mem_hook(
             HookType::MEM_READ_UNMAPPED,
@@ -432,6 +472,40 @@ impl Unpacker {
         }
         
         log::info!("Emulation stopped after {} instructions", final_count);
+        log::info!(
+            "Mirror-sync writes propagated: {}",
+            *mirror_write_count.lock().unwrap()
+        );
+
+        // Diagnostic: if emulation halted in low-mem, compare the bytes
+        // at the crash RIP to the matching image_base+RVA address. This
+        // tells us whether the section was decrypted at all.
+        if let Err(ref _e) = result {
+            if let Ok(crash_rip) = engine.get_rip() {
+                let image_base = self.pe.image_base;
+                let image_top = image_base + self.pe.size_of_image;
+                let low_mem_end = std::cmp::max(
+                    (self.pe.size_of_image + 0xFFF) & !0xFFF,
+                    0x1000000u64,
+                );
+                if crash_rip < low_mem_end {
+                    let rva = crash_rip;
+                    let mirror_bytes = engine.emu_mut()
+                        .mem_read_as_vec(rva, 16)
+                        .unwrap_or_default();
+                    let image_addr = image_base + rva;
+                    let image_bytes = if image_addr < image_top {
+                        engine.emu_mut().mem_read_as_vec(image_addr, 16).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    log::warn!(
+                        "Crash-site bytes at RVA 0x{:x}: mirror={:02x?} image={:02x?}",
+                        rva, mirror_bytes, image_bytes
+                    );
+                }
+            }
+        }
         
         // Check emulation result
         if let Err(e) = result {

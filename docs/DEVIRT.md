@@ -156,27 +156,61 @@ four distinct signatures) but differ in internal control flow
 based on data. Real semantic dedup requires M3-level lifting
 followed by M4 simplification.
 
-**Sample 1 status: unknown, but probably also VM'd.** Sample 1's
-emulation halts hard at 1.73M post-OEP events with
-`INSN_INVALID at 0x16f08b` — a jump through the low-memory RVA
-mirror that lands on invalid bytes. Until that emulation bug is
-fixed, we cannot test the same hypothesis on sample 1. The bug is
-orthogonal to the devirt pipeline; it is a loader / memory-mapping
-issue (possibly the .themida section has no raw data but is being
-jumped into via a computed address).
+**Both samples halt at a post-OEP fake-import crash.** Sample 1
+stops with `INSN_INVALID at 0x16f08b` (1.73M post-OEP events in);
+sample 2 stops with `INSN_INVALID at 0x1038083` (15.4M post-OEP
+events in). Diagnostic (implemented in `unpacker.rs` — dumps
+bytes at the crash RIP on error exit) shows the bytes are ASCII:
 
-Revised strategic fork (to decide before M3):
+- sample 1 @ 0x6f08b: `"ateDeviceAndSwap\0"` — part of
+  `D3D10CreateDeviceAndSwapChain`.
+- sample 2 @ 0x1038083: `"aceIcon\0MPR.dll\0"` — part of
+  `ExtractAssociatedIconA` plus the DLL name `MPR.dll`.
 
-1. **Push to M3 on sample 2.** Lift handler bodies to IR, simplify
-   away junk ops, attempt semantic dedup. Concrete and testable
-   on the data we already have. Most direct continuation.
-2. **Fix sample 1's `INSN_INVALID` first.** Without this, we're
-   devirting one sample instead of two — violates the "must work
-   on both samples" rule. Probably a few hours of loader debugging.
-3. **Longer trace on sample 2 first (50M–100M events).** Confirm
-   the dispatcher characterization holds at scale and see if an
-   inner dispatcher emerges from the fan-out tail. 100M ≈ 12 min
-   runtime, 6 GB JSONL.
+The programs are calling imports through the IAT, and the IAT
+entries still hold their *original* values — pointers to the
+Import-Name-Table strings inside the PE — rather than resolved
+function addresses. Themida's unpack-phase IAT reconstruction did
+not produce usable pointers in our emulator because our fake
+`LoadLibrary` / `GetProcAddress` / PEB-LDR don't return values
+that Themida's manual export-walk resolver accepts.
+
+**Fix needed:** Speakeasy-style decoy DLLs with real export tables,
+mapped into the emulator and hooked into the PEB's
+`InLoadOrderModuleList`. Non-trivial scope — probably a day of
+work for a minimal kernel32+user32+ntdll+d3d10 stub set. Tracked
+as task #10 but deferred.
+
+**Workaround for now:** both samples produce enough post-OEP
+events (sample 1: 1.73M; sample 2: 15.4M at the 50M attempt) to
+drive M3 IR lifting on the handler bodies we already have. We are
+not blocked on devirt progress; we are blocked on full sample-1
+coverage.
+
+**Defensive fix that landed.** `unpacker.rs` now installs a
+MEM_WRITE hook on the image_base range that mirrors writes into
+the low-mem RVA mirror (see the `Mirror-sync hook` comment).
+This does not fix the observed INSN_INVALID crashes but prevents
+a separate, latent class of "bare-RVA read after image_base
+write" bugs from producing wrong data. Mirror-sync writes counted
+during a run (logged post-emulation) — 17.8M for sample 1, 7.9M
+for sample 2 — so the hook fires heavily during the unpack phase.
+
+Revised strategic fork (decision after diagnostic work):
+
+1. **Push to M3 on sample 2.** Lift handler bodies to IR,
+   simplify away junk ops, attempt semantic dedup. Concrete and
+   testable on the 15.4M-event sample 2 trace we already have.
+   Chosen path.
+2. **Fix the fake-import crash (decoy DLLs).** Required for full
+   sample 1 coverage and for eventually running either sample
+   past the post-OEP fake-import call. Deferred to a dedicated
+   session — scope is a day of work, not an afternoon.
+3. **Longer trace confirmation (c).** Done — 15.4M-event run
+   confirmed `0x14105b029` (fan_out 13, exec 2085, scales
+   linearly) and surfaced a layer of **second-tier indirect
+   branches** (`0x14112463f` etc. at fan_out 31-41, lower exec)
+   suggesting a two-level VM.
 
 ## Empirical observations (after M1, 2M-event traces)
 
