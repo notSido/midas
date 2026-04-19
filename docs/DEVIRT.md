@@ -287,6 +287,38 @@ One pipeline, sample-agnostic, applied to both samples:
 Build order: (1) → (2) → (3) → (4). Each piece is a general tool;
 each new sample exercises the same code path.
 
+### Caveat on RBP at OEP (blocker for trivial bytecode walking)
+
+OepReached now carries a full GPR snapshot (see commit `f6b2bb5`).
+But empirically — verified against the OEP dump for sample 2 —
+**RBP at OEP does not point at the VM state structure**. For
+sample 2: RBP@OEP = `0x14125c2bc`, and reading 8 bytes at
+`rbp + 0x9a` from the OEP dump yields `0x490000006df38149`, which
+is *instruction bytes* (`xor r11, 0x6d; ...`), not a bytecode
+pointer.
+
+Explanation: at OEP the unpacker has finished, but the program's
+original entry hasn't yet set up the VM's state base register.
+The VM re-uses RBP as its state pointer but loads a different
+value into it when execution reaches the VM dispatcher.
+
+Implication for the bytecode walker: it needs register state at
+**first-dispatcher-entry**, not at OEP. Options:
+- Add a "capture regs at RIP X" trigger to the unpacker. After
+  the detector returns a dispatch_rip, re-run the unpacker with
+  that RIP armed; the second run produces a snapshot at the
+  dispatcher's first firing.
+- Add periodic reg snapshots (every N post-OEP ticks). Look up
+  the nearest snapshot before the dispatcher's first firing.
+- Add memory-access events to the trace. Skip register
+  recovery entirely and just read the memory addresses that the
+  dispatcher actually touched during recorded execution.
+
+The third option is the most faithful — it sidesteps any guess
+about which RBP value was "correct" and records ground truth.
+Scope: ~1 hour to add Unicorn `HookType::MEM_READ` and emit new
+trace events.
+
 ### Detector findings (M5 prep, shipped)
 
 The VM-pattern detector described in step (1) above is implemented

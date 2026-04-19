@@ -9,6 +9,6 @@ pub mod detector;
 pub mod handlers;
 pub mod regions;
 
-pub use detector::{detect_vm, RbpOffset, VmDescriptor};
+pub use detector::{detect_vm, group_into_contexts, RbpOffset, VmContext, VmDescriptor};
 pub use handlers::{Handler, HandlerCatalog};
 pub use regions::{DispatcherCandidate, TraceAnalysis};

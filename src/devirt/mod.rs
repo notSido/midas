@@ -20,4 +20,7 @@ pub mod vm;
 pub use ir::{lift_instruction, Effect, Expr, LiftError, RegId};
 pub use trace::TraceBuilder;
 pub use trace_events::{Event, RegSnapshot};
-pub use vm::{detect_vm, DispatcherCandidate, Handler, HandlerCatalog, RbpOffset, TraceAnalysis, VmDescriptor};
+pub use vm::{
+    detect_vm, group_into_contexts, DispatcherCandidate, Handler, HandlerCatalog, RbpOffset,
+    TraceAnalysis, VmContext, VmDescriptor,
+};

@@ -7,7 +7,9 @@
 
 use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
-use midas::devirt::{detect_vm, lift_instruction, HandlerCatalog, LiftError, TraceAnalysis};
+use midas::devirt::{
+    detect_vm, group_into_contexts, lift_instruction, HandlerCatalog, LiftError, TraceAnalysis,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
@@ -137,10 +139,24 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
     }
 
     let descriptors = detect_vm(&instructions);
+    let contexts = group_into_contexts(&descriptors);
     println!("== VM detector ==");
     println!("input:              {:?}", args.input);
     println!("unique instructions:{}", instructions.len());
     println!("descriptors found:  {}", descriptors.len());
+    println!(
+        "unique VM contexts: {}  (dedup by (vm_pc_offset, handler_table_offset))",
+        contexts.len()
+    );
+    for (i, c) in contexts.iter().enumerate() {
+        println!(
+            "  ctx #{}: vm_pc=rbp+0x{:x}, table=rbp+0x{:x}, {} dispatch sites",
+            i + 1,
+            c.vm_pc_offset,
+            c.handler_table_offset,
+            c.dispatch_rips.len()
+        );
+    }
     println!();
     if descriptors.is_empty() {
         println!("(no VM dispatchers detected — either the trace doesn't");

@@ -69,6 +69,44 @@ pub struct RbpOffset {
     pub add_rip: u64,
 }
 
+/// A set of dispatcher sites that share the same `(vm_pc_offset,
+/// handler_table_offset)` classification — i.e. they're plural
+/// dispatch *sites* for the same VM *context*. Themida frequently
+/// inlines a VM dispatcher into many call sites; treating them as
+/// one context is usually what you want for M5.
+#[derive(Debug, Clone)]
+pub struct VmContext {
+    pub vm_pc_offset: i64,
+    pub handler_table_offset: i64,
+    /// All descriptor dispatch RIPs that map to this context.
+    pub dispatch_rips: Vec<u64>,
+}
+
+/// Collapse a list of descriptors into one `VmContext` per unique
+/// `(vm_pc_offset, handler_table_offset)` pair. Descriptors missing
+/// either classification are skipped (they can't be placed in any
+/// context confidently). The resulting list is sorted by
+/// dispatch-site count, descending.
+pub fn group_into_contexts(descriptors: &[VmDescriptor]) -> Vec<VmContext> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(i64, i64), Vec<u64>> = BTreeMap::new();
+    for d in descriptors {
+        if let (Some(pc), Some(tbl)) = (d.vm_pc_offset, d.handler_table_offset) {
+            by_key.entry((pc, tbl)).or_default().push(d.dispatch_rip);
+        }
+    }
+    let mut out: Vec<VmContext> = by_key
+        .into_iter()
+        .map(|((pc, tbl), rips)| VmContext {
+            vm_pc_offset: pc,
+            handler_table_offset: tbl,
+            dispatch_rips: rips,
+        })
+        .collect();
+    out.sort_by(|a, b| b.dispatch_rips.len().cmp(&a.dispatch_rips.len()));
+    out
+}
+
 /// Scan the given `(rip -> bytes)` map for VM dispatcher patterns.
 /// The map is typically built from a trace's `Exec` events but could
 /// equally well come from a disassembled OEP dump.
