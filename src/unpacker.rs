@@ -8,9 +8,10 @@ use crate::win64::{peb, ldr};
 use crate::win64::{api::ApiRegistry, syscall};
 use crate::cpu_features::{self, CpuState};
 use crate::tracer::ExecutionTracer;
+use crate::devirt::TraceBuilder;
 use unicorn_engine::{RegisterX86, Unicorn};
 use unicorn_engine::unicorn_const::HookType;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// API hook range
@@ -19,12 +20,21 @@ const API_HOOK_BASE: u64 = 0xFEED_0000;
 /// Workspace for allocations
 const WORKSPACE_BASE: u64 = 0x20000000;
 
+/// Optional devirt-trace recording configuration. When present, the
+/// unpacker will continue past the OEP breakout point and write a JSONL
+/// trace for downstream VM analysis (M1+).
+pub struct DevirtTraceConfig {
+    pub path: PathBuf,
+    pub limit: u64,
+}
+
 /// Main unpacker that coordinates all components
 pub struct Unpacker {
     pe: PeFile,
     max_instructions: u64,
     #[allow(dead_code)]
     verbose: bool,
+    devirt_trace: Option<DevirtTraceConfig>,
 }
 
 impl Unpacker {
@@ -34,7 +44,18 @@ impl Unpacker {
             pe,
             max_instructions,
             verbose,
+            devirt_trace: None,
         }
+    }
+
+    /// Enable post-OEP per-instruction trace recording for
+    /// devirtualization. Without this, the unpacker stops at OEP as
+    /// before — the trace recording path is strictly additive.
+    pub fn set_devirt_trace<P: Into<PathBuf>>(&mut self, path: P, limit: u64) {
+        self.devirt_trace = Some(DevirtTraceConfig {
+            path: path.into(),
+            limit,
+        });
     }
     
     /// Run the unpacking process
@@ -136,7 +157,7 @@ impl Unpacker {
         // Create execution tracer
         let tracer = Arc::new(Mutex::new(ExecutionTracer::new()));
         let last_unique_count = Arc::new(Mutex::new(0usize));
-        
+
         // Shared state for hooks
         let instruction_count = Arc::new(Mutex::new(0u64));
         let max_instructions = self.max_instructions;
@@ -146,6 +167,14 @@ impl Unpacker {
         let code_end = oep_detector.code_end;
         let api_registry_shared = Arc::new(Mutex::new(api_registry));
 
+        // Devirt trace recorder — present only when --devirt-trace was set.
+        // Shared with the code hook behind an Arc<Mutex<_>>; armed at
+        // breakout, written to per-instruction until the configured limit.
+        let devirt_trace: Option<Arc<Mutex<TraceBuilder>>> = match &self.devirt_trace {
+            Some(cfg) => Some(Arc::new(Mutex::new(TraceBuilder::new(&cfg.path, cfg.limit)?))),
+            None => None,
+        };
+
         // Clone Arcs for hook closures
         let instr_count_clone = instruction_count.clone();
         let oep_found_clone = oep_found.clone();
@@ -154,6 +183,7 @@ impl Unpacker {
         let cpu_state_clone = cpu_state.clone();
         let tracer_clone = tracer.clone();
         let last_unique_clone = last_unique_count.clone();
+        let devirt_trace_clone = devirt_trace.clone();
         
         // Shared workspace for syscall handler
         let workspace_shared = Arc::new(Mutex::new(*workspace));
@@ -182,22 +212,66 @@ impl Unpacker {
                     let current_unique = trace.unique_count();
                     log::info!("Execution stats: {}", trace.stats());
 
-                    // Check for breakout (OEP transition)
+                    // Check for breakout (OEP transition). Skip once we
+                    // already fired — otherwise the post-OEP stream keeps
+                    // re-tripping the heuristic every million insns.
+                    let already_oep = *oep_found_clone.lock().unwrap();
                     let mut last_count = last_unique_clone.lock().unwrap();
-                    if trace.detect_breakout(*last_count) {
+                    if !already_oep && trace.detect_breakout(*last_count) {
                         log::info!("BREAKOUT DETECTED! Unique addresses jumped from {} to {} at RIP 0x{:x}", *last_count, current_unique, addr);
 
-                        // Capture current RIP as OEP candidate and stop emulation —
-                        // this is the first instruction past the decompression loop.
+                        // Capture current RIP as OEP candidate — this is the
+                        // first instruction past the decompression loop.
                         *oep_candidate_clone.lock().unwrap() = Some(addr);
                         *oep_found_clone.lock().unwrap() = true;
-                        let _ = emu.emu_stop();
-                        return;
+
+                        match &devirt_trace_clone {
+                            Some(tb) => {
+                                // Devirt mode: arm the recorder and keep
+                                // running so we capture the VM execution.
+                                if let Err(e) = tb.lock().unwrap().arm(addr) {
+                                    log::error!("Failed to arm devirt trace: {}", e);
+                                    let _ = emu.emu_stop();
+                                    return;
+                                }
+                                *last_count = current_unique;
+                            }
+                            None => {
+                                // No devirt: stop at OEP as before.
+                                let _ = emu.emu_stop();
+                                return;
+                            }
+                        }
+                    } else {
+                        *last_count = current_unique;
                     }
-                    *last_count = current_unique;
 
                     if trace.is_looping() {
                         log::warn!("Detected execution loop!");
+                    }
+                }
+            }
+
+            // Devirt trace: record this instruction if the recorder is
+            // armed. Cheap no-op while disarmed (before OEP) — one lock +
+            // boolean check. Past the limit, stop emulation cleanly.
+            if let Some(tb) = &devirt_trace_clone {
+                let mut tb = tb.lock().unwrap();
+                if tb.is_armed() {
+                    let read_size = (size as usize).min(15);
+                    let bytes = emu.mem_read_as_vec(addr, read_size).unwrap_or_default();
+                    match tb.record_exec(addr, &bytes) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            log::info!("Devirt trace limit reached at tick {}, stopping emulation", tb.tick());
+                            let _ = emu.emu_stop();
+                            return;
+                        }
+                        Err(e) => {
+                            log::error!("Devirt trace write error: {}", e);
+                            let _ = emu.emu_stop();
+                            return;
+                        }
                     }
                 }
             }
@@ -374,7 +448,19 @@ impl Unpacker {
         let registry = api_registry_shared.lock().unwrap();
         let syscall_workspace = workspace_shared.lock().unwrap();
         *workspace = std::cmp::max(registry.workspace, *syscall_workspace);
-        
+
+        // Flush the devirt trace (if any). We can't consume the builder
+        // here — the Unicorn hook closure keeps a strong `Arc` alive for
+        // the engine's lifetime — so just flush through the lock. The
+        // file closes when the engine (and its hooks) eventually drop.
+        if let Some(arc) = &devirt_trace {
+            let mut builder = arc.lock().map_err(|e| {
+                UnpackError::EmulationError(format!("devirt trace mutex poisoned: {:?}", e))
+            })?;
+            let events = builder.flush()?;
+            log::info!("Devirt trace finalized: {} events", events);
+        }
+
         Ok(())
     }
     

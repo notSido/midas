@@ -86,7 +86,22 @@ impl TraceBuilder {
         Ok(true)
     }
 
-    /// Flush and close. Returns the number of exec events written.
+    /// Flush buffered output to disk. Callable through a lock — useful
+    /// because the Unicorn hook closure keeps a strong `Arc` reference
+    /// alive for the whole engine lifetime, so we can't consume `self`
+    /// with `finish()` from `run_emulation`.
+    pub fn flush(&mut self) -> Result<u64> {
+        self.writer.flush()?;
+        log::info!(
+            "Devirt trace flushed: {} exec events written to {:?}",
+            self.tick,
+            self.path
+        );
+        Ok(self.tick)
+    }
+
+    /// Flush and consume. Used by tests / standalone callers that own
+    /// the builder outright.
     pub fn finish(mut self) -> Result<u64> {
         self.writer.flush()?;
         log::info!(

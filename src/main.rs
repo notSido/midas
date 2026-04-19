@@ -16,8 +16,10 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
     
-    /// Maximum instructions to emulate (default: 10 million)
-    #[arg(short, long, default_value = "10000000")]
+    /// Maximum instructions to emulate (default: 500 million — well above
+    /// what current Themida 3.x samples need to reach OEP; pass a smaller
+    /// value explicitly if you want a faster fail)
+    #[arg(short, long, default_value = "500000000")]
     max_instructions: u64,
     
     /// Verbose output
@@ -47,6 +49,16 @@ struct Args {
     /// Workspace base address for allocations
     #[arg(long, default_value = "0x20000000")]
     workspace: String,
+
+    /// Record a per-instruction execution trace starting at OEP
+    /// (devirtualization input). Output format is JSONL.
+    #[arg(long)]
+    devirt_trace: Option<PathBuf>,
+
+    /// Cap on the number of post-OEP instructions recorded when
+    /// `--devirt-trace` is set. Beyond this, emulation stops cleanly.
+    #[arg(long, default_value = "1000000")]
+    devirt_trace_limit: u64,
 }
 
 fn main() {
@@ -125,6 +137,9 @@ fn run() -> Result<()> {
     // Create unpacker and run
     let start_time = Instant::now();
     let mut unpacker = unpacker::Unpacker::new(pe, args.max_instructions, args.verbose);
+    if let Some(trace_path) = args.devirt_trace.clone() {
+        unpacker.set_devirt_trace(trace_path, args.devirt_trace_limit);
+    }
     
     let unpack_result = unpacker.unpack(&output_path);
     let elapsed = start_time.elapsed();
