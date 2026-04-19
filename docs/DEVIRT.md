@@ -31,7 +31,7 @@ each against a commercial packer like Themida 3.x.
 | M0  | Per-instruction trace (JSONL, armed at OEP) | ✅ done | `16094ba`, `70ded59` |
 | M1  | VM dispatcher candidate finder (offline trace analysis) | ✅ done | `a3fc9ce` |
 | M2  | Handler discovery, basic-block cluster & dedup | ✅ done | `2dab0b4` |
-| M3  | IR (`Expr` + `Effect`) + iced-x86 → IR lifter | ✅ done — all GPR widths, ZF/SF flags, cmp/test, je/jne/js/jns, unconditional jmp. 98.5% on sample 2 top handler |            |
+| M3  | IR (`Expr` + `Effect`) + iced-x86 → IR lifter | ✅ done — all GPR widths, ZF/SF flags, cmp/test, je/jne/js/jns, unconditional jmp, push/pop/inc/dec/lea/movzx. 99.9% on sample 2 top handler |            |
 | M4  | Per-handler semantics via simplification | ☐ required for semantic dedup (RIP-seq too strict) | |
 | M5  | VM bytecode stream lifter (stretch)        | ☐      |            |
 | M6  | IR simplifier — constant fold + algebraic peephole | ☐ |            |
@@ -212,31 +212,32 @@ Revised strategic fork (decision after diagnostic work):
    branches** (`0x14112463f` etc. at fan_out 31-41, lower exec)
    suggesting a two-level VM.
 
-## M3 lift coverage (sample 2, after M3.5)
+## M3 lift coverage (sample 2, after M3.5 + follow-up)
 
-After the M3.5 iteration (partial-register writes, rflags ZF/SF
-as pseudo-registers, cmp/test, je/jne/js/jns, unconditional jmp),
-whole-handler coverage on sample 2's dispatcher `0x14105b029`:
+After M3.5 (partial-register writes, ZF/SF, cmp/test, jcc, jmp) and
+the follow-up adding `push`/`pop`/`inc`/`dec`/`lea`/`movzx`, whole-
+handler coverage on sample 2's dispatcher `0x14105b029`:
 
-| Handler | Entry         | Length | Fires | Lifted    | Coverage |
-| ------- | ------------- | ------ | ----- | --------- | -------- |
-| #0      | 0x1411d6656   | 4183   | 34    | 4120/4183 | **98.5%** |
-| #1      | 0x141113557   | 2049   | 22    | 1986/2049 | 96.9%    |
-| #2      | 0x141113557   | 1892   | 22    | 1831/1892 | 96.8%    |
+| Handler | Entry         | Length | Fires | Lifted    | Coverage  |
+| ------- | ------------- | ------ | ----- | --------- | --------- |
+| #0      | 0x1411d6656   | 4183   | 34    | 4179/4183 | **99.90%** |
+| #1      | 0x141113557   | 1892   | 22    | 1890/1892 | 99.89%    |
+| #2      | 0x141113557   | 2049   | 22    | 2045/2049 | 99.80%    |
 
-(Measured on a fresh 10M-event trace post-commit. Earlier 15.4M
-figures listed 986 unique handlers; the 10M catalog is smaller
-but the three top handlers dominate fires-per-handler.)
+(Measured on a fresh 10M-event trace post-commit.)
 
-The real handler payload is now close to 100% lifted. The
-remaining ~60 unsupported instructions per handler are almost
-entirely the **dispatcher trailer** shared across every handler
-invocation: `push/pop rN` register-save prolog/epilog around the
-dispatch-prep trailer in `0x14105aecc..0x14105b029`. A handful of
-genuine-handler misses: `movzx` (zero-extending byte loads),
-`jbe` (needs CF), `dec ebx`, `pushfq`, `call`. `push`/`pop` are a
-straightforward next slice — they'd push the numbers to ~100% on
-the real payload.
+The remaining four-ish unsupported instructions per handler are
+all architecturally distinct features outside M3's stated scope:
+
+- `jbe` — needs CF modelling (compares via `CF | ZF`). We emit
+  ZF but not CF; deferred alongside `ja/jae/jb` until there's a
+  reason.
+- `pushfq` — push RFLAGS. Would require a full-flags composite
+  value; niche use inside handlers.
+- `call <addr>` — control-flow + implicit stack push. One per
+  handler, always the same outer-dispatcher helper
+  (`0x1410aa300`), pointing to the second-tier dispatcher area
+  from M1 findings.
 
 Representative real-payload excerpt, now fully lifted:
 

@@ -52,6 +52,13 @@ pub fn lift_instruction(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
         Mnemonic::Cmp => lift_cmp(insn),
         Mnemonic::Test => lift_test(insn),
 
+        Mnemonic::Inc => lift_inc_dec(insn, IncDec::Inc),
+        Mnemonic::Dec => lift_inc_dec(insn, IncDec::Dec),
+        Mnemonic::Lea => lift_lea(insn),
+        Mnemonic::Movzx => lift_movzx(insn),
+        Mnemonic::Push => lift_push(insn),
+        Mnemonic::Pop => lift_pop(insn),
+
         Mnemonic::Je | Mnemonic::Jne | Mnemonic::Js | Mnemonic::Jns => lift_jcc(insn),
         Mnemonic::Jmp => lift_jmp_unconditional(insn),
 
@@ -168,6 +175,115 @@ fn lift_test(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
     let raw = Expr::and(lhs, rhs);
     let mut effects = Vec::new();
     emit_zf_sf(&mut effects, raw, width_bits);
+    Ok(effects)
+}
+
+#[derive(Copy, Clone)]
+enum IncDec {
+    Inc,
+    Dec,
+}
+
+fn lift_inc_dec(insn: &Instruction, kind: IncDec) -> Result<Vec<Effect>, LiftError> {
+    require_op_count(insn, 1)?;
+    let width_bits = op_width_bits(insn, 0)?;
+    let v = lift_read_operand(insn, 0, width_bits)?;
+    // inc/dec set ZF/SF/OF/AF/PF but deliberately leave CF alone. We
+    // model ZF/SF; CF is preserved naturally by not emitting a SetFlag
+    // for it, matching the hardware.
+    let raw = match kind {
+        IncDec::Inc => Expr::add(v, Expr::Const(1)),
+        IncDec::Dec => Expr::sub(v, Expr::Const(1)),
+    };
+    let mut effects = write_dst(insn, raw.clone(), width_bits)?;
+    emit_zf_sf(&mut effects, raw, width_bits);
+    Ok(effects)
+}
+
+fn lift_lea(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
+    require_op_count(insn, 2)?;
+    // op1 must be memory; op0 is the destination register.
+    if insn.op_kind(1) != OpKind::Memory {
+        return Err(LiftError::BadOperand("lea source not memory"));
+    }
+    let addr = lift_mem_addr(insn)?;
+    let width_bits = op_width_bits(insn, 0)?;
+    // 32-bit dst zero-extends; 16/8-bit dst blends — handled inside
+    // `write_dst` via `partial_reg_write`.
+    write_dst(insn, addr, width_bits)
+}
+
+fn lift_movzx(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
+    require_op_count(insn, 2)?;
+    let dst_width = op_width_bits(insn, 0)?;
+    // Source width is deliberately distinct from dst width for movzx.
+    // Read the source at its own width; the resulting `Expr` is already
+    // zero-extended to a 64-bit value by our read helpers (partial-reg
+    // reads mask to width; memory loads zero-extend natively).
+    let src_width = match insn.op_kind(1) {
+        OpKind::Register => {
+            let r = insn.op_register(1);
+            if !r.is_gpr() {
+                return Err(LiftError::Unsupported("movzx non-GPR src"));
+            }
+            (r.size() as u8) * 8
+        }
+        OpKind::Memory => {
+            let sz = insn.memory_size().size();
+            match sz {
+                1 | 2 => (sz as u8) * 8,
+                _ => return Err(LiftError::Unsupported("movzx unusual mem src size")),
+            }
+        }
+        _ => return Err(LiftError::Unsupported("movzx src kind")),
+    };
+    let src = lift_read_operand(insn, 1, src_width)?;
+    write_dst(insn, src, dst_width)
+}
+
+fn lift_push(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
+    // 64-bit push only. `stack_pointer_increment` is -8 for the default
+    // long-mode push; -2 with an operand-size prefix (rare enough to
+    // reject here).
+    if insn.stack_pointer_increment() != -8 {
+        return Err(LiftError::Unsupported("non-64-bit push"));
+    }
+    let value = lift_read_operand(insn, 0, 64)?;
+    // Effects both reference the *pre-instruction* RSP — the convention
+    // used everywhere else in the lifter, letting the consumer sequence
+    // effects across instructions without worrying about intra-insn
+    // ordering. The MemStore lands at RSP-8 (the final RSP); the SetReg
+    // advances RSP by the same amount.
+    let new_rsp = Expr::sub(Expr::Reg(Register::RSP), Expr::Const(8));
+    Ok(vec![
+        Effect::MemStore {
+            addr: new_rsp.clone(),
+            value,
+            size: 8,
+        },
+        Effect::SetReg(Register::RSP, new_rsp),
+    ])
+}
+
+fn lift_pop(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
+    if insn.stack_pointer_increment() != 8 {
+        return Err(LiftError::Unsupported("non-64-bit pop"));
+    }
+    // `pop rsp` is legal but the two effects in our flat model both
+    // target RSP — the ordering semantics would be ambiguous without a
+    // sequential execution model. Skip it; Themida handlers don't use it.
+    if insn.op0_kind() == OpKind::Register && insn.op0_register() == Register::RSP {
+        return Err(LiftError::Unsupported("pop rsp"));
+    }
+    let loaded = Expr::MemLoad {
+        addr: Box::new(Expr::Reg(Register::RSP)),
+        size: 8,
+    };
+    let mut effects = write_dst(insn, loaded, 64)?;
+    effects.push(Effect::SetReg(
+        Register::RSP,
+        Expr::add(Expr::Reg(Register::RSP), Expr::Const(8)),
+    ));
     Ok(effects)
 }
 
@@ -613,5 +729,95 @@ mod tests {
             lift_instruction(&insn),
             Err(LiftError::Unsupported("mnemonic"))
         ));
+    }
+
+    #[test]
+    fn lift_push_reg() {
+        // push r9   (41 51)
+        let insn = decode_one(&[0x41, 0x51]);
+        let effs = lift_instruction(&insn).unwrap();
+        let new_rsp = Expr::sub(Expr::Reg(Register::RSP), Expr::Const(8));
+        assert_eq!(
+            effs,
+            vec![
+                Effect::MemStore {
+                    addr: new_rsp.clone(),
+                    value: Expr::Reg(Register::R9),
+                    size: 8,
+                },
+                Effect::SetReg(Register::RSP, new_rsp),
+            ]
+        );
+    }
+
+    #[test]
+    fn lift_pop_reg() {
+        // pop r9    (41 59)
+        let insn = decode_one(&[0x41, 0x59]);
+        let effs = lift_instruction(&insn).unwrap();
+        assert_eq!(
+            effs,
+            vec![
+                Effect::SetReg(
+                    Register::R9,
+                    Expr::MemLoad {
+                        addr: Box::new(Expr::Reg(Register::RSP)),
+                        size: 8,
+                    }
+                ),
+                Effect::SetReg(
+                    Register::RSP,
+                    Expr::add(Expr::Reg(Register::RSP), Expr::Const(8))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn lift_inc_rax_sets_flags() {
+        // inc rax   (48 ff c0)
+        let insn = decode_one(&[0x48, 0xFF, 0xC0]);
+        let effs = lift_instruction(&insn).unwrap();
+        assert_eq!(effs.len(), 3);
+        assert_eq!(
+            effs[0],
+            Effect::SetReg(
+                Register::RAX,
+                Expr::add(Expr::Reg(Register::RAX), Expr::Const(1))
+            )
+        );
+        assert!(matches!(effs[1], Effect::SetFlag(Flag::ZF, _)));
+        assert!(matches!(effs[2], Effect::SetFlag(Flag::SF, _)));
+    }
+
+    #[test]
+    fn lift_lea_base_plus_disp() {
+        // lea rax, [rbx + 0x10]   (48 8d 43 10)
+        let insn = decode_one(&[0x48, 0x8D, 0x43, 0x10]);
+        let effs = lift_instruction(&insn).unwrap();
+        assert_eq!(
+            effs,
+            vec![Effect::SetReg(
+                Register::RAX,
+                Expr::add(Expr::Reg(Register::RBX), Expr::Const(0x10))
+            )]
+        );
+    }
+
+    #[test]
+    fn lift_movzx_reg_mem_byte() {
+        // movzx rsi, byte ptr [rsi]   (48 0f b6 36)
+        let insn = decode_one(&[0x48, 0x0F, 0xB6, 0x36]);
+        let effs = lift_instruction(&insn).unwrap();
+        assert_eq!(
+            effs,
+            vec![Effect::SetReg(
+                Register::RSI,
+                Expr::MemLoad {
+                    addr: Box::new(Expr::Reg(Register::RSI)),
+                    size: 1,
+                }
+            )]
+        );
     }
 }
