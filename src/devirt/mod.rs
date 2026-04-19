@@ -23,6 +23,7 @@ pub use oep_dump::OepDump;
 pub use trace::TraceBuilder;
 pub use trace_events::{Event, RegSnapshot};
 pub use vm::{
-    detect_vm, group_into_contexts, resolve_vm_addresses, DispatcherCandidate, Handler,
-    HandlerCatalog, RbpOffset, TraceAnalysis, VmContext, VmDescriptor,
+    detect_vm, dispatch_target_register, evaluate_linear, group_into_contexts,
+    resolve_vm_addresses, DispatcherCandidate, EvalOutcome, EvalState, Handler, HandlerCatalog,
+    RbpOffset, TraceAnalysis, VmContext, VmDescriptor,
 };

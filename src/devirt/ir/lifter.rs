@@ -56,6 +56,7 @@ pub fn lift_instruction(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
         Mnemonic::Dec => lift_inc_dec(insn, IncDec::Dec),
         Mnemonic::Lea => lift_lea(insn),
         Mnemonic::Movzx => lift_movzx(insn),
+        Mnemonic::Movsxd => lift_movsxd(insn),
         Mnemonic::Push => lift_push(insn),
         Mnemonic::Pop => lift_pop(insn),
 
@@ -239,6 +240,31 @@ fn lift_movzx(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
     };
     let src = lift_read_operand(insn, 1, src_width)?;
     write_dst(insn, src, dst_width)
+}
+
+fn lift_movsxd(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {
+    require_op_count(insn, 2)?;
+    let dst_width = op_width_bits(insn, 0)?;
+    if dst_width != 64 {
+        // MOVSXD has only one canonical form in x86-64: 64-bit dst
+        // from 32-bit src. The 16-bit dst encoding is legal but
+        // vanishingly rare in Themida dispatchers; reject cleanly.
+        return Err(LiftError::Unsupported("movsxd non-64-bit dst"));
+    }
+    // Source width is always 32 for movsxd; read with that width so
+    // `lift_read_operand` masks to the low 32 bits before we sign-
+    // extend explicitly here.
+    let src = lift_read_operand(insn, 1, 32)?;
+    // Sign-extend 32 -> 64:
+    //   sign_bit = (src >> 31) & 1          (0 or 1)
+    //   ext     = (~~(-sign_bit)) << 32     (0 or 0xffff_ffff_0000_0000)
+    //   result  = ext | src
+    // The `Neg` pulls 1 up to u64::MAX (two's complement); shifting
+    // by 32 isolates that into the upper 32 bits.
+    let sign_bit = Expr::and(Expr::shr(src.clone(), Expr::Const(31)), Expr::Const(1));
+    let ext = Expr::shl(Expr::neg(sign_bit), Expr::Const(32));
+    let value = Expr::or(ext, src);
+    write_dst(insn, value, dst_width)
 }
 
 fn lift_push(insn: &Instruction) -> Result<Vec<Effect>, LiftError> {

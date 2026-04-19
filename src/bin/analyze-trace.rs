@@ -8,8 +8,9 @@
 use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use midas::devirt::{
-    detect_vm, group_into_contexts, lift_instruction, resolve_vm_addresses, HandlerCatalog,
-    LiftError, OepDump, RegSnapshot, TraceAnalysis,
+    detect_vm, dispatch_target_register, evaluate_linear, group_into_contexts, lift_instruction,
+    resolve_vm_addresses, EvalOutcome, EvalState, HandlerCatalog, LiftError, OepDump,
+    RegSnapshot, TraceAnalysis, VmDescriptor,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -114,6 +115,83 @@ fn print_handler_table_preview(dump: &OepDump, table_base: u64) {
                 break;
             }
         }
+    }
+}
+
+/// Run the dispatcher instructions from `opcode_fetch_rip` through
+/// `dispatch_rip` (inclusive) against a captured register snapshot +
+/// OEP dump, then report the computed target register value and how
+/// it compares against the captured one. A match proves the
+/// evaluator handles this sample's dispatch logic — the piece we'd
+/// then extend to walk the bytecode stream.
+fn print_dispatcher_evaluation(
+    d: &VmDescriptor,
+    instructions: &std::collections::BTreeMap<u64, Vec<u8>>,
+    dump: &OepDump,
+    regs: &RegSnapshot,
+    ground_truth: Option<&RegSnapshot>,
+) {
+    let Some(target_reg) = dispatch_target_register(instructions, d.dispatch_rip) else {
+        println!("  dispatch evaluation:   (target reg not identified)");
+        return;
+    };
+    let captured = ground_truth.and_then(|g| snapshot_reg_by_name(g, target_reg));
+    let mut state = EvalState::from_snapshot(regs, dump);
+    let outcome = evaluate_linear(
+        &mut state,
+        instructions,
+        d.opcode_fetch_rip,
+        d.dispatch_rip,
+    );
+    let computed = state.reg(target_reg);
+    match outcome {
+        EvalOutcome::Ok => match (computed, captured) {
+            (Some(c), Some(cap)) if c == cap => println!(
+                "  dispatch evaluation:   OK — {:?} = 0x{:x}  (matches captured)",
+                target_reg, c
+            ),
+            (Some(c), Some(cap)) => println!(
+                "  dispatch evaluation:   mismatch — evaluated {:?}=0x{:x}, captured=0x{:x}",
+                target_reg, c, cap
+            ),
+            (Some(c), None) => println!(
+                "  dispatch evaluation:   evaluated {:?}=0x{:x} (no captured value)",
+                target_reg, c
+            ),
+            _ => println!("  dispatch evaluation:   no value produced"),
+        },
+        EvalOutcome::LiftFailure { rip, err } => println!(
+            "  dispatch evaluation:   lift failed at 0x{:x}: {:?}",
+            rip, err
+        ),
+        EvalOutcome::EvalFailure { rip } => println!(
+            "  dispatch evaluation:   eval failed at 0x{:x} (unknown reg / OOB mem read)",
+            rip
+        ),
+    }
+}
+
+fn snapshot_reg_by_name(regs: &RegSnapshot, r: iced_x86::Register) -> Option<u64> {
+    use iced_x86::Register::*;
+    match r.full_register() {
+        RAX => Some(regs.rax),
+        RBX => Some(regs.rbx),
+        RCX => Some(regs.rcx),
+        RDX => Some(regs.rdx),
+        RSI => Some(regs.rsi),
+        RDI => Some(regs.rdi),
+        RBP => Some(regs.rbp),
+        RSP => Some(regs.rsp),
+        R8 => Some(regs.r8),
+        R9 => Some(regs.r9),
+        R10 => Some(regs.r10),
+        R11 => Some(regs.r11),
+        R12 => Some(regs.r12),
+        R13 => Some(regs.r13),
+        R14 => Some(regs.r14),
+        R15 => Some(regs.r15),
+        RIP => Some(regs.rip),
+        _ => Option::None,
     }
 }
 
@@ -300,6 +378,19 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
                     print_handler_table_preview(dump, tbl_val);
                 }
             }
+        }
+        // Evaluate the dispatcher slice. We need state *at the
+        // opcode fetch* (where the source reg still holds the VM_PC
+        // pointer) — the captured state at `dispatch_rip` is too
+        // late because the dispatcher has already rewritten the reg
+        // with the decrypted opcode. Falls back to the dispatch_rip
+        // capture if we don't have one at fetch.
+        let fetch_regs = reg_captures
+            .get(&d.opcode_fetch_rip)
+            .or_else(|| reg_captures.get(&d.dispatch_rip));
+        if let (Some(dump), Some(regs)) = (dump.as_ref(), fetch_regs) {
+            let ground_truth = reg_captures.get(&d.dispatch_rip);
+            print_dispatcher_evaluation(d, &instructions, dump, regs, ground_truth);
         }
         if d.rbp_state_offsets.is_empty() {
             println!("  rbp_state_offsets: (none observed in window)");

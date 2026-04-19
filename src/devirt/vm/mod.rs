@@ -6,11 +6,13 @@
 //! synthetic traces.
 
 pub mod detector;
+pub mod eval;
 pub mod handlers;
 pub mod regions;
 
 pub use detector::{
     detect_vm, group_into_contexts, resolve_vm_addresses, RbpOffset, VmContext, VmDescriptor,
 };
+pub use eval::{dispatch_target_register, evaluate_linear, EvalOutcome, EvalState};
 pub use handlers::{Handler, HandlerCatalog};
 pub use regions::{DispatcherCandidate, TraceAnalysis};

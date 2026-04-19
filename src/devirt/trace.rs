@@ -51,20 +51,25 @@ impl TraceBuilder {
         })
     }
 
-    /// Return true if this is the first time we've seen an indirect
-    /// `jmp r<reg>` at `rip` and the recorder is armed — i.e. the
-    /// auto-capture path should fire here. Callers then snapshot
-    /// registers (from the live emulator) and call
-    /// `record_regs_at_rip`.
+    /// Return true if this is the first time we've seen an
+    /// auto-capture-worthy instruction at `rip` and the recorder is
+    /// armed. Two patterns qualify:
     ///
-    /// Pattern is cheap enough to check inline for every post-OEP
-    /// instruction: a 2- or 3-byte `FF E0..FF E7` / `41 FF E0..41 FF
-    /// E7` sequence.
+    /// - Indirect `jmp r<reg>` — dispatcher-exit shape; the
+    ///   captured state has the decrypted-opcode handler address in
+    ///   the target register.
+    /// - `movzx r, word ptr [mem]` — VM opcode-fetch shape; the
+    ///   captured state has the VM_PC pointer in the source base
+    ///   register, i.e. everything the evaluator needs to run the
+    ///   dispatcher forward.
+    ///
+    /// Pattern checks are inline byte-match — no iced-x86 decode in
+    /// the hot path.
     pub fn should_auto_capture_indirect_jmp(&self, rip: u64, bytes: &[u8]) -> bool {
         if !self.armed {
             return false;
         }
-        if !is_indirect_reg_jmp_bytes(bytes) {
+        if !(is_indirect_reg_jmp_bytes(bytes) || is_movzx_word_ptr_mem_bytes(bytes)) {
             return false;
         }
         !self.auto_captured_indirect_jmps.contains(&rip)
@@ -216,6 +221,29 @@ fn is_indirect_reg_jmp_bytes(bytes: &[u8]) -> bool {
         [0x41, 0xFF, m, ..] if (*m & 0xF8) == 0xE0 => true,
         _ => false,
     }
+}
+
+/// Recognise `movzx r, word ptr [mem]` from raw bytes. Encoding is
+/// (optional REX 0x40..0x4F) + `0F B7` + ModR/M with mem-mode (mod
+/// bits != 11). Excludes register-source `movzx` since that's not a
+/// memory fetch. Accepts any register-size destination (16/32/64
+/// after zero-extend) — the VM dispatcher uses 64-bit dsts, but
+/// Themida mutation can make it any width.
+fn is_movzx_word_ptr_mem_bytes(bytes: &[u8]) -> bool {
+    let (op_idx, rex_ok) = match bytes.first() {
+        Some(b) if (0x40..=0x4F).contains(b) => (1, true),
+        Some(_) => (0, true),
+        None => (0, false),
+    };
+    if !rex_ok || bytes.len() < op_idx + 3 {
+        return false;
+    }
+    if bytes[op_idx] != 0x0F || bytes[op_idx + 1] != 0xB7 {
+        return false;
+    }
+    // ModR/M top two bits != 11 → memory addressing.
+    let mod_bits = bytes[op_idx + 2] >> 6;
+    mod_bits != 0b11
 }
 
 impl TraceBuilder {
