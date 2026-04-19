@@ -29,4 +29,4 @@ pub mod simplify;
 pub use emit::{emit_effect, emit_effects, emit_expr};
 pub use expr::{Effect, Expr, RegId};
 pub use lifter::{lift_instruction, LiftError};
-pub use simplify::{simplify_effects, simplify_expr};
+pub use simplify::{simplify_effects, simplify_effects_with_live_out, simplify_expr};

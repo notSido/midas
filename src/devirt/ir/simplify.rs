@@ -42,8 +42,24 @@ pub fn simplify_expr(e: Expr) -> Expr {
 }
 
 pub fn simplify_effects(effects: Vec<Effect>) -> Vec<Effect> {
+    // Default: conservative live-out (every GPR + every flag).
+    simplify_effects_with_live_out(effects, all_gpr64(), all_flags())
+}
+
+/// Like `simplify_effects` but lets the caller specify which registers
+/// and flags are live at the sequence's exit. VM-handler emission
+/// typically wants a much tighter set (just RBP / RSP, no flags) so
+/// all the scratch-register junk drops out — forward substitution
+/// has already inlined flag/reg reads into subsequent memory stores
+/// and branches, so dropping "unused" writes is semantics-preserving
+/// for everything visible to a downstream VM iteration.
+pub fn simplify_effects_with_live_out(
+    effects: Vec<Effect>,
+    live_out_regs: Vec<RegId>,
+    live_out_flags: Vec<Flag>,
+) -> Vec<Effect> {
     let substituted = forward_substitute(effects);
-    dead_effect_elim(substituted)
+    dead_effect_elim(substituted, live_out_regs, live_out_flags)
 }
 
 // -------------------------------------------------------------------
@@ -322,22 +338,24 @@ fn substitute_reads(
 // Dead-effect elimination
 // -------------------------------------------------------------------
 
-fn dead_effect_elim(effects: Vec<Effect>) -> Vec<Effect> {
+fn dead_effect_elim(
+    effects: Vec<Effect>,
+    live_out_regs: Vec<RegId>,
+    live_out_flags: Vec<Flag>,
+) -> Vec<Effect> {
     // After forward-substitution, every `SetReg(r, v)` has `v`
     // expressed in terms of ORIGINAL register/flag values — each
     // write is an independent definition of `r`'s final value.
     // Only the LAST write per reg/flag contributes; everything
     // before it is redundantly re-defining the same thing and can
-    // be dropped. This is cleaner than classical liveness-DCE
-    // (which would keep every link in a chain like `r15 = r15 ^
-    // k1; r15 = (r15 ^ k1) + k2; ...` because each link "reads" r15).
+    // be dropped.
     //
     // MemStore and Branch are always kept — their addr/value/cond
     // expressions have already been forward-substituted, so they
     // capture the correct intermediate state even if earlier
     // SetRegs get dropped.
-    let live_regs: HashSet<RegId> = all_gpr64().into_iter().collect();
-    let live_flags: HashSet<Flag> = all_flags().into_iter().collect();
+    let live_regs: HashSet<RegId> = live_out_regs.into_iter().collect();
+    let live_flags: HashSet<Flag> = live_out_flags.into_iter().collect();
 
     // First pass: find the index of the last SetReg per register
     // and the last SetFlag per flag.

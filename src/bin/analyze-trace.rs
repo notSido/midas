@@ -9,8 +9,9 @@ use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use midas::devirt::{
     detect_vm, dispatch_target_register, emit_effects, evaluate_linear, group_into_contexts,
-    lift_instruction, resolve_vm_addresses, simplify_effects, EvalOutcome, EvalState,
-    HandlerCatalog, LiftError, MemSnapshot, OepDump, RegSnapshot, TraceAnalysis, VmDescriptor,
+    lift_instruction, resolve_vm_addresses, simplify_effects_with_live_out, EvalOutcome,
+    EvalState, HandlerCatalog, LiftError, MemSnapshot, OepDump, RegSnapshot, TraceAnalysis,
+    VmDescriptor,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -245,69 +246,92 @@ fn print_trace_replay_walk(
     }
 }
 
-/// Lift the first observed handler body for this VM context to IR,
-/// simplify, emit pseudo-C. Purely illustrative — shows what one
-/// VM opcode's native semantics looks like after all the cleanup.
-fn print_first_handler_pseudo_c(
+/// For each captured dispatcher firing, evaluate to get the handler
+/// address, then emit every unique handler body as labelled pseudo-C
+/// and list the VM-program firing sequence below. This is the
+/// whole-observed-VM-program output — the "Deliverable B text form"
+/// at the current level of cleanup.
+fn print_full_vm_program(
     d: &VmDescriptor,
     instructions: &std::collections::BTreeMap<u64, Vec<u8>>,
     dump: &OepDump,
     firings: &[(u64, RegSnapshot, Vec<MemSnapshot>)],
 ) {
-    use iced_x86::{Decoder, DecoderOptions, Instruction};
-    // Evaluate the first firing's dispatcher to get the handler
-    // entry address. The replay walker already does this; we could
-    // surface that value, but recomputing here keeps this function
-    // independent.
-    let (_, regs, mems) = &firings[0];
+    use std::collections::BTreeMap;
     let Some(target_reg) = dispatch_target_register(instructions, d.dispatch_rip) else {
         return;
     };
-    let mut state = EvalState::from_snapshot(regs, dump, None);
-    for m in mems {
-        state.add_mem_snapshot(m.clone());
-    }
-    let outcome = evaluate_linear(
-        &mut state,
-        instructions,
-        d.dispatcher_start_rip,
-        d.dispatch_rip,
-    );
-    if !matches!(outcome, EvalOutcome::Ok) {
-        return;
-    }
-    let Some(handler_entry) = state.reg(target_reg) else {
-        return;
-    };
 
-    // Collect all RIPs from handler_entry up to the NEXT dispatcher
-    // firing — these are the instructions the VM handler actually
-    // executed for this one opcode. We bound by the next dispatcher
-    // RIP's first occurrence >= handler_entry in the trace's
-    // sorted-RIP order. Note: this is a best-effort bound — a real
-    // handler may branch backwards / internally; we just take the
-    // handler's *straight-line* run from entry to dispatcher.
-    // (Reasonable for demonstration; the full cross-basic-block
-    // extraction is future work.)
+    // Resolve each firing → handler address. Build the program as
+    // (tick, handler_addr) pairs; collect the unique set of handler
+    // addresses for body emission.
+    let mut program: Vec<(u64, u64)> = Vec::with_capacity(firings.len());
+    let mut unique_handlers: BTreeMap<u64, ()> = BTreeMap::new();
+    for (tick, regs, mems) in firings {
+        let mut state = EvalState::from_snapshot(regs, dump, None);
+        for m in mems {
+            state.add_mem_snapshot(m.clone());
+        }
+        let outcome = evaluate_linear(
+            &mut state,
+            instructions,
+            d.dispatcher_start_rip,
+            d.dispatch_rip,
+        );
+        if !matches!(outcome, EvalOutcome::Ok) {
+            continue;
+        }
+        if let Some(handler) = state.reg(target_reg) {
+            program.push((*tick, handler));
+            unique_handlers.insert(handler, ());
+        }
+    }
+    if unique_handlers.is_empty() {
+        return;
+    }
+
+    println!();
+    println!(
+        "  observed VM program: {} dispatches, {} unique handlers",
+        program.len(),
+        unique_handlers.len()
+    );
+    println!();
+
+    // Emit each unique handler body, simplified + pseudo-C.
+    for (i, (entry, ())) in unique_handlers.iter().enumerate() {
+        print_handler_body(i + 1, *entry, instructions, d.dispatch_rip);
+    }
+
+    // Emit the VM-program sequence.
+    println!();
+    println!("  // VM program trace (tick → handler)");
+    for (tick, handler) in &program {
+        println!("  //   tick {:>10}  handler_0x{:x}()", tick, handler);
+    }
+}
+
+fn print_handler_body(
+    index: usize,
+    entry: u64,
+    instructions: &std::collections::BTreeMap<u64, Vec<u8>>,
+    dispatch_rip: u64,
+) {
+    use iced_x86::{Decoder, DecoderOptions, Instruction};
+    const MAX_INSNS: usize = 256;
     let mut handler_insns: Vec<(u64, &[u8])> = Vec::new();
-    let mut count = 0usize;
-    const MAX_INSNS: usize = 128; // keep output bounded
-    for (rip, bytes) in instructions.range(handler_entry..) {
-        if *rip == d.dispatch_rip {
+    for (rip, bytes) in instructions.range(entry..) {
+        if *rip == dispatch_rip {
             break;
         }
         handler_insns.push((*rip, bytes.as_slice()));
-        count += 1;
-        if count >= MAX_INSNS {
+        if handler_insns.len() >= MAX_INSNS {
             break;
         }
     }
     if handler_insns.is_empty() {
         return;
     }
-
-    // Lift every instruction we can; skip (with a comment) those we
-    // can't.
     let mut lifted: Vec<midas::devirt::Effect> = Vec::new();
     let mut skipped = 0usize;
     for (rip, bytes) in &handler_insns {
@@ -318,24 +342,30 @@ fn print_first_handler_pseudo_c(
             Err(_) => skipped += 1,
         }
     }
-    let simplified = simplify_effects(lifted);
-    let effect_count_before = simplified.len();
-    println!();
+    let simplified = simplify_effects_with_live_out(
+        lifted,
+        vec![iced_x86::Register::RBP, iced_x86::Register::RSP],
+        vec![],
+    );
     println!(
-        "  handler pseudo-C (first firing, entry 0x{:x}, {} insns, {} lifted, {} skipped):",
-        handler_entry,
+        "  // handler #{} @ 0x{:x}  ({} insns, {} effects, {} skipped)",
+        index,
+        entry,
         handler_insns.len(),
-        effect_count_before,
+        simplified.len(),
         skipped
     );
+    println!("  handler_0x{:x}() {{", entry);
     let text = emit_effects(&simplified);
-    for line in text.lines().take(40) {
-        println!("    {}", line);
+    for line in text.lines().take(32) {
+        println!("      {}", line);
     }
     let lines_total = text.lines().count();
-    if lines_total > 40 {
-        println!("    ... ({} more lines)", lines_total - 40);
+    if lines_total > 32 {
+        println!("      // ... ({} more lines)", lines_total - 32);
     }
+    println!("  }}");
+    println!();
 }
 
 fn snapshot_reg_by_name(regs: &RegSnapshot, r: iced_x86::Register) -> Option<u64> {
@@ -592,13 +622,7 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
                 if let Some(firings) = multi_captures.get(&d.opcode_fetch_rip) {
                     if !firings.is_empty() {
                         print_trace_replay_walk(d, &instructions, dump, firings);
-                        // Lift + simplify + emit the first handler's
-                        // body as a pseudo-C artifact. Takes the
-                        // handler's entry (= first firing's computed
-                        // handler address) and collects all RIPs in
-                        // the trace from the handler entry up to the
-                        // next dispatcher firing.
-                        print_first_handler_pseudo_c(d, &instructions, dump, firings);
+                        print_full_vm_program(d, &instructions, dump, firings);
                     }
                 }
             }

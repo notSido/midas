@@ -19,8 +19,8 @@ pub mod trace_events;
 pub mod vm;
 
 pub use ir::{
-    emit_effect, emit_effects, emit_expr, lift_instruction, simplify_effects, simplify_expr,
-    Effect, Expr, LiftError, RegId,
+    emit_effect, emit_effects, emit_expr, lift_instruction, simplify_effects,
+    simplify_effects_with_live_out, simplify_expr, Effect, Expr, LiftError, RegId,
 };
 pub use oep_dump::OepDump;
 pub use trace::TraceBuilder;
