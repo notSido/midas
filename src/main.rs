@@ -8,8 +8,10 @@ use std::time::Instant;
 #[command(name = "midas")]
 #[command(about = "Midas - Themida 3.x unpacker for Linux", long_about = None)]
 struct Args {
-    /// Input PE file (Themida-protected)
-    #[arg(short, long)]
+    /// Input PE file (Themida-protected). Positional argument: the
+    /// *only* thing midas requires on the happy path. See
+    /// `project_1_0_binary_contract` in auto-memory.
+    #[arg(value_name = "PATH")]
     input: PathBuf,
     
     /// Output file for unpacked PE
@@ -50,14 +52,25 @@ struct Args {
     #[arg(long, default_value = "0x20000000")]
     workspace: String,
 
-    /// Record a per-instruction execution trace starting at OEP
-    /// (devirtualization input). Output format is JSONL.
+    /// Override the default devirt trace path (JSONL, post-OEP
+    /// per-instruction). By default the trace is always produced at
+    /// `<output>.trace.jsonl` — pass this only to customize. See
+    /// also `--no-devirt-trace` to opt out entirely.
     #[arg(long)]
     devirt_trace: Option<PathBuf>,
 
-    /// Cap on the number of post-OEP instructions recorded when
-    /// `--devirt-trace` is set. Beyond this, emulation stops cleanly.
-    #[arg(long, default_value = "1000000")]
+    /// Opt out of producing a devirt trace. Default is on (the
+    /// trace is the input to offline VM analysis). Useful for
+    /// pure-unpack runs that don't need devirt; small perf win from
+    /// skipping the post-OEP instruction recording.
+    #[arg(long)]
+    no_devirt_trace: bool,
+
+    /// Cap on the number of post-OEP instructions recorded. Default
+    /// is 10M — enough to expose the VM dispatcher on both current
+    /// samples. Disarmed recorder has near-zero overhead, so leaving
+    /// this alone is the right default.
+    #[arg(long, default_value = "10000000")]
     devirt_trace_limit: u64,
 
     /// (Testing back-door — not the primary path.) Emit a one-shot
@@ -156,14 +169,30 @@ fn run() -> Result<()> {
     // Create unpacker and run
     let start_time = Instant::now();
     let mut unpacker = unpacker::Unpacker::new(pe, args.max_instructions, args.verbose);
-    if let Some(trace_path) = args.devirt_trace.clone() {
-        unpacker.set_devirt_trace(trace_path, args.devirt_trace_limit);
+    // Devirt trace is produced by default — zero-config UX (see
+    // `feedback_zero_config_ux` in auto-memory). The user doesn't
+    // have to know it exists; downstream tools consume it to
+    // build the VM descriptor + walker. If `--devirt-trace` was
+    // passed, use that path; otherwise derive a deterministic
+    // sibling of the output PE. `--no-devirt-trace` opts out for
+    // pure-unpack runs that don't need devirt analysis.
+    let trace_path = args.devirt_trace.clone().unwrap_or_else(|| {
+        let mut p = output_path.clone();
+        let stem = p.file_stem().unwrap().to_str().unwrap().to_string();
+        p.set_file_name(format!("{}.trace.jsonl", stem));
+        p
+    });
+    if !args.no_devirt_trace {
+        unpacker.set_devirt_trace(trace_path.clone(), args.devirt_trace_limit);
         if !args.devirt_capture_regs_at.is_empty() {
             unpacker.set_devirt_capture_regs_at(args.devirt_capture_regs_at.clone());
         }
+        if !args.quiet && !args.json {
+            log::info!("Devirt trace will be written to: {:?}", trace_path);
+        }
     } else if !args.devirt_capture_regs_at.is_empty() {
         log::warn!(
-            "--devirt-capture-regs-at ignored because --devirt-trace was not set"
+            "--devirt-capture-regs-at ignored because --no-devirt-trace was set"
         );
     }
     
