@@ -86,6 +86,31 @@ impl<'a> EvalState<'a> {
         self.mem_snapshots.push(snap);
     }
 
+    /// Dump the current register state to a `RegSnapshot`. Missing
+    /// registers default to 0 (they haven't been written).
+    pub fn gpr_snapshot(&self) -> RegSnapshot {
+        let g = |r: Register| self.reg(r).unwrap_or(0);
+        RegSnapshot {
+            rax: g(Register::RAX),
+            rbx: g(Register::RBX),
+            rcx: g(Register::RCX),
+            rdx: g(Register::RDX),
+            rsi: g(Register::RSI),
+            rdi: g(Register::RDI),
+            rbp: g(Register::RBP),
+            rsp: g(Register::RSP),
+            r8: g(Register::R8),
+            r9: g(Register::R9),
+            r10: g(Register::R10),
+            r11: g(Register::R11),
+            r12: g(Register::R12),
+            r13: g(Register::R13),
+            r14: g(Register::R14),
+            r15: g(Register::R15),
+            rip: g(Register::RIP),
+        }
+    }
+
     pub fn reg(&self, r: Register) -> Option<u64> {
         self.regs.get(&r.full_register()).copied()
     }
@@ -271,6 +296,12 @@ pub struct WalkStep {
     /// Handler address the dispatcher computed (= value of the jmp
     /// target register after evaluation).
     pub handler_addr: u64,
+    /// Snapshot of all 16 GPRs at the moment of dispatch. Captures
+    /// everything downstream might want: the decrypted opcode lives
+    /// in whatever register the dispatcher shifted+indexed (usually
+    /// R11 for sample 2, R15 for sample 1). Not sample-specific in
+    /// the walker; the caller inspects per descriptor if needed.
+    pub gprs_at_dispatch: crate::devirt::trace_events::RegSnapshot,
 }
 
 /// Iterate the VM dispatcher forward, simulating bytecode execution
@@ -320,6 +351,7 @@ where
             iter,
             vm_pc,
             handler_addr,
+            gprs_at_dispatch: state.gpr_snapshot(),
         });
     }
     out

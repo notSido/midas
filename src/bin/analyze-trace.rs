@@ -203,9 +203,13 @@ fn print_bytecode_walk(
         d.dispatcher_start_rip
     );
     for step in &steps {
+        // All top-candidate indexer registers observed in current
+        // samples (sample 2 → R11, sample 1 → R15). Printing both
+        // keeps output sample-agnostic.
+        let g = &step.gprs_at_dispatch;
         println!(
-            "    [{:>3}] VM_PC=0x{:010x}  →  handler=0x{:x}",
-            step.iter, step.vm_pc, step.handler_addr
+            "    [{:>3}] VM_PC=0x{:010x}  handler=0x{:x}  r11=0x{:x} r15=0x{:x} r9=0x{:x}",
+            step.iter, step.vm_pc, step.handler_addr, g.r11, g.r15, g.r9
         );
     }
     if steps.is_empty() {
