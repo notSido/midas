@@ -9,8 +9,8 @@ use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use midas::devirt::{
     detect_vm, dispatch_target_register, evaluate_linear, group_into_contexts, lift_instruction,
-    resolve_vm_addresses, EvalOutcome, EvalState, HandlerCatalog, LiftError, MemSnapshot, OepDump,
-    RegSnapshot, TraceAnalysis, VmDescriptor,
+    resolve_vm_addresses, walk_bytecode, EvalOutcome, EvalState, HandlerCatalog, LiftError,
+    MemSnapshot, OepDump, RegSnapshot, TraceAnalysis, VmDescriptor,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -173,6 +173,43 @@ fn print_dispatcher_evaluation(
             "  dispatch evaluation:   eval failed at 0x{:x} (unknown reg / OOB mem read)",
             rip
         ),
+    }
+}
+
+fn print_bytecode_walk(
+    d: &VmDescriptor,
+    instructions: &std::collections::BTreeMap<u64, Vec<u8>>,
+    dump: &OepDump,
+    fetch_regs: &RegSnapshot,
+    fetch_mem: &MemSnapshot,
+    vm_pc_cell_addr: u64,
+) {
+    let Some(target_reg) = dispatch_target_register(instructions, d.dispatch_rip) else {
+        return;
+    };
+    let mut state = EvalState::from_snapshot(fetch_regs, dump, Some(fetch_mem));
+    let steps = walk_bytecode(
+        &mut state,
+        instructions,
+        d.dispatcher_start_rip,
+        d.dispatch_rip,
+        vm_pc_cell_addr,
+        target_reg,
+        32, // max iters — informative first slice, not exhaustive
+    );
+    println!(
+        "  bytecode walk ({} iterations from dispatcher_start 0x{:x}):",
+        steps.len(),
+        d.dispatcher_start_rip
+    );
+    for step in &steps {
+        println!(
+            "    [{:>3}] VM_PC=0x{:010x}  →  handler=0x{:x}",
+            step.iter, step.vm_pc, step.handler_addr
+        );
+    }
+    if steps.is_empty() {
+        println!("    (no iterations completed — evaluator stopped immediately)");
     }
 }
 
@@ -410,6 +447,15 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
                 fetch_mem,
                 dispatch_mem,
             );
+            // Iterative walker: only for descriptor #1 of each
+            // unique VM context (avoids duplicating the same walk
+            // across every inlined dispatch site). Requires both
+            // fetch-regs + fetch-mem and a resolved vm_pc_addr.
+            if i == 0 {
+                if let (Some(fmem), Some(pc_addr)) = (fetch_mem, d.vm_pc_addr) {
+                    print_bytecode_walk(d, &instructions, dump, regs, fmem, pc_addr);
+                }
+            }
         }
         if d.rbp_state_offsets.is_empty() {
             println!("  rbp_state_offsets: (none observed in window)");

@@ -39,6 +39,14 @@ pub struct VmDescriptor {
     /// RIP of the final indirect-branch `jmp r<reg>` that transfers
     /// control to the selected handler.
     pub dispatch_rip: u64,
+    /// Best estimate of where the dispatcher basic block *starts*,
+    /// upstream of `opcode_fetch_rip`. Derived from the earliest
+    /// RIP in the detector's backward-scan window — the natural
+    /// boundary at which instruction-RIP gaps widen past 256 bytes
+    /// (typically signalling a basic-block edge). Used by the
+    /// offline walker to re-evaluate the whole dispatcher each
+    /// iteration, picking up VM_PC fresh from the state cell.
+    pub dispatcher_start_rip: u64,
     /// RIP of the `movzx r, word ptr [...]` that fetches the
     /// encrypted opcode. Used as an anchor when further analysis
     /// wants to inspect the fetch site.
@@ -77,6 +85,8 @@ pub struct RbpOffset {
     /// Offset immediate (`add rX, imm`). Signed because `add r, -k`
     /// is legal though rarely used here.
     pub offset: i64,
+    /// RIP of the `mov rX, rbp` instruction that starts the pair.
+    pub mov_rip: u64,
     /// RIP of the `add rX, imm` instruction.
     pub add_rip: u64,
 }
@@ -173,6 +183,7 @@ pub fn detect_vm(instructions: &BTreeMap<u64, Vec<u8>>) -> Vec<VmDescriptor> {
                     rbp_state_offsets.push(RbpOffset {
                         reg: rx,
                         offset: off,
+                        mov_rip: **mov_rip,
                         add_rip: *add_rip,
                     });
                     claimed.push(m);
@@ -187,8 +198,22 @@ pub fn detect_vm(instructions: &BTreeMap<u64, Vec<u8>>) -> Vec<VmDescriptor> {
         }
 
         if let Some(fetch_rip) = opcode_fetch_rip {
+            // The dispatcher prelude begins at the earliest `mov rX,
+            // rbp` instruction in the descriptor — that's the first
+            // instruction to initialize one of the RBP-relative
+            // state pointers. Using the earliest such `mov_rip` as
+            // dispatcher_start_rip ties the walker's entry point to
+            // actual dispatcher code, not to some arbitrary
+            // neighbor in the backward-scan window. Falls back to
+            // `fetch_rip` if we somehow have no RbpOffset pairs.
+            let dispatcher_start_rip = rbp_state_offsets
+                .iter()
+                .map(|o| o.mov_rip)
+                .min()
+                .unwrap_or(fetch_rip);
             let mut d = VmDescriptor {
                 dispatch_rip: **jmp_rip,
+                dispatcher_start_rip,
                 opcode_fetch_rip: fetch_rip,
                 rbp_state_offsets,
                 vm_pc_offset: None,
@@ -405,6 +430,26 @@ mod tests {
 
     fn map_from_pairs(pairs: Vec<(u64, &[u8])>) -> BTreeMap<u64, Vec<u8>> {
         pairs.into_iter().map(|(r, b)| (r, b.to_vec())).collect()
+    }
+
+    #[test]
+    fn descriptor_carries_dispatcher_start_rip() {
+        // Dispatcher prelude: `mov r11, rbp` at 0x1000 is the
+        // first RBP-pair mov, so dispatcher_start_rip should be
+        // exactly 0x1000 (tied to the descriptor's own RbpOffset,
+        // not to an arbitrary window neighbor).
+        let bytes: Vec<(u64, &[u8])> = vec![
+            (0x1000, &[0x49, 0x89, 0xEB]),
+            (0x1003, &[0x49, 0x81, 0xC3, 0x9A, 0, 0, 0]),
+            (0x100A, &[0x4D, 0x8B, 0x1B]),
+            (0x100D, &[0x4D, 0x0F, 0xB7, 0x1B]),
+            (0x1011, &[0x41, 0xFF, 0xE2]),
+        ];
+        let map: BTreeMap<u64, Vec<u8>> =
+            bytes.into_iter().map(|(r, b)| (r, b.to_vec())).collect();
+        let found = detect_vm(&map);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].dispatcher_start_rip, 0x1000);
     }
 
     #[test]

@@ -24,6 +24,6 @@ pub use trace::TraceBuilder;
 pub use trace_events::{Event, MemSnapshot, RegSnapshot};
 pub use vm::{
     detect_vm, dispatch_target_register, evaluate_linear, group_into_contexts,
-    resolve_vm_addresses, DispatcherCandidate, EvalOutcome, EvalState, Handler, HandlerCatalog,
-    RbpOffset, TraceAnalysis, VmContext, VmDescriptor,
+    resolve_vm_addresses, walk_bytecode, DispatcherCandidate, EvalOutcome, EvalState, Handler,
+    HandlerCatalog, RbpOffset, TraceAnalysis, VmContext, VmDescriptor, WalkStep,
 };

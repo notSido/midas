@@ -258,6 +258,73 @@ impl InstructionMap for std::collections::BTreeMap<u64, Vec<u8>> {
     }
 }
 
+/// One step of iterative bytecode-walking: values observed at the
+/// moment the dispatcher is about to transfer control to a handler.
+#[derive(Debug, Clone)]
+pub struct WalkStep {
+    /// 0-based iteration count (0 = first dispatch after the seed).
+    pub iter: usize,
+    /// VM_PC read from the VM state cell *before* this iteration's
+    /// dispatcher evaluation — i.e. the bytecode-stream offset of
+    /// the VM instruction about to fire.
+    pub vm_pc: u64,
+    /// Handler address the dispatcher computed (= value of the jmp
+    /// target register after evaluation).
+    pub handler_addr: u64,
+}
+
+/// Iterate the VM dispatcher forward, simulating bytecode execution
+/// offline. Each iteration re-evaluates the dispatcher slice
+/// (`dispatcher_start_rip ..= dispatch_rip`); state carries forward
+/// via the mem overlay (VM_PC and rolling key cells the dispatcher
+/// mutates).
+///
+/// Stops early on evaluator failure, when VM_PC repeats (loop), or
+/// after `max_iters`. Returns the sequence of `(vm_pc, handler)`
+/// observed — one entry per successful iteration.
+///
+/// The caller must have already seeded `state` with the fetch-site
+/// register snapshot AND the corresponding mem-snapshot so the VM
+/// state cells are live.
+pub fn walk_bytecode<I>(
+    state: &mut EvalState,
+    instructions: &I,
+    dispatcher_start_rip: u64,
+    dispatch_rip: u64,
+    vm_pc_cell_addr: u64,
+    dispatch_target_reg: Register,
+    max_iters: usize,
+) -> Vec<WalkStep>
+where
+    I: InstructionMap,
+{
+    let mut out = Vec::new();
+    let mut seen_vm_pc: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for iter in 0..max_iters {
+        let Some(vm_pc) = state.read_mem(vm_pc_cell_addr, 8) else {
+            break;
+        };
+        if !seen_vm_pc.insert(vm_pc) {
+            // VM_PC repeated — we've either looped or the
+            // dispatcher didn't advance it. Stop.
+            break;
+        }
+        match evaluate_linear(state, instructions, dispatcher_start_rip, dispatch_rip) {
+            EvalOutcome::Ok => {}
+            _ => break,
+        }
+        let Some(handler_addr) = state.reg(dispatch_target_reg) else {
+            break;
+        };
+        out.push(WalkStep {
+            iter,
+            vm_pc,
+            handler_addr,
+        });
+    }
+    out
+}
+
 /// Retrieve the register targeted by a `jmp r<reg>` at `dispatch_rip`
 /// in `instructions`. Returns `None` if the instruction at that RIP
 /// isn't an indirect-register jmp.
