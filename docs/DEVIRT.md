@@ -221,48 +221,71 @@ events, OEP 0x140eb084e):
   on sample 1 is actively driving execution — dispatching many
   hundreds of VM opcodes across the recorded trace window.
 
-### Sample 1 vs sample 2 summary
+### Invariants across both samples
 
-| Aspect                        | Sample 1          | Sample 2             |
-| ----------------------------- | ----------------- | -------------------- |
-| VM interpreter entry          | 0x140f82a80       | 0x141048839          |
-| VM_PC                         | `[rbp+0x15C]`     | `[rbp+0x9A]`         |
-| Aux state                     | `+0x58, +0x15F`   | `+0x26, +0xD4`       |
-| Decryption                    | `add r12w, 0x7F90` | `sub+sub+xor rolling` |
-| VM fire count (10M / 1.73M)  | ~20,000 hits      | 3 hits               |
-| Threaded-dispatch presence    | yes, dozens       | yes, dozens          |
-| Dominant execution layer      | **VM**            | **threaded dispatch**|
+The two samples share the **same two-layer Themida architecture**:
 
-### Strategic implication
+1. A classical `[rbp+X]` VM interpreter (fetch encrypted 16-bit
+   opcode → rolling-key decrypt → handler-table indirect → jmp).
+2. A threaded-dispatch layer (many `jmp r<reg>` / `ret <var>`
+   sites, with shared handler-entry pool).
 
-The two samples require different primary strategies.
+The **pattern** is invariant; only the *parameters* differ. Those
+parameters are what an auto-detector must extract at runtime.
 
-- **Sample 1.** Classical M5 is the right big lever: a bytecode-
-  stream lifter walking from the VM_PC at OEP, substituting
-  lifted handler semantics, producing a reconstructed native
-  program. The VM is active and observable.
+| Parameter (what a detector returns) | Sample 1          | Sample 2             |
+| ----------------------------------- | ----------------- | -------------------- |
+| VM interpreter entry (OEP-dump RIP) | 0x140f82a80       | 0x141048839          |
+| VM_PC offset (from `rbp`)           | `+0x15C`          | `+0x9A`              |
+| Aux state offsets                   | `+0x58, +0x15F`   | `+0x26, +0xD4`       |
+| Decrypt op                          | `add r12w, 0x7F90` | rolling sub+sub+xor |
 
-- **Sample 2.** Non-VM native deobfuscation (HANDOFF item 5) on
-  the threaded-dispatch layer is the bigger lever. M5 on sample 2
-  would clean up a tiny tail-called VM slice only.
+The **observed quantitative difference** — VM fired ~20,000 times
+in s1's 1.73M trace vs 3 times in s2's 10M trace — is a
+**trace-coverage artifact**, not an architecture difference. s1's
+trace died early in a VM-heavy routine; s2's ran past its VM
+slice and spent most of the budget on threaded-dispatched native.
+A different trace window would flip the hit counts. **This does
+not motivate sample-specific tooling.**
 
-- **Shared infrastructure.** Both approaches use the same lifter
-  + simplifier pipeline on lifted IR. Building M5 for sample 1
-  gives us the bytecode-walker and handler-effect composer; we
-  can apply the handler-effect piece to sample 2's 3-hit slice
-  essentially for free.
+### Sample-agnostic is axiomatic (design constraint)
 
-Recommended ordering for Deliverable B:
+See `feedback_sample_agnostic` in auto-memory. All midas code
+must work on any Themida sample with zero hardcoded per-sample
+constants. The VM_PC offset, handler-table base, key offset,
+decrypt op, and dispatcher RIP all live in a `VmDescriptor`
+returned at runtime by the detector; never in code.
 
-1. Build M5 as a general tool using **sample 1** as the testbed
-   (VM is active, ground truth easy to validate).
-2. Apply M5 to sample 2 as-is — produces a small cleaned region.
-3. Build the non-VM native deobfuscation pass for sample 2's
-   threaded-dispatch layer — reuses the same lifter + simplifier
-   infrastructure on static basic blocks from the OEP dump.
+### Strategic direction for Deliverable B
 
-Open scope negotiations with the user before committing to
-either (1) or (3); both are multi-day pieces of work.
+One pipeline, sample-agnostic, applied to both samples:
+
+1. **VM-pattern detector** (new, M5 prep). Scans the OEP dump
+   for the canonical fetch/decrypt/table-lookup/dispatch
+   sequence. Returns a `VmDescriptor` per VM instance (a sample
+   may have one, or several, or none reached during the trace
+   window). Acceptance: correct descriptors for both current
+   samples, zero sample-specific code paths.
+
+2. **VM bytecode walker** (M5 proper). Consumes a `VmDescriptor`
+   and the OEP dump. Walks the bytecode stream from VM_PC at
+   OEP, decoding each opcode against the handler table, lifting
+   each handler body to IR, composing a `Vec<Effect>` per VM-
+   protected function.
+
+3. **Threaded-dispatch resolver** (non-VM pass, HANDOFF item 5).
+   Starts from OEP in the dump; follows static control flow;
+   when it hits an indirect branch (`jmp r<reg>` / `ret <var>`),
+   resolves targets by value-tracking on the immediately-
+   preceding instructions. Emits a CFG covering all reachable
+   native code.
+
+4. **Unified lifter + simplifier + emitter.** Already sample-
+   agnostic by construction (IR layer has no sample-specific
+   knowledge). Consumes the output of (2) and (3) uniformly.
+
+Build order: (1) → (2) → (3) → (4). Each piece is a general tool;
+each new sample exercises the same code path.
 
 ## Earlier finding — sample 2 *is* VM'd; 2M events was too short
 
