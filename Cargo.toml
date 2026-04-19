@@ -29,6 +29,10 @@ path = "src/main.rs"
 name = "disasm-loop"
 path = "src/bin/disasm-loop.rs"
 
+[[bin]]
+name = "analyze-trace"
+path = "src/bin/analyze-trace.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

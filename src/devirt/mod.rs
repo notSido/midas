@@ -14,6 +14,8 @@
 
 pub mod trace;
 pub mod trace_events;
+pub mod vm;
 
 pub use trace::TraceBuilder;
 pub use trace_events::Event;
+pub use vm::{DispatcherCandidate, TraceAnalysis};
