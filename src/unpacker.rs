@@ -8,7 +8,7 @@ use crate::win64::{peb, ldr};
 use crate::win64::{api::ApiRegistry, syscall};
 use crate::cpu_features::{self, CpuState};
 use crate::tracer::ExecutionTracer;
-use crate::devirt::{RegSnapshot, TraceBuilder};
+use crate::devirt::{MemSnapshot, RegSnapshot, TraceBuilder};
 use unicorn_engine::{RegisterX86, Unicorn};
 use unicorn_engine::unicorn_const::HookType;
 use std::path::{Path, PathBuf};
@@ -261,7 +261,9 @@ impl Unpacker {
                                 // running so we capture the VM execution.
                                 // Capture a full GPR snapshot at the arm instant so the
                                 // bytecode walker can resolve [rbp + X]-style VM state
-                                // pointers without a second emulation pass.
+                                // pointers without a second emulation pass. (OEP-arm
+                                // doesn't carry a mem snapshot — auto-capture events
+                                // post-OEP do; OEP-arm regs are just the entry values.)
                                 let regs = match snapshot_gprs(emu) {
                                     Ok(s) => Some(s),
                                     Err(e) => {
@@ -310,7 +312,8 @@ impl Unpacker {
                     if tb.should_auto_capture_indirect_jmp(addr, &bytes) {
                         match snapshot_gprs(emu) {
                             Ok(regs) => {
-                                if let Err(e) = tb.record_auto_captured_regs(addr, regs) {
+                                let mem = snapshot_rbp_window(emu, regs.rbp);
+                                if let Err(e) = tb.record_auto_captured_regs(addr, regs, mem) {
                                     log::warn!(
                                         "auto regs-at-rip record failed at 0x{:x}: {}",
                                         addr, e
@@ -328,7 +331,8 @@ impl Unpacker {
                     if tb.should_capture_regs(addr) {
                         match snapshot_gprs(emu) {
                             Ok(regs) => {
-                                if let Err(e) = tb.record_regs_at_rip(addr, regs) {
+                                let mem = snapshot_rbp_window(emu, regs.rbp);
+                                if let Err(e) = tb.record_regs_at_rip(addr, regs, mem) {
                                     log::warn!(
                                         "regs-at-rip record failed at 0x{:x}: {}",
                                         addr, e
@@ -675,6 +679,25 @@ impl Unpacker {
         }
 
         None
+    }
+}
+
+/// Read a 512-byte memory window starting at RBP. Covers every
+/// VM-state offset observed to date (`+0x26`, `+0x9A`, `+0xD4`,
+/// `+0x15F`, `+0x1C2`) with headroom. Purpose: the offline
+/// evaluator needs live memory at capture time to read VM state
+/// cells the dispatcher mutated during VM initialization — the
+/// OEP dump has the stale pre-init view. Returns `None` if
+/// Unicorn couldn't read the range (e.g. RBP points at unmapped
+/// memory); the trace is still usable without it.
+fn snapshot_rbp_window(emu: &Unicorn<()>, rbp: u64) -> Option<MemSnapshot> {
+    const WINDOW_SIZE: usize = 0x200; // 512 bytes
+    match emu.mem_read_as_vec(rbp, WINDOW_SIZE) {
+        Ok(bytes) => Some(MemSnapshot {
+            base_va: rbp,
+            bytes,
+        }),
+        Err(_) => None,
     }
 }
 

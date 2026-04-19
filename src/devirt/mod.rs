@@ -21,7 +21,7 @@ pub mod vm;
 pub use ir::{lift_instruction, Effect, Expr, LiftError, RegId};
 pub use oep_dump::OepDump;
 pub use trace::TraceBuilder;
-pub use trace_events::{Event, RegSnapshot};
+pub use trace_events::{Event, MemSnapshot, RegSnapshot};
 pub use vm::{
     detect_vm, dispatch_target_register, evaluate_linear, group_into_contexts,
     resolve_vm_addresses, DispatcherCandidate, EvalOutcome, EvalState, Handler, HandlerCatalog,

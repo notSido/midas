@@ -9,7 +9,7 @@ use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use midas::devirt::{
     detect_vm, dispatch_target_register, evaluate_linear, group_into_contexts, lift_instruction,
-    resolve_vm_addresses, EvalOutcome, EvalState, HandlerCatalog, LiftError, OepDump,
+    resolve_vm_addresses, EvalOutcome, EvalState, HandlerCatalog, LiftError, MemSnapshot, OepDump,
     RegSnapshot, TraceAnalysis, VmDescriptor,
 };
 use std::collections::HashMap;
@@ -130,13 +130,18 @@ fn print_dispatcher_evaluation(
     dump: &OepDump,
     regs: &RegSnapshot,
     ground_truth: Option<&RegSnapshot>,
+    fetch_mem: Option<&MemSnapshot>,
+    dispatch_mem: Option<&MemSnapshot>,
 ) {
     let Some(target_reg) = dispatch_target_register(instructions, d.dispatch_rip) else {
         println!("  dispatch evaluation:   (target reg not identified)");
         return;
     };
     let captured = ground_truth.and_then(|g| snapshot_reg_by_name(g, target_reg));
-    let mut state = EvalState::from_snapshot(regs, dump);
+    let mut state = EvalState::from_snapshot(regs, dump, fetch_mem);
+    if let Some(m) = dispatch_mem {
+        state.add_mem_snapshot(m.clone());
+    }
     let outcome = evaluate_linear(
         &mut state,
         instructions,
@@ -258,6 +263,7 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
     let reader = BufReader::new(file);
     let mut instructions: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut reg_captures: HashMap<u64, RegSnapshot> = HashMap::new();
+    let mut mem_captures: HashMap<u64, MemSnapshot> = HashMap::new();
     for line in reader.lines().flatten() {
         if line.trim().is_empty() {
             continue;
@@ -270,8 +276,11 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
             Event::Exec { rip, bytes, .. } => {
                 instructions.entry(rip).or_insert(bytes);
             }
-            Event::RegsAtRip { rip, regs, .. } => {
+            Event::RegsAtRip { rip, regs, mem, .. } => {
                 reg_captures.entry(rip).or_insert(regs);
+                if let Some(m) = mem {
+                    mem_captures.entry(rip).or_insert(m);
+                }
             }
             Event::OepReached { .. } => {}
         }
@@ -390,7 +399,17 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
             .or_else(|| reg_captures.get(&d.dispatch_rip));
         if let (Some(dump), Some(regs)) = (dump.as_ref(), fetch_regs) {
             let ground_truth = reg_captures.get(&d.dispatch_rip);
-            print_dispatcher_evaluation(d, &instructions, dump, regs, ground_truth);
+            let fetch_mem = mem_captures.get(&d.opcode_fetch_rip);
+            let dispatch_mem = mem_captures.get(&d.dispatch_rip);
+            print_dispatcher_evaluation(
+                d,
+                &instructions,
+                dump,
+                regs,
+                ground_truth,
+                fetch_mem,
+                dispatch_mem,
+            );
         }
         if d.rbp_state_offsets.is_empty() {
             println!("  rbp_state_offsets: (none observed in window)");

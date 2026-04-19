@@ -24,22 +24,32 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind, Register};
 use super::super::ir::expr::Flag;
 use super::super::ir::{lift_instruction, Effect, Expr, LiftError};
 use super::super::oep_dump::OepDump;
-use super::super::trace_events::RegSnapshot;
+use super::super::trace_events::{MemSnapshot, RegSnapshot};
 
 pub struct EvalState<'a> {
     regs: HashMap<Register, u64>,
     flags: HashMap<Flag, u64>,
     /// Byte-level overlay on top of `dump` — memory stores go here,
-    /// memory reads consult this first before falling back to the
-    /// dump.
+    /// memory reads consult this first before falling back to other
+    /// sources.
     mem_overlay: HashMap<u64, u8>,
+    /// Captured memory slices from the trace (e.g. the RBP-window
+    /// snapshot recorded alongside each RegsAtRip event). Consulted
+    /// after the overlay, before the OEP dump. Sorted by base_va for
+    /// binary-searchable lookup.
+    mem_snapshots: Vec<MemSnapshot>,
     dump: &'a OepDump,
 }
 
 impl<'a> EvalState<'a> {
     /// Seed register state from a `RegSnapshot`, flags empty, no
-    /// memory overlay yet.
-    pub fn from_snapshot(regs: &RegSnapshot, dump: &'a OepDump) -> Self {
+    /// memory overlay yet. Attach an optional live-memory snapshot
+    /// captured at the same tick; consulted before the OEP dump.
+    pub fn from_snapshot(
+        regs: &RegSnapshot,
+        dump: &'a OepDump,
+        mem: Option<&MemSnapshot>,
+    ) -> Self {
         let mut m: HashMap<Register, u64> = HashMap::new();
         m.insert(Register::RAX, regs.rax);
         m.insert(Register::RBX, regs.rbx);
@@ -58,12 +68,22 @@ impl<'a> EvalState<'a> {
         m.insert(Register::R14, regs.r14);
         m.insert(Register::R15, regs.r15);
         m.insert(Register::RIP, regs.rip);
+        let mem_snapshots = mem.cloned().into_iter().collect::<Vec<_>>();
         Self {
             regs: m,
             flags: HashMap::new(),
             mem_overlay: HashMap::new(),
+            mem_snapshots,
             dump,
         }
+    }
+
+    /// Attach an additional captured memory slice. Used when the
+    /// evaluator is seeded from one capture but has access to more
+    /// snapshots from the trace (e.g. the dispatch-site capture
+    /// supplements the fetch-site capture).
+    pub fn add_mem_snapshot(&mut self, snap: MemSnapshot) {
+        self.mem_snapshots.push(snap);
     }
 
     pub fn reg(&self, r: Register) -> Option<u64> {
@@ -78,13 +98,29 @@ impl<'a> EvalState<'a> {
         let mut val: u64 = 0;
         for i in 0..size as u64 {
             let byte_addr = addr + i;
-            let b = match self.mem_overlay.get(&byte_addr) {
-                Some(b) => *b,
-                None => self.dump.read_bytes_at_va(byte_addr, 1)?[0],
-            };
+            let b = self.read_byte(byte_addr)?;
             val |= (b as u64) << (8 * i);
         }
         Some(val)
+    }
+
+    fn read_byte(&self, addr: u64) -> Option<u8> {
+        if let Some(b) = self.mem_overlay.get(&addr) {
+            return Some(*b);
+        }
+        // Live memory from a captured snapshot (most specific source
+        // of truth for cells the VM mutated during init).
+        for snap in &self.mem_snapshots {
+            if addr >= snap.base_va {
+                let off = (addr - snap.base_va) as usize;
+                if off < snap.bytes.len() {
+                    return Some(snap.bytes[off]);
+                }
+            }
+        }
+        // Fallback: OEP-dumped PE. Still the right source for static
+        // data (handler table, bytecode stream, .text).
+        self.dump.read_bytes_at_va(addr, 1).map(|s| s[0])
     }
 
     pub fn write_mem(&mut self, addr: u64, value: u64, size: u8) {
@@ -259,7 +295,7 @@ mod tests {
     fn eval_const() {
         let dump = dummy_dump();
         let snap = RegSnapshot::default();
-        let state = EvalState::from_snapshot(&snap, &dump);
+        let state = EvalState::from_snapshot(&snap, &dump, None);
         assert_eq!(state.eval(&Expr::Const(42)), Some(42));
     }
 
@@ -270,20 +306,18 @@ mod tests {
             rbp: 0xdead_beef,
             ..Default::default()
         };
-        let state = EvalState::from_snapshot(&snap, &dump);
+        let state = EvalState::from_snapshot(&snap, &dump, None);
         assert_eq!(state.eval(&Expr::Reg(Register::RBP)), Some(0xdead_beef));
     }
 
     #[test]
     fn eval_arithmetic_chain() {
-        // (rbp + 0x9A) & 0xFF_FF simulates what the dispatcher's
-        // decrypt-chain looks like at the bit level.
         let dump = dummy_dump();
         let snap = RegSnapshot {
             rbp: 0x100,
             ..Default::default()
         };
-        let state = EvalState::from_snapshot(&snap, &dump);
+        let state = EvalState::from_snapshot(&snap, &dump, None);
         let e = Expr::and(
             Expr::add(Expr::Reg(Register::RBP), Expr::Const(0x9a)),
             Expr::Const(0xffff),
@@ -295,11 +329,28 @@ mod tests {
     fn memstore_overlay_then_memload() {
         let dump = dummy_dump();
         let snap = RegSnapshot::default();
-        let mut state = EvalState::from_snapshot(&snap, &dump);
+        let mut state = EvalState::from_snapshot(&snap, &dump, None);
         state.write_mem(0x1000, 0xdead_beef, 4);
         assert_eq!(state.read_mem(0x1000, 4), Some(0xdead_beef));
-        // u8 slices of the same region should reflect the overlay.
         assert_eq!(state.read_mem(0x1000, 1), Some(0xef));
         assert_eq!(state.read_mem(0x1003, 1), Some(0xde));
+    }
+
+    #[test]
+    fn mem_snapshot_precedes_dump() {
+        // Captured snapshot at base 0x2000 should shadow the dump.
+        let dump = dummy_dump();
+        let snap = RegSnapshot::default();
+        let mem = MemSnapshot {
+            base_va: 0x2000,
+            bytes: vec![0xaa, 0xbb, 0xcc, 0xdd],
+        };
+        let state = EvalState::from_snapshot(&snap, &dump, Some(&mem));
+        // Read from the captured slice.
+        assert_eq!(state.read_mem(0x2000, 1), Some(0xaa));
+        assert_eq!(state.read_mem(0x2001, 2), Some(0xccbb));
+        // Outside both the snapshot and the 512-byte synthetic
+        // dump (image_base 0): read returns None.
+        assert_eq!(state.read_mem(0x5000, 1), None);
     }
 }

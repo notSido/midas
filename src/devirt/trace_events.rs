@@ -35,16 +35,40 @@ pub enum Event {
     },
 
     /// Register snapshot captured the first time a specific RIP is
-    /// executed post-OEP. Triggered by `--devirt-capture-regs-at`;
-    /// used to recover register state at known-interesting points
-    /// (e.g. VM dispatcher entry) so the offline bytecode walker
-    /// can resolve `[rbp + X]`-style VM-state pointers without a
-    /// second emulator run.
+    /// executed post-OEP. Triggered by auto-capture on indirect
+    /// `jmp r<reg>` / `movzx r, word ptr [...]` (or by the explicit
+    /// `--devirt-capture-regs-at` back-door). Used to recover
+    /// register state at known-interesting points (e.g. VM
+    /// dispatcher entry) so the offline bytecode walker can resolve
+    /// `[rbp + X]`-style VM-state pointers without a second emulator
+    /// run.
+    ///
+    /// The optional `mem` snapshot carries the live memory around
+    /// RBP at capture time — needed because the OEP dump has
+    /// pre-VM-init memory, but the VM state cells (rolling key,
+    /// possibly handler-table pointer) have been rewritten by the
+    /// time the dispatcher fires. Having both regs and a memory
+    /// window lets an offline evaluator reproduce dispatcher
+    /// execution exactly.
     RegsAtRip {
         tick: u64,
         rip: u64,
         regs: RegSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mem: Option<MemSnapshot>,
     },
+}
+
+/// Slice of live memory captured at a trace event. `base_va` is the
+/// virtual address the slice starts at; `bytes` is the raw content.
+/// Intended to accompany `RegsAtRip` so downstream tooling has
+/// ground-truth memory at the capture tick, not just at OEP-dump
+/// time.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemSnapshot {
+    pub base_va: u64,
+    #[serde(with = "hex_bytes")]
+    pub bytes: Vec<u8>,
 }
 
 /// Full 16-GPR + RIP snapshot. Stored in JSONL as a flat object so
@@ -106,6 +130,42 @@ mod tests {
             regs: Some(RegSnapshot { rbp: 0xdead_beef, rsp: 0xcafe_f00d, .. }),
             ..
         }));
+    }
+
+    #[test]
+    fn regs_at_rip_with_mem_round_trips() {
+        let ev = Event::RegsAtRip {
+            tick: 100,
+            rip: 0x141048853,
+            regs: RegSnapshot {
+                rbp: 0x1412c1a1e,
+                ..Default::default()
+            },
+            mem: Some(MemSnapshot {
+                base_va: 0x1412c1a1e,
+                bytes: vec![0x11, 0x22, 0x33, 0x44],
+            }),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: Event = serde_json::from_str(&s).unwrap();
+        if let Event::RegsAtRip { mem: Some(m), .. } = back {
+            assert_eq!(m.base_va, 0x1412c1a1e);
+            assert_eq!(m.bytes, vec![0x11, 0x22, 0x33, 0x44]);
+        } else {
+            panic!("expected RegsAtRip with mem");
+        }
+    }
+
+    #[test]
+    fn regs_at_rip_without_mem_back_compat() {
+        // Old traces (pre-MemSnapshot) had no `mem` field.
+        let line = r#"{"kind":"regs_at_rip","tick":0,"rip":100,"regs":{"rax":0,"rbx":0,"rcx":0,"rdx":0,"rsi":0,"rdi":0,"rbp":0,"rsp":0,"r8":0,"r9":0,"r10":0,"r11":0,"r12":0,"r13":0,"r14":0,"r15":0,"rip":0}}"#;
+        let ev: Event = serde_json::from_str(line).unwrap();
+        if let Event::RegsAtRip { mem, .. } = ev {
+            assert!(mem.is_none());
+        } else {
+            panic!("wrong variant");
+        }
     }
 }
 

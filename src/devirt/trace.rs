@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{Result, UnpackError};
 
-use super::trace_events::{Event, RegSnapshot};
+use super::trace_events::{Event, MemSnapshot, RegSnapshot};
 
 pub struct TraceBuilder {
     writer: BufWriter<File>,
@@ -82,6 +82,7 @@ impl TraceBuilder {
         &mut self,
         rip: u64,
         regs: RegSnapshot,
+        mem: Option<MemSnapshot>,
     ) -> Result<()> {
         if !self.armed {
             return Ok(());
@@ -91,6 +92,7 @@ impl TraceBuilder {
             tick: self.tick,
             rip,
             regs,
+            mem,
         };
         self.write_event(&event)?;
         Ok(())
@@ -111,9 +113,15 @@ impl TraceBuilder {
         self.armed && self.capture_regs_at.contains(&rip)
     }
 
-    /// Record a RegsAtRip event. Removes the RIP from the pending
-    /// set so subsequent firings don't re-emit.
-    pub fn record_regs_at_rip(&mut self, rip: u64, regs: RegSnapshot) -> Result<()> {
+    /// Record a RegsAtRip event with optional memory snapshot.
+    /// Removes the RIP from the pending set so subsequent firings
+    /// don't re-emit.
+    pub fn record_regs_at_rip(
+        &mut self,
+        rip: u64,
+        regs: RegSnapshot,
+        mem: Option<MemSnapshot>,
+    ) -> Result<()> {
         if !self.armed {
             return Ok(());
         }
@@ -122,6 +130,7 @@ impl TraceBuilder {
             tick: self.tick,
             rip,
             regs,
+            mem,
         };
         self.write_event(&event)?;
         Ok(())
