@@ -7,7 +7,7 @@
 
 use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
-use midas::devirt::{lift_instruction, HandlerCatalog, LiftError, TraceAnalysis};
+use midas::devirt::{detect_vm, lift_instruction, HandlerCatalog, LiftError, TraceAnalysis};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
@@ -63,6 +63,14 @@ struct Args {
     /// Exclusive upper bound for `--dump-region-start`.
     #[arg(long, value_parser = parse_hex_or_dec)]
     dump_region_end: Option<u64>,
+
+    /// Scan every unique `(rip, bytes)` pair in the trace for the
+    /// canonical Themida VM dispatcher pattern and print one
+    /// `VmDescriptor` per candidate found. Sample-agnostic — the
+    /// detector uses an invariant pattern and returns sample-
+    /// specific parameters.
+    #[arg(long)]
+    detect_vm: bool,
 }
 
 fn parse_hex_or_dec(s: &str) -> std::result::Result<u64, String> {
@@ -91,6 +99,9 @@ fn main() {
 }
 
 fn run(args: Args) -> midas::Result<()> {
+    if args.detect_vm {
+        return run_detect_vm(&args);
+    }
     if args.dump_region_start.is_some() {
         return run_dump_region(&args);
     }
@@ -101,6 +112,58 @@ fn run(args: Args) -> midas::Result<()> {
         return run_extract_handlers(&args);
     }
     run_dispatcher_candidates(&args)
+}
+
+fn run_detect_vm(args: &Args) -> midas::Result<()> {
+    use midas::devirt::Event;
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(&args.input)?;
+    let reader = BufReader::new(file);
+    let mut instructions: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for line in reader.lines().flatten() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Event = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let Event::Exec { rip, bytes, .. } = event {
+            instructions.entry(rip).or_insert(bytes);
+        }
+    }
+
+    let descriptors = detect_vm(&instructions);
+    println!("== VM detector ==");
+    println!("input:              {:?}", args.input);
+    println!("unique instructions:{}", instructions.len());
+    println!("descriptors found:  {}", descriptors.len());
+    println!();
+    if descriptors.is_empty() {
+        println!("(no VM dispatchers detected — either the trace doesn't");
+        println!(" cover a VM-protected region, or the pattern is different)");
+        return Ok(());
+    }
+    for (i, d) in descriptors.iter().enumerate() {
+        println!("--- descriptor #{} ---", i + 1);
+        println!("  dispatch_rip:     0x{:x}", d.dispatch_rip);
+        println!("  opcode_fetch_rip: 0x{:x}", d.opcode_fetch_rip);
+        if d.rbp_state_offsets.is_empty() {
+            println!("  rbp_state_offsets: (none observed in window)");
+        } else {
+            println!("  rbp_state_offsets:");
+            for off in &d.rbp_state_offsets {
+                println!(
+                    "    [rbp + 0x{:x}]  reg={:?}  add@0x{:x}",
+                    off.offset, off.reg, off.add_rip
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_dump_region(args: &Args) -> midas::Result<()> {
