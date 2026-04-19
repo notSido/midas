@@ -86,6 +86,29 @@ impl<'a> EvalState<'a> {
         self.mem_snapshots.push(snap);
     }
 
+    /// Overwrite the current register state with values from
+    /// `regs`. Flags are cleared; memory overlay untouched.
+    pub fn restore_gprs(&mut self, regs: &RegSnapshot) {
+        self.set_reg(Register::RAX, regs.rax);
+        self.set_reg(Register::RBX, regs.rbx);
+        self.set_reg(Register::RCX, regs.rcx);
+        self.set_reg(Register::RDX, regs.rdx);
+        self.set_reg(Register::RSI, regs.rsi);
+        self.set_reg(Register::RDI, regs.rdi);
+        self.set_reg(Register::RBP, regs.rbp);
+        self.set_reg(Register::RSP, regs.rsp);
+        self.set_reg(Register::R8, regs.r8);
+        self.set_reg(Register::R9, regs.r9);
+        self.set_reg(Register::R10, regs.r10);
+        self.set_reg(Register::R11, regs.r11);
+        self.set_reg(Register::R12, regs.r12);
+        self.set_reg(Register::R13, regs.r13);
+        self.set_reg(Register::R14, regs.r14);
+        self.set_reg(Register::R15, regs.r15);
+        self.set_reg(Register::RIP, regs.rip);
+        self.flags.clear();
+    }
+
     /// Dump the current register state to a `RegSnapshot`. Missing
     /// registers default to 0 (they haven't been written).
     pub fn gpr_snapshot(&self) -> RegSnapshot {
@@ -329,15 +352,28 @@ pub fn walk_bytecode<I>(
 where
     I: InstructionMap,
 {
+    // Snapshot the seed register state so we can reset to it at the
+    // start of every iteration. The dispatcher prelude re-initializes
+    // the registers it uses, but any dispatcher that reads a
+    // register not covered by its prelude would otherwise inherit
+    // stale values from the previous iteration. Resetting is
+    // defensive: correctness comes from the memory overlay, which we
+    // deliberately let carry forward.
+    let seed_regs = state.gpr_snapshot();
     let mut out = Vec::new();
     let mut seen_vm_pc: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for iter in 0..max_iters {
+        if iter > 0 {
+            // Restore GPRs to the seed state; memory overlay (and
+            // thus VM_PC cell, rolling key cell, any other
+            // dispatcher-written bytes) stays as the previous
+            // iteration left it.
+            state.restore_gprs(&seed_regs);
+        }
         let Some(vm_pc) = state.read_mem(vm_pc_cell_addr, 8) else {
             break;
         };
         if !seen_vm_pc.insert(vm_pc) {
-            // VM_PC repeated — we've either looped or the
-            // dispatcher didn't advance it. Stop.
             break;
         }
         match evaluate_linear(state, instructions, dispatcher_start_rip, dispatch_rip) {

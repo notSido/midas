@@ -9,8 +9,8 @@ use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use midas::devirt::{
     detect_vm, dispatch_target_register, evaluate_linear, group_into_contexts, lift_instruction,
-    resolve_vm_addresses, walk_bytecode, EvalOutcome, EvalState, HandlerCatalog, LiftError,
-    MemSnapshot, OepDump, RegSnapshot, TraceAnalysis, VmDescriptor,
+    resolve_vm_addresses, EvalOutcome, EvalState, HandlerCatalog, LiftError, MemSnapshot,
+    OepDump, RegSnapshot, TraceAnalysis, VmDescriptor,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -130,17 +130,24 @@ fn print_dispatcher_evaluation(
     dump: &OepDump,
     regs: &RegSnapshot,
     ground_truth: Option<&RegSnapshot>,
-    fetch_mem: Option<&MemSnapshot>,
-    dispatch_mem: Option<&MemSnapshot>,
+    fetch_mems: Option<&Vec<MemSnapshot>>,
+    dispatch_mems: Option<&Vec<MemSnapshot>>,
 ) {
     let Some(target_reg) = dispatch_target_register(instructions, d.dispatch_rip) else {
         println!("  dispatch evaluation:   (target reg not identified)");
         return;
     };
     let captured = ground_truth.and_then(|g| snapshot_reg_by_name(g, target_reg));
-    let mut state = EvalState::from_snapshot(regs, dump, fetch_mem);
-    if let Some(m) = dispatch_mem {
-        state.add_mem_snapshot(m.clone());
+    let mut state = EvalState::from_snapshot(regs, dump, None);
+    if let Some(ms) = fetch_mems {
+        for m in ms {
+            state.add_mem_snapshot(m.clone());
+        }
+    }
+    if let Some(ms) = dispatch_mems {
+        for m in ms {
+            state.add_mem_snapshot(m.clone());
+        }
     }
     let outcome = evaluate_linear(
         &mut state,
@@ -176,44 +183,65 @@ fn print_dispatcher_evaluation(
     }
 }
 
-fn print_bytecode_walk(
+/// Replay-mode walk: for each recorded firing of the dispatcher's
+/// opcode-fetch RIP, seed an `EvalState` from that firing's exact
+/// captured state and evaluate the dispatcher forward to the jmp.
+/// This mirrors the runtime instead of relying on state flowing
+/// forward via overlay — so the bytecode bytes the walker sees at
+/// iter N are the exact bytes the real VM saw at that moment.
+fn print_trace_replay_walk(
     d: &VmDescriptor,
     instructions: &std::collections::BTreeMap<u64, Vec<u8>>,
     dump: &OepDump,
-    fetch_regs: &RegSnapshot,
-    fetch_mem: &MemSnapshot,
-    vm_pc_cell_addr: u64,
+    firings: &[(u64, RegSnapshot, Vec<MemSnapshot>)],
 ) {
     let Some(target_reg) = dispatch_target_register(instructions, d.dispatch_rip) else {
         return;
     };
-    let mut state = EvalState::from_snapshot(fetch_regs, dump, Some(fetch_mem));
-    let steps = walk_bytecode(
-        &mut state,
-        instructions,
-        d.dispatcher_start_rip,
-        d.dispatch_rip,
-        vm_pc_cell_addr,
-        target_reg,
-        32, // max iters — informative first slice, not exhaustive
-    );
     println!(
-        "  bytecode walk ({} iterations from dispatcher_start 0x{:x}):",
-        steps.len(),
+        "  bytecode walk ({} captured firings, replay mode from dispatcher_start 0x{:x}):",
+        firings.len(),
         d.dispatcher_start_rip
     );
-    for step in &steps {
-        // All top-candidate indexer registers observed in current
-        // samples (sample 2 → R11, sample 1 → R15). Printing both
-        // keeps output sample-agnostic.
-        let g = &step.gprs_at_dispatch;
-        println!(
-            "    [{:>3}] VM_PC=0x{:010x}  handler=0x{:x}  r11=0x{:x} r15=0x{:x} r9=0x{:x}",
-            step.iter, step.vm_pc, step.handler_addr, g.r11, g.r15, g.r9
+    for (i, (tick, regs, mems)) in firings.iter().enumerate() {
+        let mut state = EvalState::from_snapshot(regs, dump, None);
+        for m in mems {
+            state.add_mem_snapshot(m.clone());
+        }
+        let outcome = midas::devirt::evaluate_linear(
+            &mut state,
+            instructions,
+            d.dispatcher_start_rip,
+            d.dispatch_rip,
         );
-    }
-    if steps.is_empty() {
-        println!("    (no iterations completed — evaluator stopped immediately)");
+        let handler = state.reg(target_reg).unwrap_or(0);
+        let g = state.gpr_snapshot();
+        let status = match outcome {
+            midas::devirt::EvalOutcome::Ok => "OK",
+            midas::devirt::EvalOutcome::LiftFailure { rip, .. } => {
+                println!(
+                    "    [{:>3}] tick={:>10}  LIFT FAIL at 0x{:x}",
+                    i, tick, rip
+                );
+                continue;
+            }
+            midas::devirt::EvalOutcome::EvalFailure { rip } => {
+                println!(
+                    "    [{:>3}] tick={:>10}  EVAL FAIL at 0x{:x}",
+                    i, tick, rip
+                );
+                continue;
+            }
+        };
+        // VM_PC at fetch time = (base reg of fetch instr); we
+        // approximate via R11-or-whichever. Use rip from regs minus 4
+        // is sample-specific; just read VM_PC from the regs' actual
+        // known-to-be-fetch-base (r11 for sample 2, r15 for sample
+        // 1). Report both.
+        println!(
+            "    [{:>3}] tick={:>10}  {}  handler=0x{:x}  r11=0x{:x} r15=0x{:x}",
+            i, tick, status, handler, g.r11, g.r15
+        );
     }
 }
 
@@ -304,7 +332,12 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
     let reader = BufReader::new(file);
     let mut instructions: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut reg_captures: HashMap<u64, RegSnapshot> = HashMap::new();
-    let mut mem_captures: HashMap<u64, MemSnapshot> = HashMap::new();
+    let mut mem_captures: HashMap<u64, Vec<MemSnapshot>> = HashMap::new();
+    // Multi-shot captures (one entry per firing) in tick order.
+    // The movzx auto-capture path emits one per dispatcher iteration
+    // so the walker can seed each iter from its ground-truth state.
+    let mut multi_captures: HashMap<u64, Vec<(u64, RegSnapshot, Vec<MemSnapshot>)>> =
+        HashMap::new();
     for line in reader.lines().flatten() {
         if line.trim().is_empty() {
             continue;
@@ -317,11 +350,22 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
             Event::Exec { rip, bytes, .. } => {
                 instructions.entry(rip).or_insert(bytes);
             }
-            Event::RegsAtRip { rip, regs, mem, .. } => {
-                reg_captures.entry(rip).or_insert(regs);
-                if let Some(m) = mem {
-                    mem_captures.entry(rip).or_insert(m);
+            Event::RegsAtRip {
+                tick,
+                rip,
+                regs,
+                mems,
+            } => {
+                reg_captures.entry(rip).or_insert_with(|| regs.clone());
+                if !mems.is_empty() {
+                    mem_captures
+                        .entry(rip)
+                        .or_insert_with(|| mems.clone());
                 }
+                multi_captures
+                    .entry(rip)
+                    .or_default()
+                    .push((tick, regs, mems));
             }
             Event::OepReached { .. } => {}
         }
@@ -440,24 +484,22 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
             .or_else(|| reg_captures.get(&d.dispatch_rip));
         if let (Some(dump), Some(regs)) = (dump.as_ref(), fetch_regs) {
             let ground_truth = reg_captures.get(&d.dispatch_rip);
-            let fetch_mem = mem_captures.get(&d.opcode_fetch_rip);
-            let dispatch_mem = mem_captures.get(&d.dispatch_rip);
+            let fetch_mems = mem_captures.get(&d.opcode_fetch_rip);
+            let dispatch_mems = mem_captures.get(&d.dispatch_rip);
             print_dispatcher_evaluation(
                 d,
                 &instructions,
                 dump,
                 regs,
                 ground_truth,
-                fetch_mem,
-                dispatch_mem,
+                fetch_mems,
+                dispatch_mems,
             );
-            // Iterative walker: only for descriptor #1 of each
-            // unique VM context (avoids duplicating the same walk
-            // across every inlined dispatch site). Requires both
-            // fetch-regs + fetch-mem and a resolved vm_pc_addr.
             if i == 0 {
-                if let (Some(fmem), Some(pc_addr)) = (fetch_mem, d.vm_pc_addr) {
-                    print_bytecode_walk(d, &instructions, dump, regs, fmem, pc_addr);
+                if let Some(firings) = multi_captures.get(&d.opcode_fetch_rip) {
+                    if !firings.is_empty() {
+                        print_trace_replay_walk(d, &instructions, dump, firings);
+                    }
                 }
             }
         }

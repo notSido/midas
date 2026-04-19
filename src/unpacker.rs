@@ -312,8 +312,8 @@ impl Unpacker {
                     if tb.should_auto_capture_indirect_jmp(addr, &bytes) {
                         match snapshot_gprs(emu) {
                             Ok(regs) => {
-                                let mem = snapshot_rbp_window(emu, regs.rbp);
-                                if let Err(e) = tb.record_auto_captured_regs(addr, regs, mem) {
+                                let mems = build_capture_mems(emu, addr, &bytes, &regs);
+                                if let Err(e) = tb.record_auto_captured_regs(addr, regs, mems) {
                                     log::warn!(
                                         "auto regs-at-rip record failed at 0x{:x}: {}",
                                         addr, e
@@ -331,8 +331,8 @@ impl Unpacker {
                     if tb.should_capture_regs(addr) {
                         match snapshot_gprs(emu) {
                             Ok(regs) => {
-                                let mem = snapshot_rbp_window(emu, regs.rbp);
-                                if let Err(e) = tb.record_regs_at_rip(addr, regs, mem) {
+                                let mems = build_capture_mems(emu, addr, &bytes, &regs);
+                                if let Err(e) = tb.record_regs_at_rip(addr, regs, mems) {
                                     log::warn!(
                                         "regs-at-rip record failed at 0x{:x}: {}",
                                         addr, e
@@ -684,14 +684,9 @@ impl Unpacker {
 
 /// Read a 512-byte memory window starting at RBP. Covers every
 /// VM-state offset observed to date (`+0x26`, `+0x9A`, `+0xD4`,
-/// `+0x15F`, `+0x1C2`) with headroom. Purpose: the offline
-/// evaluator needs live memory at capture time to read VM state
-/// cells the dispatcher mutated during VM initialization — the
-/// OEP dump has the stale pre-init view. Returns `None` if
-/// Unicorn couldn't read the range (e.g. RBP points at unmapped
-/// memory); the trace is still usable without it.
+/// `+0x15F`, `+0x1C2`) with headroom.
 fn snapshot_rbp_window(emu: &Unicorn<()>, rbp: u64) -> Option<MemSnapshot> {
-    const WINDOW_SIZE: usize = 0x200; // 512 bytes
+    const WINDOW_SIZE: usize = 0x200;
     match emu.mem_read_as_vec(rbp, WINDOW_SIZE) {
         Ok(bytes) => Some(MemSnapshot {
             base_va: rbp,
@@ -699,6 +694,97 @@ fn snapshot_rbp_window(emu: &Unicorn<()>, rbp: u64) -> Option<MemSnapshot> {
         }),
         Err(_) => None,
     }
+}
+
+/// If `bytes` decodes to a `movzx r, word ptr [mem]`, read 4KB
+/// starting at the computed memory-operand effective address.
+/// Returns `None` for any other instruction shape or unreadable
+/// memory. Purpose: at VM opcode-fetch instructions, this snapshot
+/// captures the LIVE bytecode stream — which may differ from the
+/// OEP dump (handlers or init code may progressively decrypt the
+/// bytecode).
+fn snapshot_movzx_mem_window(
+    emu: &Unicorn<()>,
+    bytes: &[u8],
+    rip: u64,
+) -> Option<MemSnapshot> {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
+    let mut dec = Decoder::with_ip(64, bytes, rip, DecoderOptions::NONE);
+    let insn = dec.decode();
+    if insn.mnemonic() != Mnemonic::Movzx {
+        return None;
+    }
+    if insn.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    let base = insn.memory_base();
+    let index = insn.memory_index();
+    if index != iced_x86::Register::None {
+        return None;
+    }
+    let base_val = if base == iced_x86::Register::None {
+        0
+    } else {
+        read_gpr(emu, base).ok()?
+    };
+    let addr = base_val.wrapping_add(insn.memory_displacement64());
+    const BYTECODE_WINDOW: usize = 0x1000;
+    match emu.mem_read_as_vec(addr, BYTECODE_WINDOW) {
+        Ok(bytes) => Some(MemSnapshot {
+            base_va: addr,
+            bytes,
+        }),
+        Err(_) => None,
+    }
+}
+
+fn read_gpr(emu: &Unicorn<()>, r: iced_x86::Register) -> Result<u64> {
+    use iced_x86::Register as I;
+    use unicorn_engine::RegisterX86 as U;
+    let u = match r.full_register() {
+        I::RAX => U::RAX,
+        I::RBX => U::RBX,
+        I::RCX => U::RCX,
+        I::RDX => U::RDX,
+        I::RSI => U::RSI,
+        I::RDI => U::RDI,
+        I::RBP => U::RBP,
+        I::RSP => U::RSP,
+        I::R8 => U::R8,
+        I::R9 => U::R9,
+        I::R10 => U::R10,
+        I::R11 => U::R11,
+        I::R12 => U::R12,
+        I::R13 => U::R13,
+        I::R14 => U::R14,
+        I::R15 => U::R15,
+        _ => {
+            return Err(UnpackError::EmulationError(
+                "read_gpr: not a full GPR64".into(),
+            ))
+        }
+    };
+    emu.reg_read(u)
+        .map_err(|e| UnpackError::EmulationError(format!("reg_read failed: {:?}", e)))
+}
+
+/// Build the full `mems: Vec<MemSnapshot>` for a capture event:
+/// RBP window (always, if readable) + movzx source-pointer
+/// window (only for movzx-word-ptr instructions).
+fn build_capture_mems(
+    emu: &Unicorn<()>,
+    rip: u64,
+    bytes: &[u8],
+    regs: &RegSnapshot,
+) -> Vec<MemSnapshot> {
+    let mut out = Vec::with_capacity(2);
+    if let Some(m) = snapshot_rbp_window(emu, regs.rbp) {
+        out.push(m);
+    }
+    if let Some(m) = snapshot_movzx_mem_window(emu, bytes, rip) {
+        out.push(m);
+    }
+    out
 }
 
 /// Read all 16 GPRs + RIP out of the Unicorn emulator into a

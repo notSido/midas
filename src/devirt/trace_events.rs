@@ -54,8 +54,13 @@ pub enum Event {
         tick: u64,
         rip: u64,
         regs: RegSnapshot,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mem: Option<MemSnapshot>,
+        /// Zero or more memory windows captured at this tick. Typical
+        /// shape for a dispatcher-fetch capture: one window at RBP
+        /// (VM state struct) plus one window at the movzx source
+        /// register's pointed-to address (bytecode stream). For a
+        /// dispatch-exit capture: just the RBP window.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mems: Vec<MemSnapshot>,
     },
 }
 
@@ -133,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn regs_at_rip_with_mem_round_trips() {
+    fn regs_at_rip_with_mems_round_trips() {
         let ev = Event::RegsAtRip {
             tick: 100,
             rip: 0x141048853,
@@ -141,28 +146,35 @@ mod tests {
                 rbp: 0x1412c1a1e,
                 ..Default::default()
             },
-            mem: Some(MemSnapshot {
-                base_va: 0x1412c1a1e,
-                bytes: vec![0x11, 0x22, 0x33, 0x44],
-            }),
+            mems: vec![
+                MemSnapshot {
+                    base_va: 0x1412c1a1e,
+                    bytes: vec![0x11, 0x22, 0x33, 0x44],
+                },
+                MemSnapshot {
+                    base_va: 0x1412ee872,
+                    bytes: vec![0xaa, 0xbb],
+                },
+            ],
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: Event = serde_json::from_str(&s).unwrap();
-        if let Event::RegsAtRip { mem: Some(m), .. } = back {
-            assert_eq!(m.base_va, 0x1412c1a1e);
-            assert_eq!(m.bytes, vec![0x11, 0x22, 0x33, 0x44]);
+        if let Event::RegsAtRip { mems, .. } = back {
+            assert_eq!(mems.len(), 2);
+            assert_eq!(mems[0].base_va, 0x1412c1a1e);
+            assert_eq!(mems[1].base_va, 0x1412ee872);
+            assert_eq!(mems[1].bytes, vec![0xaa, 0xbb]);
         } else {
-            panic!("expected RegsAtRip with mem");
+            panic!("expected RegsAtRip with mems");
         }
     }
 
     #[test]
-    fn regs_at_rip_without_mem_back_compat() {
-        // Old traces (pre-MemSnapshot) had no `mem` field.
+    fn regs_at_rip_without_mems_back_compat() {
         let line = r#"{"kind":"regs_at_rip","tick":0,"rip":100,"regs":{"rax":0,"rbx":0,"rcx":0,"rdx":0,"rsi":0,"rdi":0,"rbp":0,"rsp":0,"r8":0,"r9":0,"r10":0,"r11":0,"r12":0,"r13":0,"r14":0,"r15":0,"rip":0}}"#;
         let ev: Event = serde_json::from_str(line).unwrap();
-        if let Event::RegsAtRip { mem, .. } = ev {
-            assert!(mem.is_none());
+        if let Event::RegsAtRip { mems, .. } = ev {
+            assert!(mems.is_empty());
         } else {
             panic!("wrong variant");
         }

@@ -29,6 +29,12 @@ pub struct TraceBuilder {
     /// capture path so every unique dispatcher candidate produces
     /// exactly one `RegsAtRip` event without user-supplied config.
     auto_captured_indirect_jmps: HashSet<u64>,
+    /// For `movzx r, word ptr [mem]` we capture on EVERY firing
+    /// (multi-shot), not just first, because the bytecode those
+    /// instructions read may change between firings (handlers can
+    /// progressively decrypt). Bounded per-RIP so a busy movzx
+    /// inside a handler body doesn't flood the trace.
+    movzx_fire_counts: std::collections::HashMap<u64, u32>,
 }
 
 impl TraceBuilder {
@@ -48,6 +54,7 @@ impl TraceBuilder {
             limit,
             capture_regs_at: HashSet::new(),
             auto_captured_indirect_jmps: HashSet::new(),
+            movzx_fire_counts: std::collections::HashMap::new(),
         })
     }
 
@@ -69,10 +76,17 @@ impl TraceBuilder {
         if !self.armed {
             return false;
         }
-        if !(is_indirect_reg_jmp_bytes(bytes) || is_movzx_word_ptr_mem_bytes(bytes)) {
-            return false;
+        // Indirect jmp: one capture per unique RIP.
+        if is_indirect_reg_jmp_bytes(bytes) {
+            return !self.auto_captured_indirect_jmps.contains(&rip);
         }
-        !self.auto_captured_indirect_jmps.contains(&rip)
+        // movzx: multi-shot, capped per RIP to bound trace size.
+        if is_movzx_word_ptr_mem_bytes(bytes) {
+            const MOVZX_CAP_PER_RIP: u32 = 64;
+            let count = self.movzx_fire_counts.get(&rip).copied().unwrap_or(0);
+            return count < MOVZX_CAP_PER_RIP;
+        }
+        false
     }
 
     /// Variant of `record_regs_at_rip` used by the automatic path —
@@ -82,17 +96,24 @@ impl TraceBuilder {
         &mut self,
         rip: u64,
         regs: RegSnapshot,
-        mem: Option<MemSnapshot>,
+        mems: Vec<MemSnapshot>,
     ) -> Result<()> {
         if !self.armed {
             return Ok(());
         }
-        self.auto_captured_indirect_jmps.insert(rip);
+        // Decide which bookkeeping set to update based on the mems
+        // shape: movzx captures always carry a second snapshot
+        // (bytecode window) besides the RBP window.
+        if mems.len() >= 2 {
+            *self.movzx_fire_counts.entry(rip).or_insert(0) += 1;
+        } else {
+            self.auto_captured_indirect_jmps.insert(rip);
+        }
         let event = Event::RegsAtRip {
             tick: self.tick,
             rip,
             regs,
-            mem,
+            mems,
         };
         self.write_event(&event)?;
         Ok(())
@@ -113,14 +134,14 @@ impl TraceBuilder {
         self.armed && self.capture_regs_at.contains(&rip)
     }
 
-    /// Record a RegsAtRip event with optional memory snapshot.
+    /// Record a RegsAtRip event with any number of mem snapshots.
     /// Removes the RIP from the pending set so subsequent firings
     /// don't re-emit.
     pub fn record_regs_at_rip(
         &mut self,
         rip: u64,
         regs: RegSnapshot,
-        mem: Option<MemSnapshot>,
+        mems: Vec<MemSnapshot>,
     ) -> Result<()> {
         if !self.armed {
             return Ok(());
@@ -130,7 +151,7 @@ impl TraceBuilder {
             tick: self.tick,
             rip,
             regs,
-            mem,
+            mems,
         };
         self.write_event(&event)?;
         Ok(())
