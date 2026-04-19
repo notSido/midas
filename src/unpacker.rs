@@ -298,31 +298,49 @@ impl Unpacker {
             if let Some(tb) = &devirt_trace_clone {
                 let mut tb = tb.lock().unwrap();
                 if tb.is_armed() {
-                    // One-shot register capture: if this RIP is
-                    // registered via --devirt-capture-regs-at, emit a
-                    // RegsAtRip event before the Exec. Removed from the
-                    // pending set on success so repeated firings don't
-                    // spam the trace.
+                    let read_size = (size as usize).min(15);
+                    let bytes = emu.mem_read_as_vec(addr, read_size).unwrap_or_default();
+                    // Automatic one-shot register capture on every
+                    // indirect `jmp r<reg>` the first time each RIP
+                    // fires post-OEP. No flag required — the offline
+                    // VM-pattern detector uses the resulting
+                    // `RegsAtRip` events to recover dispatcher-entry
+                    // register state (RBP in particular) for every
+                    // candidate dispatcher.
+                    if tb.should_auto_capture_indirect_jmp(addr, &bytes) {
+                        match snapshot_gprs(emu) {
+                            Ok(regs) => {
+                                if let Err(e) = tb.record_auto_captured_regs(addr, regs) {
+                                    log::warn!(
+                                        "auto regs-at-rip record failed at 0x{:x}: {}",
+                                        addr, e
+                                    );
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "auto regs snapshot failed at 0x{:x}: {}",
+                                addr, e
+                            ),
+                        }
+                    }
+                    // Manual one-shot capture (testing back-door;
+                    // primary path is the auto-capture above).
                     if tb.should_capture_regs(addr) {
                         match snapshot_gprs(emu) {
                             Ok(regs) => {
                                 if let Err(e) = tb.record_regs_at_rip(addr, regs) {
                                     log::warn!(
                                         "regs-at-rip record failed at 0x{:x}: {}",
-                                        addr,
-                                        e
+                                        addr, e
                                     );
                                 }
                             }
                             Err(e) => log::warn!(
                                 "regs snapshot failed at 0x{:x}: {}",
-                                addr,
-                                e
+                                addr, e
                             ),
                         }
                     }
-                    let read_size = (size as usize).min(15);
-                    let bytes = emu.mem_read_as_vec(addr, read_size).unwrap_or_default();
                     match tb.record_exec(addr, &bytes) {
                         Ok(true) => {}
                         Ok(false) => {

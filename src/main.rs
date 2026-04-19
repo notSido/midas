@@ -60,12 +60,13 @@ struct Args {
     #[arg(long, default_value = "1000000")]
     devirt_trace_limit: u64,
 
-    /// Emit a one-shot register snapshot the first time this RIP
-    /// fires post-OEP. Repeatable. Used by the offline bytecode
-    /// walker to recover register state at a specific point (e.g.
-    /// dispatcher entry) without a full register-delta trace.
-    /// Requires `--devirt-trace`.
-    #[arg(long, value_parser = parse_rip)]
+    /// (Testing back-door — not the primary path.) Emit a one-shot
+    /// register snapshot the first time this RIP fires post-OEP.
+    /// Repeatable. The primary capture path is automatic: the
+    /// unpacker already snapshots regs on the first firing of every
+    /// indirect `jmp r<reg>` post-OEP without any flag — this exists
+    /// only for targeted debugging of specific non-dispatcher RIPs.
+    #[arg(long, value_parser = parse_rip, hide = true)]
     devirt_capture_regs_at: Vec<u64>,
 }
 

@@ -24,6 +24,11 @@ pub struct TraceBuilder {
     /// the first time each RIP is executed post-OEP. Entries are
     /// removed on capture so repeated firings don't spam the trace.
     capture_regs_at: HashSet<u64>,
+    /// Tracks which indirect `jmp r<reg>` RIPs have already had a
+    /// one-shot register snapshot emitted — used by the automatic-
+    /// capture path so every unique dispatcher candidate produces
+    /// exactly one `RegsAtRip` event without user-supplied config.
+    auto_captured_indirect_jmps: HashSet<u64>,
 }
 
 impl TraceBuilder {
@@ -42,7 +47,48 @@ impl TraceBuilder {
             armed: false,
             limit,
             capture_regs_at: HashSet::new(),
+            auto_captured_indirect_jmps: HashSet::new(),
         })
+    }
+
+    /// Return true if this is the first time we've seen an indirect
+    /// `jmp r<reg>` at `rip` and the recorder is armed — i.e. the
+    /// auto-capture path should fire here. Callers then snapshot
+    /// registers (from the live emulator) and call
+    /// `record_regs_at_rip`.
+    ///
+    /// Pattern is cheap enough to check inline for every post-OEP
+    /// instruction: a 2- or 3-byte `FF E0..FF E7` / `41 FF E0..41 FF
+    /// E7` sequence.
+    pub fn should_auto_capture_indirect_jmp(&self, rip: u64, bytes: &[u8]) -> bool {
+        if !self.armed {
+            return false;
+        }
+        if !is_indirect_reg_jmp_bytes(bytes) {
+            return false;
+        }
+        !self.auto_captured_indirect_jmps.contains(&rip)
+    }
+
+    /// Variant of `record_regs_at_rip` used by the automatic path —
+    /// marks the RIP as captured so the same dispatcher doesn't emit
+    /// a second event on its next firing.
+    pub fn record_auto_captured_regs(
+        &mut self,
+        rip: u64,
+        regs: RegSnapshot,
+    ) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.auto_captured_indirect_jmps.insert(rip);
+        let event = Event::RegsAtRip {
+            tick: self.tick,
+            rip,
+            regs,
+        };
+        self.write_event(&event)?;
+        Ok(())
     }
 
     /// Register a RIP at which a one-shot register snapshot should
@@ -156,7 +202,23 @@ impl TraceBuilder {
         );
         Ok(self.tick)
     }
+}
 
+/// Recognise the x86-64 `jmp r<reg>` register-indirect form from raw
+/// bytes. Two encodings:
+/// - `FF E0..FF E7` — RAX..RDI (2 bytes, no REX).
+/// - `41 FF E0..41 FF E7` — R8..R15 (3 bytes, REX.B set).
+/// Excludes indirect-through-memory (`jmp [mem]`) which uses different
+/// ModR/M mode bits.
+fn is_indirect_reg_jmp_bytes(bytes: &[u8]) -> bool {
+    match bytes {
+        [0xFF, m, ..] if (*m & 0xF8) == 0xE0 => true,
+        [0x41, 0xFF, m, ..] if (*m & 0xF8) == 0xE0 => true,
+        _ => false,
+    }
+}
+
+impl TraceBuilder {
     fn write_event(&mut self, event: &Event) -> Result<()> {
         serde_json::to_writer(&mut self.writer, event)
             .map_err(|e| UnpackError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
