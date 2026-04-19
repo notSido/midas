@@ -46,6 +46,10 @@ pub struct Handler {
     pub fire_count: u64,
     /// First few RIPs of the sequence — useful for eyeballing.
     pub first_rips: Vec<u64>,
+    /// One concrete invocation's full `(rip, bytes)` sequence. Populated
+    /// from the first observation of this signature. Used by the IR
+    /// lifter to turn a handler into `Vec<Effect>`.
+    pub exemplar: Vec<(u64, Vec<u8>)>,
 }
 
 /// Result of handler extraction against a given dispatcher address.
@@ -73,8 +77,8 @@ impl HandlerCatalog {
         // `seen_dispatcher`: have we passed the first dispatcher RIP
         // yet? We only record invocations between consecutive firings.
         let mut seen_dispatcher = false;
-        let mut current: Vec<u64> = Vec::new();
-        // signature → (Handler aggregate)
+        // `current`: (rip, bytes) pairs of the in-progress invocation.
+        let mut current: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut groups: HashMap<u64, Handler> = HashMap::new();
         let mut total_invocations: u64 = 0;
 
@@ -89,7 +93,7 @@ impl HandlerCatalog {
                 Event::OepReached { .. } => {
                     // marker — ignore for segmentation
                 }
-                Event::Exec { rip, .. } => {
+                Event::Exec { rip, bytes, .. } => {
                     if rip == dispatcher_rip {
                         if seen_dispatcher && !current.is_empty() {
                             finalize_invocation(&current, &mut groups);
@@ -98,7 +102,7 @@ impl HandlerCatalog {
                         seen_dispatcher = true;
                         current.clear();
                     } else if seen_dispatcher {
-                        current.push(rip);
+                        current.push((rip, bytes));
                     }
                 }
             }
@@ -123,22 +127,25 @@ impl HandlerCatalog {
     }
 }
 
-fn signature_of(rips: &[u64]) -> u64 {
+fn signature_of(pairs: &[(u64, Vec<u8>)]) -> u64 {
     let mut h = DefaultHasher::new();
-    rips.hash(&mut h);
+    for (rip, _) in pairs {
+        rip.hash(&mut h);
+    }
     h.finish()
 }
 
-fn finalize_invocation(rips: &[u64], groups: &mut HashMap<u64, Handler>) {
-    let sig = signature_of(rips);
+fn finalize_invocation(pairs: &[(u64, Vec<u8>)], groups: &mut HashMap<u64, Handler>) {
+    let sig = signature_of(pairs);
     let entry = groups.entry(sig).or_insert_with(|| {
-        let preview: Vec<u64> = rips.iter().take(8).copied().collect();
+        let preview: Vec<u64> = pairs.iter().take(8).map(|(r, _)| *r).collect();
         Handler {
             signature: sig,
-            entry_rip: rips[0],
-            length: rips.len(),
+            entry_rip: pairs[0].0,
+            length: pairs.len(),
             fire_count: 0,
             first_rips: preview,
+            exemplar: pairs.to_vec(),
         }
     });
     entry.fire_count += 1;
@@ -185,6 +192,7 @@ mod tests {
         assert_eq!(cat.handlers[0].fire_count, 3);
         assert_eq!(cat.handlers[0].entry_rip, 0x2000);
         assert_eq!(cat.handlers[0].length, 3);
+        assert_eq!(cat.handlers[0].exemplar.len(), 3);
         assert_eq!(cat.handlers[1].fire_count, 2);
         assert_eq!(cat.handlers[1].entry_rip, 0x3000);
         assert_eq!(cat.handlers[1].length, 2);

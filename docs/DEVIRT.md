@@ -30,8 +30,8 @@ each against a commercial packer like Themida 3.x.
 | --- | ---------------------------- | ------ | ---------- |
 | M0  | Per-instruction trace (JSONL, armed at OEP) | ✅ done | `16094ba`, `70ded59` |
 | M1  | VM dispatcher candidate finder (offline trace analysis) | ✅ done | `a3fc9ce` |
-| M2  | Handler discovery, basic-block cluster & dedup | ✅ done | (this commit) |
-| M3  | IR (`Expr` + `Effect`) + iced-x86 → IR lifter | ⏳ ready to start on sample 2 VM handlers |            |
+| M2  | Handler discovery, basic-block cluster & dedup | ✅ done | `2dab0b4` |
+| M3  | IR (`Expr` + `Effect`) + iced-x86 → IR lifter | ✅ first cut done (this commit) — 64-bit GPR ops only |            |
 | M4  | Per-handler semantics via simplification | ☐ required for semantic dedup (RIP-seq too strict) | |
 | M5  | VM bytecode stream lifter (stretch)        | ☐      |            |
 | M6  | IR simplifier — constant fold + algebraic peephole | ☐ |            |
@@ -211,6 +211,45 @@ Revised strategic fork (decision after diagnostic work):
    linearly) and surfaced a layer of **second-tier indirect
    branches** (`0x14112463f` etc. at fan_out 31-41, lower exec)
    suggesting a two-level VM.
+
+## M3 first-cut lift coverage (sample 2 top handler)
+
+Lifted the first 60 instructions of sample 2's top handler
+(sig=0xe2663df3a17a3d4d, entry=0x1411d6656, fires 43/1316).
+**47/60 (78%) lifted successfully** with a minimal 64-bit-GPR-only
+lifter covering mov / add / sub / and / or / xor / shl / shr /
+not / neg.
+
+The handler is a textbook mutation wrapper: a real 3-byte
+decryption validation buried in heavy junk arithmetic.
+Representative excerpt (lines annotated):
+
+```
+mov r11b, [rbx]          ← load plaintext byte (real op, narrow)
+sub r11b, 0EEh           ← decrypt step (real, narrow)
+or r9, rsi               ← junk (never read again)
+xor rcx, rbx             ← junk
+xor rcx, rbx             ← cancels the previous xor
+sub r11b, 50h            ← decrypt step (real, narrow)
+...
+sub r11b, 0A8h           ← decrypt step (real, narrow)
+cmp r11b, 0              ← validate
+jne <fail>               ← branch on failure
+```
+
+Of the 13 unsupported:
+- 9 are narrow-register partial writes (`r11b`, `sil`, `r12d`) —
+  intentionally deferred. Will be the next M3 iteration:
+  materialize partial writes as `SetReg(full, (full & ~mask) |
+  (value << shift))`.
+- 2 `Cmp` + 2 `Jne` — need an rflags / branch-condition model.
+  Cheapest path: represent flags as pseudo-registers SF/ZF/CF/OF
+  updated by arithmetic effects, then lift `jne` as "branch if
+  ZF == 0". M3.5 or early M4.
+
+Everything else lifts. The `xor rcx, rbx; xor rcx, rbx`
+back-to-back pair visible in the output is exactly the kind of
+junk the simplifier (M6) will eliminate via `x xor y xor y = x`.
 
 ## Empirical observations (after M1, 2M-event traces)
 

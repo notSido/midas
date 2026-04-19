@@ -6,7 +6,9 @@
 //! elsewhere but the trace file is local.
 
 use clap::Parser;
-use midas::devirt::{HandlerCatalog, TraceAnalysis};
+use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
+use midas::devirt::{lift_instruction, HandlerCatalog, LiftError, TraceAnalysis};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
 
@@ -39,6 +41,16 @@ struct Args {
     /// In handler-extract mode, print up to this many handlers.
     #[arg(long, default_value = "30")]
     handlers_to_print: usize,
+
+    /// Lift handler #N (0 = top by fire_count) to IR and report
+    /// per-instruction lift success. Requires `--dispatcher`.
+    #[arg(long)]
+    lift_handler: Option<usize>,
+
+    /// Cap on the number of handler instructions lifted when
+    /// `--lift-handler` is used.
+    #[arg(long, default_value = "200")]
+    lift_limit: usize,
 }
 
 fn parse_hex_or_dec(s: &str) -> std::result::Result<u64, String> {
@@ -67,10 +79,89 @@ fn main() {
 }
 
 fn run(args: Args) -> midas::Result<()> {
+    if args.lift_handler.is_some() {
+        return run_lift_handler(&args);
+    }
     if args.extract_handlers {
         return run_extract_handlers(&args);
     }
     run_dispatcher_candidates(&args)
+}
+
+fn run_lift_handler(args: &Args) -> midas::Result<()> {
+    let dispatcher = args.dispatcher.ok_or_else(|| {
+        midas::UnpackError::DumpError("--dispatcher <RIP> is required with --lift-handler".into())
+    })?;
+    let idx = args.lift_handler.unwrap();
+    let catalog = HandlerCatalog::from_trace_file(&args.input, dispatcher)?;
+    let handler = catalog.handlers.get(idx).ok_or_else(|| {
+        midas::UnpackError::DumpError(format!(
+            "handler index {} out of range (have {})",
+            idx,
+            catalog.handlers.len()
+        ))
+    })?;
+
+    println!(
+        "== lifting handler #{}  sig=0x{:016x}  entry=0x{:x}  len={}  fires={} ==",
+        idx, handler.signature, handler.entry_rip, handler.length, handler.fire_count
+    );
+
+    let take = handler.exemplar.len().min(args.lift_limit);
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    let mut unsupported_mnemonic: HashMap<String, usize> = HashMap::new();
+    let mut unsupported_reason: HashMap<&'static str, usize> = HashMap::new();
+    let mut formatter = IntelFormatter::new();
+    let mut disasm = String::new();
+
+    for (rip, bytes) in handler.exemplar.iter().take(take) {
+        let mut dec = Decoder::with_ip(64, bytes, *rip, DecoderOptions::NONE);
+        let insn: Instruction = dec.decode();
+        disasm.clear();
+        formatter.format(&insn, &mut disasm);
+
+        match lift_instruction(&insn) {
+            Ok(effects) => {
+                ok += 1;
+                println!("  OK  0x{:x}  {:<40} -> {} effect(s)", rip, disasm, effects.len());
+            }
+            Err(LiftError::Unsupported(reason)) => {
+                fail += 1;
+                *unsupported_reason.entry(reason).or_insert(0) += 1;
+                let m = format!("{:?}", insn.mnemonic());
+                *unsupported_mnemonic.entry(m).or_insert(0) += 1;
+                println!("  NS  0x{:x}  {:<40} -> unsupported: {}", rip, disasm, reason);
+            }
+            Err(LiftError::BadOperand(reason)) => {
+                fail += 1;
+                println!("  ER  0x{:x}  {:<40} -> bad-operand: {}", rip, disasm, reason);
+            }
+        }
+    }
+
+    println!();
+    println!("== summary ==");
+    println!("lifted ok:      {}/{}", ok, ok + fail);
+    println!("unsupported:    {}", fail);
+    if !unsupported_reason.is_empty() {
+        println!("reasons:");
+        let mut rs: Vec<_> = unsupported_reason.iter().collect();
+        rs.sort_by(|a, b| b.1.cmp(a.1));
+        for (r, c) in rs {
+            println!("  {:<30} {}", r, c);
+        }
+    }
+    if !unsupported_mnemonic.is_empty() {
+        println!("unsupported mnemonics (top 15):");
+        let mut ms: Vec<_> = unsupported_mnemonic.iter().collect();
+        ms.sort_by(|a, b| b.1.cmp(a.1));
+        for (m, c) in ms.into_iter().take(15) {
+            println!("  {:<30} {}", m, c);
+        }
+    }
+
+    Ok(())
 }
 
 fn run_dispatcher_candidates(args: &Args) -> midas::Result<()> {

@@ -12,10 +12,12 @@
 //! - **M3**: IR + iced-x86 → `Expr` lifter.
 //! - **M4**: per-handler semantics via simplification.
 
+pub mod ir;
 pub mod trace;
 pub mod trace_events;
 pub mod vm;
 
+pub use ir::{lift_instruction, Effect, Expr, LiftError, RegId};
 pub use trace::TraceBuilder;
 pub use trace_events::Event;
 pub use vm::{DispatcherCandidate, Handler, HandlerCatalog, TraceAnalysis};
