@@ -31,10 +31,10 @@ each against a commercial packer like Themida 3.x.
 | M0  | Per-instruction trace (JSONL, armed at OEP) | ✅ done | `16094ba`, `70ded59` |
 | M1  | VM dispatcher candidate finder (offline trace analysis) | ✅ done | `a3fc9ce` |
 | M2  | Handler discovery, basic-block cluster & dedup | ✅ done | (this commit) |
-| M3  | IR (`Expr` + `Effect`) + iced-x86 → IR lifter | ⚠ pending fork decision — see "MAJOR FINDING" |            |
-| M4  | Per-handler semantics via simplification | ⚠ scoped-to-VM-handlers; likely re-targeted to mutation cleanup | |
-| M5  | VM bytecode stream lifter (stretch)        | ☐ may not apply — samples not VM'd at OEP |            |
-| M6  | IR simplifier — constant fold + algebraic peephole | ☐ re-scoped toward mutated-native cleanup |            |
+| M3  | IR (`Expr` + `Effect`) + iced-x86 → IR lifter | ⏳ ready to start on sample 2 VM handlers |            |
+| M4  | Per-handler semantics via simplification | ☐ required for semantic dedup (RIP-seq too strict) | |
+| M5  | VM bytecode stream lifter (stretch)        | ☐      |            |
+| M6  | IR simplifier — constant fold + algebraic peephole | ☐ |            |
 | M7  | Output emitter — pseudo-C / lifted x86     | ☐      |            |
 | M8  | (If ever needed) `varisat` SAT for predicate resolution | ☐ |            |
 
@@ -115,68 +115,68 @@ faster fail.
   interpreter state, emit per-opcode lifted IR, simplify, and
   serialize. This is where "original code" comes out the other end.
 
-## MAJOR FINDING — rethink the target (post-M2, 2026-04-19)
+## MAJOR FINDING — sample 2 *is* VM'd; 2M events was too short
 
-M2 extraction forced the realization that **Themida 3.x at OEP is
-running mutated *native* code, not a VM interpreter loop**. Evidence:
+**Retraction of earlier finding.** An earlier version of this doc
+concluded from 2M-event traces that neither sample was running a
+VM interpreter at OEP. That was wrong, and specifically wrong
+because 2M events was too short a window. Leaving this retraction
+in place so future readers see the mistake.
 
-- Sample 1, 2M-event trace: highest exec count of any RIP is **662**.
-  A real per-op VM interpreter fires tens of thousands of times in a
-  trace that long.
-- Sample 2, 2M-event trace: top M1 dispatcher (`0x1410eb7dd`)
-  segments the trace into only **34 invocations / 33 unique
-  handlers**. Handler bodies run 8k–95k instructions each. A true VM
-  op handler is dozens of instructions.
-- Both samples' OEP bytes are mutated-arithmetic patterns
-  (`and rax, rsi`, `xor r9, 0x40`) — not an indirect-jump dispatch.
+At **10M events**, sample 2 reveals a genuine VM dispatcher:
 
-Corrected mental model:
+- Dispatcher tail: `0x14105b029`, **fan-out 13, exec_count 1317**.
+  (At 2M events: fan-out 4, exec_count 7 — super-linear scaling
+  once we cross a threshold.)
+- Dispatcher body appears to be the contiguous block
+  `0x14105aecc – 0x14105aed5` + `0x14105b029`, all at exec=1317,
+  all fan-out 1 except the tail. That's the tight ~10-insn loop we
+  expected from a VM interpreter.
+- 1316 handler invocations segmented from the trace. 986 unique
+  RIP-sequence signatures, average handler length ≈ 7600 native
+  instructions.
 
-- **Themida mutates the native instruction stream** of the original
-  program with junk ops, dead code, and register swaps. That is the
-  bulk of what executes post-OEP.
-- **Themida's VM is invoked selectively**, wrapping *specific*
-  sub-routines (typically license checks, serial validation,
-  anti-debug — the author's marked "critical" ranges), not the
-  whole program.
-- M1's indirect-branch finder is still surfacing real dispatchers,
-  but at the granularity of *callee tables* / *switch statements*
-  in the mutated native code — not a VM interpreter.
+That last figure — 7600 native insns per VM op — is large, not the
+classic 30–50 insn handler. Two readings, both plausible:
 
-Implications for the milestones:
+1. **Themida mutates the VM handlers themselves.** Each handler
+   runs a few semantically-meaningful ops wrapped in heavy junk
+   (xor-zero chains, push/pop pairs, dead branches).
+2. **Multi-level dispatch.** The `0x14105b029` branch picks one of
+   13 *handler classes*; inside each class there may be a nested
+   finer-grained dispatch we haven't located. The fan-out table
+   shows other indirect branches (e.g. `0x14112463f` with fan-out
+   39, exec=166) that could be the inner dispatchers.
 
-- **M3 / M4 as originally scoped (VM handler lifting) do not apply to
-  this vantage point.** A per-handler IR with 30-insn bodies is the
-  wrong target; we need whole-function lifting with mutation cleanup.
-- The useful analog work becomes: **mutation cleanup / deobfuscation
-  of mutated native code**, not devirtualization of VM bytecode.
-  That pipeline:
-  1. Lift a function region to IR (iced-x86 → Expr/Effect, still M3
-     but of native code, not VM handlers).
-  2. Algebraic simplifier eats junk ops: `xor rax, 0; add rax, 0;
-     push/pop pairs; x xor x = 0; mov rax, rax; ...`.
-  3. Dead-code elimination on the IR.
-  4. Re-emit cleaned x86 or pseudo-C.
-- M2 (handler catalog) is a useful artifact *as a map* of the
-  mutated-native call-graph, even when its "handlers" are whole
-  subroutines rather than VM ops. Keep it.
-- If/when we hit a function that IS VM'd, the original M3/M4/M5
-  apply. We'd detect that by: short tight inner loop, high exec
-  count at the dispatcher, many short unique handlers. We did not
-  see any such region in the first 2M post-OEP instructions.
+The 986-unique-from-1316-invocations ratio also tells us
+**RIP-sequence equality is too strict for semantic dedup**:
+multiple handler invocations share the same entry RIP
+(e.g. `0x141113557` appears as rows 2, 3, 5, 6 in the top-20 with
+four distinct signatures) but differ in internal control flow
+based on data. Real semantic dedup requires M3-level lifting
+followed by M4 simplification.
 
-Next strategic fork (to decide before M3):
+**Sample 1 status: unknown, but probably also VM'd.** Sample 1's
+emulation halts hard at 1.73M post-OEP events with
+`INSN_INVALID at 0x16f08b` — a jump through the low-memory RVA
+mirror that lands on invalid bytes. Until that emulation bug is
+fixed, we cannot test the same hypothesis on sample 1. The bug is
+orthogonal to the devirt pipeline; it is a loader / memory-mapping
+issue (possibly the .themida section has no raw data but is being
+jumped into via a computed address).
 
-1. **Mutation cleanup path** — retarget M3 to lift whole functions,
-   simplify away junk, produce cleaned code. Most practical payoff
-   for these specific samples.
-2. **Longer-trace path** — record 20M+ post-OEP instructions and
-   look for a region where a tight dispatcher emerges. If it does,
-   we've found the VM; if it doesn't, the samples may simply not
-   use VM'ing on any hot path, and path 1 is the only game.
-3. **Triggered-VM path** — run the samples with specific inputs or
-   API returns that force protected code (license-check failure,
-   etc.). Much more involved; probably out of scope.
+Revised strategic fork (to decide before M3):
+
+1. **Push to M3 on sample 2.** Lift handler bodies to IR, simplify
+   away junk ops, attempt semantic dedup. Concrete and testable
+   on the data we already have. Most direct continuation.
+2. **Fix sample 1's `INSN_INVALID` first.** Without this, we're
+   devirting one sample instead of two — violates the "must work
+   on both samples" rule. Probably a few hours of loader debugging.
+3. **Longer trace on sample 2 first (50M–100M events).** Confirm
+   the dispatcher characterization holds at scale and see if an
+   inner dispatcher emerges from the fan-out tail. 100M ≈ 12 min
+   runtime, 6 GB JSONL.
 
 ## Empirical observations (after M1, 2M-event traces)
 
