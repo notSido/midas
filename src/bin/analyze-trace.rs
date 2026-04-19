@@ -149,8 +149,16 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
     }
     for (i, d) in descriptors.iter().enumerate() {
         println!("--- descriptor #{} ---", i + 1);
-        println!("  dispatch_rip:     0x{:x}", d.dispatch_rip);
-        println!("  opcode_fetch_rip: 0x{:x}", d.opcode_fetch_rip);
+        println!("  dispatch_rip:         0x{:x}", d.dispatch_rip);
+        println!("  opcode_fetch_rip:     0x{:x}", d.opcode_fetch_rip);
+        match d.vm_pc_offset {
+            Some(o) => println!("  vm_pc_offset:         rbp + 0x{:x}", o),
+            None => println!("  vm_pc_offset:         (unresolved)"),
+        }
+        match d.handler_table_offset {
+            Some(o) => println!("  handler_table_offset: rbp + 0x{:x}", o),
+            None => println!("  handler_table_offset: (unresolved)"),
+        }
         if d.rbp_state_offsets.is_empty() {
             println!("  rbp_state_offsets: (none observed in window)");
         } else {

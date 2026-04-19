@@ -45,6 +45,16 @@ pub struct VmDescriptor {
     /// for VM_PC / handler-table base / rolling-key storage.
     /// Sorted by RIP of the `add` instruction.
     pub rbp_state_offsets: Vec<RbpOffset>,
+    /// Best-guess RBP-relative offset of the VM_PC pointer. Derived
+    /// post-detection by tracing the opcode-fetch base register back
+    /// to its most recent `rbp + IMM` definition. `None` if the
+    /// classifier can't resolve it.
+    pub vm_pc_offset: Option<i64>,
+    /// Best-guess RBP-relative offset of the handler-table base
+    /// pointer. Derived by tracing the dispatch target register back
+    /// through its most recent `mov target, [base]` load, then the
+    /// base register's most recent `rbp + IMM` definition.
+    pub handler_table_offset: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,15 +137,99 @@ pub fn detect_vm(instructions: &BTreeMap<u64, Vec<u8>>) -> Vec<VmDescriptor> {
         }
 
         if let Some(fetch_rip) = opcode_fetch_rip {
-            descriptors.push(VmDescriptor {
+            let mut d = VmDescriptor {
                 dispatch_rip: **jmp_rip,
                 opcode_fetch_rip: fetch_rip,
                 rbp_state_offsets,
-            });
+                vm_pc_offset: None,
+                handler_table_offset: None,
+            };
+            d.vm_pc_offset = classify_vm_pc(&d, instructions);
+            d.handler_table_offset = classify_handler_table(&d, instructions);
+            descriptors.push(d);
         }
     }
 
     descriptors
+}
+
+/// Return the RBP-relative offset that feeds the opcode fetch's
+/// memory base register, tracing the register back through the
+/// dispatcher body. Returns the last `rbp + IMM` value assigned to
+/// that register before the fetch fires.
+fn classify_vm_pc(d: &VmDescriptor, instructions: &BTreeMap<u64, Vec<u8>>) -> Option<i64> {
+    let fetch_bytes = instructions.get(&d.opcode_fetch_rip)?;
+    let fetch = decode_at(fetch_bytes, d.opcode_fetch_rip);
+    if fetch.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    let base = fetch.memory_base();
+    if !base.is_gpr64() {
+        return None;
+    }
+    most_recent_rbp_offset(d, base, d.opcode_fetch_rip)
+}
+
+/// Return the RBP-relative offset that feeds the dispatch's handler-
+/// table load. The path: `jmp target` → find the most recent `mov
+/// target, [base]` before dispatch → that `base` register's most
+/// recent `rbp + IMM` definition.
+fn classify_handler_table(
+    d: &VmDescriptor,
+    instructions: &BTreeMap<u64, Vec<u8>>,
+) -> Option<i64> {
+    let dispatch_bytes = instructions.get(&d.dispatch_rip)?;
+    let dispatch = decode_at(dispatch_bytes, d.dispatch_rip);
+    if dispatch.op0_kind() != OpKind::Register {
+        return None;
+    }
+    let target = dispatch.op0_register();
+    if !target.is_gpr64() {
+        return None;
+    }
+
+    // Walk back from dispatch_rip for the most recent `mov target,
+    // [base]`. Bail if target is redefined by a non-memory-load along
+    // the way — only a direct load exposes a usable `base`.
+    let sorted: Vec<(&u64, &Vec<u8>)> = instructions.iter().collect();
+    let dispatch_idx = sorted.iter().position(|(r, _)| **r == d.dispatch_rip)?;
+    let mut base_reg: Option<Register> = None;
+    for j in (0..dispatch_idx).rev() {
+        let (rip, bytes) = sorted[j];
+        let insn = decode_at(bytes, *rip);
+        if insn.mnemonic() == Mnemonic::Mov
+            && insn.op_count() == 2
+            && insn.op0_kind() == OpKind::Register
+            && insn.op0_register() == target
+            && insn.op1_kind() == OpKind::Memory
+        {
+            base_reg = Some(insn.memory_base());
+            break;
+        }
+        if writes_register(&insn, target) {
+            break;
+        }
+    }
+    let base = base_reg?;
+    if !base.is_gpr64() {
+        return None;
+    }
+    most_recent_rbp_offset(d, base, d.dispatch_rip)
+}
+
+fn most_recent_rbp_offset(d: &VmDescriptor, reg: Register, before_rip: u64) -> Option<i64> {
+    let reg_full = reg.full_register();
+    let mut best: Option<&RbpOffset> = None;
+    for off in &d.rbp_state_offsets {
+        if off.reg.full_register() == reg_full && off.add_rip < before_rip {
+            match best {
+                None => best = Some(off),
+                Some(prev) if off.add_rip > prev.add_rip => best = Some(off),
+                _ => {}
+            }
+        }
+    }
+    best.map(|o| o.offset)
 }
 
 /// Window of up to `MAX_WINDOW_STEPS` sorted neighbors preceding
@@ -262,6 +356,9 @@ mod tests {
         assert_eq!(d.rbp_state_offsets.len(), 1);
         assert_eq!(d.rbp_state_offsets[0].reg, Register::R11);
         assert_eq!(d.rbp_state_offsets[0].offset, 0x9A);
+        // Classifier should trace the fetch's base (R11) back to
+        // the single rbp+0x9A offset.
+        assert_eq!(d.vm_pc_offset, Some(0x9A));
     }
 
     #[test]
