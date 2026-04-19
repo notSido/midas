@@ -18,7 +18,10 @@ pub mod trace;
 pub mod trace_events;
 pub mod vm;
 
-pub use ir::{lift_instruction, Effect, Expr, LiftError, RegId};
+pub use ir::{
+    emit_effect, emit_effects, emit_expr, lift_instruction, simplify_effects, simplify_expr,
+    Effect, Expr, LiftError, RegId,
+};
 pub use oep_dump::OepDump;
 pub use trace::TraceBuilder;
 pub use trace_events::{Event, MemSnapshot, RegSnapshot};

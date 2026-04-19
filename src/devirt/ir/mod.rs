@@ -21,8 +21,12 @@
 //!   makes the algebraic simplifier safe: we can rewrite inside an
 //!   `Expr` without worrying about ordering vs memory.
 
+pub mod emit;
 pub mod expr;
 pub mod lifter;
+pub mod simplify;
 
+pub use emit::{emit_effect, emit_effects, emit_expr};
 pub use expr::{Effect, Expr, RegId};
 pub use lifter::{lift_instruction, LiftError};
+pub use simplify::{simplify_effects, simplify_expr};
