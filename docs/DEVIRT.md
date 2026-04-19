@@ -287,6 +287,51 @@ One pipeline, sample-agnostic, applied to both samples:
 Build order: (1) → (2) → (3) → (4). Each piece is a general tool;
 each new sample exercises the same code path.
 
+### Detector findings (M5 prep, shipped)
+
+The VM-pattern detector described in step (1) above is implemented
+and shipped in `src/devirt/vm/detector.rs`. `analyze-trace
+--detect-vm` runs it against any post-OEP JSONL trace. Zero
+hardcoded per-sample constants.
+
+What the detector returns per dispatcher:
+- `dispatch_rip`: the final `jmp r<reg>`.
+- `opcode_fetch_rip`: the `movzx r, word ptr [...]`.
+- `vm_pc_offset`, `handler_table_offset`: classified by
+  backward data-flow from the fetch / dispatch.
+- `rbp_state_offsets`: the full set of `(reg, offset)` pairs
+  seen in the dispatcher window — raw candidates for other
+  roles (rolling key, return-target cells, etc.).
+
+Empirical results on both current samples:
+
+- **Sample 2**: 12 dispatchers found. Descriptor #1 matches the
+  hand-found recon exactly (VM_PC `rbp+0x9a`, handler-table
+  `rbp+0x26`). Several descriptors share the same offsets —
+  those are distinct dispatcher *sites* for the same VM
+  *context* (one interpreter, many call sites).
+- **Sample 1**: 99 dispatchers found. Descriptor #1 is a
+  textbook Themida VM at `rbp+0x15f` / `rbp+0x6a`. Some
+  descriptors have `vm_pc_offset: None` or `handler_table_offset:
+  None` — either genuine false positives (the `movzx word ptr`
+  landed in a non-VM block) or dispatchers whose data flow is
+  through paths the classifier doesn't yet trace.
+
+**New discovery: multiple VM contexts per binary.** The
+descriptor set isn't one VM with multiple dispatcher sites — it
+includes *distinct* VM instances using different RBP-relative
+offsets for their state. Examples:
+
+- Sample 2: `rbp+0x9a`/`rbp+0x26` (VM A) and `rbp+0x1c2`/
+  `rbp+0xf5` (VM B).
+- Sample 1: `rbp+0x15f`/`rbp+0x6a` (VM A), `rbp+0x79`/`rbp+0x2d`
+  (VM B), and probably more.
+
+Themida creates multiple VM instances per binary, each with its
+own context. The bytecode walker (step 2) must handle each
+instance independently — the same algorithm parameterised by
+different descriptors.
+
 ## Earlier finding — sample 2 *is* VM'd; 2M events was too short
 
 **Retraction of earlier finding.** An earlier version of this doc
