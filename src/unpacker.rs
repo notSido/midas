@@ -8,7 +8,7 @@ use crate::win64::{peb, ldr};
 use crate::win64::{api::ApiRegistry, syscall};
 use crate::cpu_features::{self, CpuState};
 use crate::tracer::ExecutionTracer;
-use crate::devirt::TraceBuilder;
+use crate::devirt::{RegSnapshot, TraceBuilder};
 use unicorn_engine::{RegisterX86, Unicorn};
 use unicorn_engine::unicorn_const::HookType;
 use std::path::{Path, PathBuf};
@@ -229,7 +229,17 @@ impl Unpacker {
                             Some(tb) => {
                                 // Devirt mode: arm the recorder and keep
                                 // running so we capture the VM execution.
-                                if let Err(e) = tb.lock().unwrap().arm(addr) {
+                                // Capture a full GPR snapshot at the arm instant so the
+                                // bytecode walker can resolve [rbp + X]-style VM state
+                                // pointers without a second emulation pass.
+                                let regs = match snapshot_gprs(emu) {
+                                    Ok(s) => Some(s),
+                                    Err(e) => {
+                                        log::warn!("Failed to snapshot GPRs at OEP: {}", e);
+                                        None
+                                    }
+                                };
+                                if let Err(e) = tb.lock().unwrap().arm(addr, regs) {
                                     log::error!("Failed to arm devirt trace: {}", e);
                                     let _ = emu.emu_stop();
                                     return;
@@ -592,7 +602,33 @@ impl Unpacker {
                 return Some((start, end));
             }
         }
-        
+
         None
     }
+}
+
+/// Read all 16 GPRs + RIP out of the Unicorn emulator into a
+/// `RegSnapshot`. Used to capture register state at OEP-arm time
+/// so the devirt trace carries RBP (and friends) forward to the
+/// offline bytecode walker.
+fn snapshot_gprs(emu: &Unicorn<()>) -> Result<RegSnapshot> {
+    Ok(RegSnapshot {
+        rax: emu.reg_read(RegisterX86::RAX)?,
+        rbx: emu.reg_read(RegisterX86::RBX)?,
+        rcx: emu.reg_read(RegisterX86::RCX)?,
+        rdx: emu.reg_read(RegisterX86::RDX)?,
+        rsi: emu.reg_read(RegisterX86::RSI)?,
+        rdi: emu.reg_read(RegisterX86::RDI)?,
+        rbp: emu.reg_read(RegisterX86::RBP)?,
+        rsp: emu.reg_read(RegisterX86::RSP)?,
+        r8: emu.reg_read(RegisterX86::R8)?,
+        r9: emu.reg_read(RegisterX86::R9)?,
+        r10: emu.reg_read(RegisterX86::R10)?,
+        r11: emu.reg_read(RegisterX86::R11)?,
+        r12: emu.reg_read(RegisterX86::R12)?,
+        r13: emu.reg_read(RegisterX86::R13)?,
+        r14: emu.reg_read(RegisterX86::R14)?,
+        r15: emu.reg_read(RegisterX86::R15)?,
+        rip: emu.reg_read(RegisterX86::RIP)?,
+    })
 }

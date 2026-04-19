@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{Result, UnpackError};
 
-use super::trace_events::Event;
+use super::trace_events::{Event, RegSnapshot};
 
 pub struct TraceBuilder {
     writer: BufWriter<File>,
@@ -41,18 +41,26 @@ impl TraceBuilder {
 
     /// Switch recording on and emit a synthetic `OepReached` marker so
     /// downstream tools know where in the original stream we armed.
-    pub fn arm(&mut self, rip: u64) -> Result<()> {
+    /// Accepts an optional GPR snapshot — callers with access to the
+    /// live emulator should pass one; tests/standalone callers can pass
+    /// `None`.
+    pub fn arm(&mut self, rip: u64, regs: Option<RegSnapshot>) -> Result<()> {
         if self.armed {
             return Ok(());
         }
         log::info!(
-            "Devirt trace armed at RIP 0x{:x} (limit {} events, path {:?})",
+            "Devirt trace armed at RIP 0x{:x} (limit {} events, path {:?}, regs={})",
             rip,
             self.limit,
-            self.path
+            self.path,
+            if regs.is_some() { "yes" } else { "no" },
         );
         self.armed = true;
-        let marker = Event::OepReached { tick: 0, rip };
+        let marker = Event::OepReached {
+            tick: 0,
+            rip,
+            regs,
+        };
         self.write_event(&marker)?;
         Ok(())
     }
