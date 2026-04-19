@@ -3,4 +3,5 @@
 *.zip
 .DS_Store
 /samples/
+/.claude/
 
