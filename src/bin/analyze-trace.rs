@@ -51,6 +51,18 @@ struct Args {
     /// `--lift-handler` is used.
     #[arg(long, default_value = "200")]
     lift_limit: usize,
+
+    /// Dump all unique (rip, bytes) pairs observed in the trace whose
+    /// RIP is in `[dump_region_start .. dump_region_end)`, sorted by
+    /// RIP, disassembled via iced-x86. Useful for reading a code
+    /// region (e.g. a VM dispatcher body) out of the OEP memory dump
+    /// without re-disassembling the whole PE.
+    #[arg(long, value_parser = parse_hex_or_dec)]
+    dump_region_start: Option<u64>,
+
+    /// Exclusive upper bound for `--dump-region-start`.
+    #[arg(long, value_parser = parse_hex_or_dec)]
+    dump_region_end: Option<u64>,
 }
 
 fn parse_hex_or_dec(s: &str) -> std::result::Result<u64, String> {
@@ -79,6 +91,9 @@ fn main() {
 }
 
 fn run(args: Args) -> midas::Result<()> {
+    if args.dump_region_start.is_some() {
+        return run_dump_region(&args);
+    }
     if args.lift_handler.is_some() {
         return run_lift_handler(&args);
     }
@@ -86,6 +101,64 @@ fn run(args: Args) -> midas::Result<()> {
         return run_extract_handlers(&args);
     }
     run_dispatcher_candidates(&args)
+}
+
+fn run_dump_region(args: &Args) -> midas::Result<()> {
+    use midas::devirt::Event;
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let start = args.dump_region_start.unwrap();
+    let end = args.dump_region_end.ok_or_else(|| {
+        midas::UnpackError::DumpError(
+            "--dump-region-end <RIP> is required with --dump-region-start".into(),
+        )
+    })?;
+
+    let file = File::open(&args.input)?;
+    let reader = BufReader::new(file);
+    let mut seen: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut hits: u64 = 0;
+    for line in reader.lines().flatten() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Event = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let Event::Exec { rip, bytes, .. } = event {
+            if rip >= start && rip < end {
+                hits += 1;
+                seen.entry(rip).or_insert(bytes);
+            }
+        }
+    }
+
+    println!("== region 0x{:x} .. 0x{:x} ==", start, end);
+    println!("exec hits:    {}", hits);
+    println!("unique rips:  {}", seen.len());
+    println!();
+    let mut formatter = IntelFormatter::new();
+    let mut disasm = String::new();
+    for (rip, bytes) in &seen {
+        let mut dec = Decoder::with_ip(64, bytes, *rip, DecoderOptions::NONE);
+        let insn = dec.decode();
+        disasm.clear();
+        formatter.format(&insn, &mut disasm);
+        // Hex bytes (up to 10 shown).
+        let take = bytes.len().min(10);
+        let mut hex = String::with_capacity(take * 3);
+        for b in &bytes[..take] {
+            hex.push_str(&format!("{:02x} ", b));
+        }
+        if bytes.len() > take {
+            hex.push_str("...");
+        }
+        println!("  0x{:x}  {:<30} {}", rip, hex, disasm);
+    }
+    Ok(())
 }
 
 fn run_lift_handler(args: &Args) -> midas::Result<()> {

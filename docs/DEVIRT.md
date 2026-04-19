@@ -115,7 +115,77 @@ faster fail.
   interpreter state, emit per-opcode lifted IR, simplify, and
   serialize. This is where "original code" comes out the other end.
 
-## MAJOR FINDING — sample 2 *is* VM'd; 2M events was too short
+## MAJOR FINDING — the prior "dispatcher" is a helper trampoline (M5 recon)
+
+Revises, again, the earlier M1/M2 conclusion. Empirical disassembly
+of sample 2's hot regions at OEP (using a new `analyze-trace
+--dump-region-start/--dump-region-end` subcommand) shows the
+following:
+
+- **`0x14105b029` is `ret 0` — not a VM dispatcher.** The block from
+  `0x14105aecc .. 0x14105b029` is a shared trampoline reached via
+  `call 0x1410aa300 → jmp 0x14105aecc`. Its behaviour: push all 15
+  GPRs, mutate `dword ptr [rbp+0xDA]` and `dword ptr [rbp+0x1D2]`
+  with fixed AND/OR/SUB/XOR masks, pop all 15 GPRs, `ret`. The
+  `ret` returns to the *instruction after the original call*,
+  continuing the caller's handler body. This is an integrity/
+  anti-tamper helper, not a dispatcher. Fan-out 13 observed at
+  `0x14105b029` = 13 distinct `call 0x1410aa300` sites in the
+  trace.
+
+- **M2's "handler catalog" is mislabelled.** Segmentation at
+  `0x14105b029` actually cuts a single VM handler into multiple
+  sub-segments at every helper call. The 4183-instruction "top
+  handler" includes the helper's own 111-instruction body; the
+  apparent 986 unique handlers reflect caller-site variation, not
+  13 VM opcodes. **Do not treat the M2 catalog as VM handlers.**
+
+- **The real VM interpreter exists at `0x141048839`.** Canonical
+  Themida opcode-fetch+dispatch:
+  ```
+  mov r11, [rbp+0x9A]                ; VM_PC
+  movzx r11, word ptr [r11+4]        ; fetch encrypted opcode
+  sub   r11d, [rbp+0xD4]             ; decrypt with rolling key
+  sub   r11d, 0x11B4411F             ; constant part of decrypt
+  xor   [rbp+0xD4], r11d             ; advance rolling key
+  and   r11, 0xFFFF                  ; mask opcode to 16 bits
+  shl   r11, 3                       ; handler index * 8
+  mov   r10, [[rbp+0x26] + r11]      ; handler_table[opcode]
+  ; then a VM_PC advance...
+  mov   rbx, [rbp+0x9A]
+  movsxd r9, [rbx]                   ; signed delta from bytecode
+  add   [rbp+0x9A], r9               ; VM_PC += delta
+  jmp   r10                          ; to the handler
+  ```
+  VM state lives at the following `[rbp + ...]` offsets:
+  - `+0x9A` — VM_PC (pointer into bytecode stream)
+  - `+0x26` — handler-table base pointer
+  - `+0xD4` — rolling decryption key
+
+  This matches classical Themida VM architecture. Confirmed.
+
+- **But this interpreter fires only 3 times in the 10M-event
+  trace.** Meaning: the VM-protected region of the program is
+  *small*. The dominant execution layer is **threaded dispatch**
+  — dozens of `jmp r<reg>` and `ret 0` sites with fan-out 13–39
+  each, scattered throughout the binary. The handler pool for
+  those threaded dispatches lives around `0x141048a05 ..
+  0x14104bf31`, a sparse jump-table of 5-byte `jmp rel32`
+  instructions that re-target into real handler bodies elsewhere
+  in the image.
+
+- **Practical implication for Deliverable B.** Applying classical
+  M5 (locate VM_PC, walk bytecode, substitute handler semantics)
+  produces a very small cleaned-up region — only the 3-hit VM
+  slice. The vast majority of the code reached by the trace is
+  *not* VM-protected; it is *control-flow-obfuscated* by threaded
+  dispatch + instruction mutation. The non-VM-native
+  deobfuscation pass (item 5 on HANDOFF's numbered path) is
+  therefore the bigger lever — and arguably the M5 work should be
+  re-scoped. See the open question logged in HANDOFF's "when to
+  check in" list.
+
+## Earlier finding — sample 2 *is* VM'd; 2M events was too short
 
 **Retraction of earlier finding.** An earlier version of this doc
 concluded from 2M-event traces that neither sample was running a
