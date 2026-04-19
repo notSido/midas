@@ -66,20 +66,23 @@ impl ExecutionTracer {
     /// Returns true if unique address count increased dramatically
     pub fn detect_breakout(&self, last_unique_count: usize) -> bool {
         let current = self.unique_count();
-        
-        // If unique addresses increased by 100x or more, we broke out!
-        if last_unique_count > 0 && last_unique_count < 1000 {
-            let increase_factor = current / last_unique_count;
-            if increase_factor >= 100 {
-                return true;
-            }
+        if current <= last_unique_count {
+            return false;
         }
-        
-        // Or if we jumped from <1000 to >100000 unique addresses
-        if last_unique_count < 1000 && current > 100000 {
+        let delta = current - last_unique_count;
+
+        // Coming out of a tight decompression loop: was <1000 unique, now lots more.
+        // Accept a large absolute jump (≥2000 new addresses in one window) — many
+        // samples break out to a few thousand new addrs before we see 100k+.
+        if last_unique_count < 1000 && delta >= 2000 {
             return true;
         }
-        
+
+        // Or an explosive jump: from small unique count to >100k
+        if last_unique_count < 1000 && current > 100_000 {
+            return true;
+        }
+
         false
     }
     

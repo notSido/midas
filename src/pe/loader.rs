@@ -49,16 +49,17 @@ impl PeLoader {
         }
         
         // Map low memory FIRST for RVA addressing (before stack)
-        // Themida jumps to RVA addresses expecting them to be mapped
-        // Include address 0 for null pointer reads that might be valid in packer code
+        // Themida jumps to RVA addresses expecting them to be mapped.
+        // Size must cover the full image — entry points / sections beyond 16 MB exist.
         let low_mem_start = 0x0u64;
-        let low_mem_end = 0x1000000u64; // Up to 16MB
-        
-        emu.mem_map(low_mem_start, low_mem_end, Prot::ALL)
+        let low_mem_size = std::cmp::max(align_up(self.pe.size_of_image, 0x1000), 0x1000000u64);
+        let low_mem_end = low_mem_start + low_mem_size;
+
+        emu.mem_map(low_mem_start, low_mem_size, Prot::ALL)
             .map_err(|e| UnpackError::MemoryError(format!("Failed to map low memory: {:?}", e)))?;
-        
+
         log::info!("Mapped low memory for RVA addressing: 0x{:x} - 0x{:x}", low_mem_start, low_mem_end);
-        
+
         // Mirror PE sections to low memory (for RVA addressing)
         // Write headers (if any)
         if header_size > 0 && header_size <= self.pe.data.len() {
@@ -66,19 +67,26 @@ impl PeLoader {
             emu.mem_write(0, &self.pe.data[..header_size])?;
             log::debug!("Wrote PE headers to address 0");
         }
-        
+
         for section in self.pe.sections() {
             let virtual_addr = section.virtual_address as u64;
             let raw_ptr = section.pointer_to_raw_data as usize;
             let raw_size = section.size_of_raw_data as usize;
             let virtual_size = section.virtual_size as u64;
             let section_name = String::from_utf8_lossy(&section.name);
-            
-            if raw_size > 0 && raw_ptr + raw_size <= self.pe.data.len() && virtual_addr < low_mem_end {
-                emu.mem_write(virtual_addr, &self.pe.data[raw_ptr..raw_ptr + raw_size])?;
-                log::info!("Mirrored section {} to RVA 0x{:x} (raw: 0x{:x}, virt: 0x{:x})", 
-                    section_name.trim_end_matches('\0'), virtual_addr, raw_size, virtual_size);
-            } else if virtual_addr < low_mem_end {
+
+            if virtual_addr >= low_mem_end {
+                continue;
+            }
+
+            let remaining = (low_mem_end - virtual_addr) as usize;
+            let write_len = raw_size.min(remaining);
+
+            if write_len > 0 && raw_ptr + write_len <= self.pe.data.len() {
+                emu.mem_write(virtual_addr, &self.pe.data[raw_ptr..raw_ptr + write_len])?;
+                log::info!("Mirrored section {} to RVA 0x{:x} (raw: 0x{:x}, virt: 0x{:x}, wrote: 0x{:x})",
+                    section_name.trim_end_matches('\0'), virtual_addr, raw_size, virtual_size, write_len);
+            } else {
                 log::warn!("Section {} at RVA 0x{:x} has no raw data (virtual size: 0x{:x})",
                     section_name.trim_end_matches('\0'), virtual_addr, virtual_size);
             }

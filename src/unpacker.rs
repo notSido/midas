@@ -141,13 +141,15 @@ impl Unpacker {
         let instruction_count = Arc::new(Mutex::new(0u64));
         let max_instructions = self.max_instructions;
         let oep_found = Arc::new(Mutex::new(false));
+        let oep_candidate: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let code_start = oep_detector.code_start;
         let code_end = oep_detector.code_end;
         let api_registry_shared = Arc::new(Mutex::new(api_registry));
-        
+
         // Clone Arcs for hook closures
         let instr_count_clone = instruction_count.clone();
         let oep_found_clone = oep_found.clone();
+        let oep_candidate_clone = oep_candidate.clone();
         let api_registry_clone = api_registry_shared.clone();
         let cpu_state_clone = cpu_state.clone();
         let tracer_clone = tracer.clone();
@@ -183,12 +185,14 @@ impl Unpacker {
                     // Check for breakout (OEP transition)
                     let mut last_count = last_unique_clone.lock().unwrap();
                     if trace.detect_breakout(*last_count) {
-                        log::info!("BREAKOUT DETECTED! Unique addresses jumped from {} to {}", *last_count, current_unique);
-                        log::info!("This is likely the OEP transition!");
+                        log::info!("BREAKOUT DETECTED! Unique addresses jumped from {} to {} at RIP 0x{:x}", *last_count, current_unique, addr);
 
-                        // Mark OEP as found
-                        let mut oep = oep_found_clone.lock().unwrap();
-                        *oep = true;
+                        // Capture current RIP as OEP candidate and stop emulation —
+                        // this is the first instruction past the decompression loop.
+                        *oep_candidate_clone.lock().unwrap() = Some(addr);
+                        *oep_found_clone.lock().unwrap() = true;
+                        let _ = emu.emu_stop();
+                        return;
                     }
                     *last_count = current_unique;
 
@@ -347,12 +351,10 @@ impl Unpacker {
         let oep_reached = *oep_found.lock().unwrap();
         if oep_reached {
             state.mark_oep_reached();
-            // Set OEP in detector - use whatever RIP we have when breakout was detected
-            let rip = engine.get_rip()?;
-            log::info!("OEP transition detected, current RIP: 0x{:x}", rip);
-            
-            // Set this as the OEP regardless of which section it's in
-            oep_detector.oep = Some(rip);
+            // Prefer the RIP captured at breakout; fall back to current RIP.
+            let oep = oep_candidate.lock().unwrap().unwrap_or(engine.get_rip()?);
+            log::info!("OEP captured at: 0x{:x}", oep);
+            oep_detector.oep = Some(oep);
         }
         
         log::info!("Emulation stopped after {} instructions", final_count);

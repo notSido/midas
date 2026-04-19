@@ -2,3 +2,5 @@
 *.exe
 *.zip
 .DS_Store
+/samples/
+
