@@ -76,6 +76,47 @@ struct Args {
     detect_vm: bool,
 }
 
+/// Preview the first 64 bytes of the bytecode stream starting at
+/// `vm_pc_value`. Purely raw — opcode decryption is sample-specific
+/// and belongs to the walker.
+fn print_bytecode_preview(dump: &OepDump, vm_pc_value: u64) {
+    match dump.read_bytes_at_va(vm_pc_value, 64) {
+        Some(bytes) => {
+            println!("  bytecode preview (@0x{:x}, 64 bytes):", vm_pc_value);
+            for chunk in bytes.chunks(16) {
+                let mut hex = String::with_capacity(48);
+                for b in chunk {
+                    hex.push_str(&format!("{:02x} ", b));
+                }
+                println!("    {}", hex);
+            }
+        }
+        None => println!(
+            "  bytecode preview: (VM_PC 0x{:x} out of image)",
+            vm_pc_value
+        ),
+    }
+}
+
+/// Read the first 16 u64 entries of the handler table. Each entry is
+/// a candidate handler address — we don't filter for plausibility
+/// yet (e.g. "is this RIP in .text"), just dump.
+fn print_handler_table_preview(dump: &OepDump, table_base: u64) {
+    println!(
+        "  handler table preview (@0x{:x}, first 16 entries):",
+        table_base
+    );
+    for i in 0..16u64 {
+        match dump.read_u64_at_va(table_base + i * 8) {
+            Some(v) => println!("    [{:>2}] 0x{:016x}", i, v),
+            None => {
+                println!("    [{:>2}] (out of image)", i);
+                break;
+            }
+        }
+    }
+}
+
 /// Turn `<stem>.trace.jsonl` (the path midas writes) into
 /// `<stem>.exe` (the OEP dump path midas writes alongside). Returns
 /// `None` for non-matching suffixes — user can still view the
@@ -243,6 +284,22 @@ fn run_detect_vm(args: &Args) -> midas::Result<()> {
                 }
             }
             None => println!("  handler_table_addr:   (no capture / unresolved)"),
+        }
+        // Preview the bytecode stream and handler table when both the
+        // dump and the resolved pointers are available. Only prints
+        // for descriptor #1 of each unique VM context to avoid
+        // spamming the same values across all dispatch sites.
+        if i == 0 {
+            if let (Some(dump), Some(pc_addr), Some(tbl_addr)) =
+                (dump.as_ref(), d.vm_pc_addr, d.handler_table_addr)
+            {
+                if let (Some(pc_val), Some(tbl_val)) =
+                    (dump.read_u64_at_va(pc_addr), dump.read_u64_at_va(tbl_addr))
+                {
+                    print_bytecode_preview(dump, pc_val);
+                    print_handler_table_preview(dump, tbl_val);
+                }
+            }
         }
         if d.rbp_state_offsets.is_empty() {
             println!("  rbp_state_offsets: (none observed in window)");
