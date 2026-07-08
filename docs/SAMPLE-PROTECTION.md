@@ -15,11 +15,11 @@ known, single-packer-layer PE suitable for OEP / devirt work.
 
 | Field | Value |
 |---|---|
-| Original source | trivial C program (`hello.exe`-class), Win64 |
-| Pre-protection hash | _record SHA-256 of the unprotected EXE here before protecting_ |
-| Post-protection hash | _record SHA-256 of `samples/<protected>.exe` after step 9_ |
-| Deposited path | `samples/` (gitignored; lives only on disk) |
-| Tool | Themida demo (free evaluation build) |
+| Original source | `test_target.c` — single-TU C, kernel32-only, no CRT I/O, integer-only. Functions: `decode_string` (XOR), `fnv1a_64` (rolling hash), `decide` (3-way branch), `run_state_machine` (4-state FSM). See `themida-sample/README.md`. |
+| Pre-protection hash | `2e1f5a921bae7483d21221adaf770fa7e71ea6fe700cd73e1eda6976dfe84f29` (SHA-256, 298,390 bytes) |
+| Post-protection hash | `8e3796d03ddcdc8d664444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf` (SHA-256, 1,651,622 bytes / 1,612.91 KB). MD5: `ab233038e853d01827c01c5274d2f8b3` (Themida-reported) |
+| Deposited path | `samples/test_target_protected.exe` (gitignored; lives only on disk) |
+| Tool | Themida demo (free evaluation build), `Themida64.exe` from `ThemidaDemo32_64.zip` |
 
 > Fill the two hash fields once you've produced the files. The
 > pre-protection hash is the only way to confirm the unpacker
@@ -27,33 +27,54 @@ known, single-packer-layer PE suitable for OEP / devirt work.
 
 ---
 
-## 1. Demo-version constraints (what the demo does and doesn't do)
+## 1. Demo-version constraints (confirmed at protect-time)
 
-Documented restrictions of the free DEMO build, per Oreans help:
+When **Protect** was clicked, Themida displayed a warning dialog
+listing the exact demo restrictions applied to this build. These
+are **authoritative** — they come from the tool itself, not from
+Oreans docs or third-party claims:
 
-- **Mandatory splash screen.** The demo inserts a splash image that
-  runs **before** the protected app takes control. This is the most
-  visible artifact and must not be confused with the protection boot
-  loader's own behavior.
-- **No Windows-service support.** The demo splash screen cannot
-  display for a service, so a protected service will fail to start.
-  Our test target is **not** a service — no impact.
-- **No registration path.** The demo cannot be unlocked to the full
-  product; the splash screen stays regardless. Treat any "fully
-  functional protection" claims from third parties as unverified.
-- **Protection techniques are exposed.** Anti-debug, encryption,
-  obfuscation, and VM macros are available in the demo UI. Oreans
-  does not officially state that demo protection strength equals
-  the paid build — assume the *techniques* are present but do not
-  assert strength parity in analysis notes.
-- **License tiers (for context only):** Developer 249 EUR,
-  Company 499 EUR. We are on demo; this is irrelevant to the
-  sample but worth noting so nobody thinks we shipped a paid build.
+> This application will be protected with some DEMO restrictions:
+>
+> - Virtualization Macros convert to Falcon Tiny VM
+> - String Encryption not available
+> - DEMO splash screen inserted in protected file
+> - Some internal protections are disabled
 
-What the demo **does not** add (per Oreans docs, not asserted
-beyond what's documented):
-- No licensing/registration unlock.
-- No removal of the splash screen.
+### What each restriction means for this sample
+
+| Restriction | Effect on our sample | midas impact |
+|---|---|---|
+| **VM macros → Falcon Tiny VM** | Any inline SecureEngine VM macros are downgraded to the Falcon Tiny VM architecture. **Our source has 0 macros**, so this only affects the boot-loader VM — Themida's own internal VM code will use Falcon Tiny. | The devirt pipeline will see the **Falcon** VM architecture. `vm/detector.rs` must recognize Falcon's dispatch pattern. Falcon is a real VM, not a stub — it still needs full devirt. |
+| **String Encryption not available** | The STR_ENCRYPT macro and the "Encrypt ASCII/Unicode on VM macros" toggles are non-functional in demo. | No string-encryption layer to reverse. Our source had no macros anyway, so no change. |
+| **DEMO splash screen inserted** | A splash image runs before the protected app takes control. | midas trace will include splash execution in the pre-OEP region. OEP is **after** splash + boot loader. Don't misread splash code as boot-loader VM. |
+| **Some internal protections disabled** | Unspecified subset of internal (non-UI) protections are off. Oreans does not document which. | We cannot know what's missing. Treat the sample as having **at least** the UI-selected protections, and **possibly fewer** internal ones. Do not assert the sample has a specific internal protection unless confirmed in trace. |
+
+### Prior Oreans-docs notes (context only)
+
+The Oreans help docs mention additional demo constraints that are
+consistent with the above:
+- No registration/unlock path — splash stays regardless.
+- Windows services fail because splash can't display (our target
+  is not a service — no impact).
+- License tiers: Developer 249 EUR, Company 499 EUR.
+
+### Critical correction vs. earlier assumptions
+
+The Oreans *documentation* says "all protection options are
+enabled by default." **This is not true for the demo build.**
+The demo ships with a lighter default set:
+- Encrypt Strings: all OFF
+- Entry Point Virtualization: OFF
+- Anti-Sandbox: OFF
+- Anti-File Patching: OFF (we confirmed this in the UI)
+
+The demo *does* enable: Anti-debug, Compress & Encrypt (all 3),
+Detect file/registry monitors, Allow execution under VM/VPC.
+
+**Any future statement about "Themida defaults" must specify
+whether it refers to the paid build or the demo.** This doc now
+does.
 
 ---
 
@@ -92,31 +113,29 @@ Path variables are supported (`%THEMIDA_FOLDER%`,
 
 ---
 
-## 4. Protection Options — the toggles we set
+## 4. Protection Options — actual demo UI state (confirmed)
 
-The **Protection Options** panel has every option enabled by
-default. For the test target we deliberately **keep defaults**
-except where noted, so the sample exercises the features the
-unpacker/devirt pipeline must handle.
+The **Protection Options** panel in the demo does **not** ship
+with "all options enabled by default" (the Oreans docs describe
+the paid build). The actual demo defaults we observed:
 
-| Option | Set to | Why |
+| Option | State | Decision |
 |---|---|---|
-| Anti-Debugger | **On** (default) | Unpacker must defeat anti-debug; keep it as a stress test. |
-| Advanced API-Wrapping | **On** (default) | Wraps IAT — exercises `src/themida/iat.rs`. |
-| Compress application / resources / boot loader | **On** (default) | Small startup penalty; standard for real samples. |
-| Encrypt ASCII/Unicode on VM macros | **On** (default) | No VM macros in our target, but the flag is harmless. |
-| Re-Encrypt after decryption | **On** (default) | Standard. |
-| Detect File/Registry Monitors | **On** (default) | Keep; our unpacker stubs registry/file APIs anyway. |
-| Entry Point Obfuscation | **On** (default) | Treats the first instructions as a VM macro. If the protected EXE fails to start under midas, **disable this first** — it is the documented incompatibility suspect. |
-| Anti-File Patching | **Off** | We may re-sign/re-compress the output for testing; this flag would trip `MSG_ID_FILE_CORRUPTED`. Disable to avoid false positives. |
-| Anti-Sandbox | **On** (default) | Keep; midas is not a sandbox so it shouldn't fire, but the check code is present in the binary. |
-| Perform Protection checks on VM macros | **On** (default) | No VM macros in target; no effect. |
+| Anti-debug | **ON** | ✅ keep — exercises anti-debug path in unpacker |
+| Compress & Encrypt: Application | **ON** | ✅ keep |
+| Compress & Encrypt: Resources | **ON** | ✅ keep |
+| Compress & Encrypt: SecureEngine | **ON** | ✅ keep |
+| Encrypt Strings: ASCII on VM macros | OFF | ✅ leave — no VM macros in target, no effect; also demo disables STR_ENCRYPT entirely |
+| Encrypt Strings: Unicode on VM macros | OFF | ✅ leave — same |
+| Encrypt Strings: Re-encrypt after decryption | OFF | ✅ leave — same |
+| Detect file/registry monitors | **ON** | ✅ keep |
+| Allow execution under VMware/Virtual PC | **ON** | ✅ keep — midas uses Unicorn emulation; this prevents VM-detection refusals |
+| Entry Point Virtualization | OFF | ✅ leave — baseline. (This is the option the Oreans docs call "Entry Point Obfuscation"; first thing to enable in a harder re-protect variant if baseline succeeds.) |
+| Anti-File Patching | OFF | ✅ keep — avoids `MSG_ID_FILE_CORRUPTED` trips on post-protection modification |
+| Anti-Sandbox | OFF | ✅ leave — baseline; demo defaults it off |
 
-> **Decision rationale:** we deviate from defaults only on
-> **Anti-File Patching** (off) to avoid post-protection tamper
-> trips, and we flag **Entry Point Obfuscation** as the first knob
-> to turn if the sample misbehaves. Everything else stays default
-> so the sample is representative of a real-world Themida build.
+> **No changes were made from the demo defaults.** The panel was
+> left exactly as Themida presented it. This is the baseline build.
 
 ---
 
@@ -129,19 +148,29 @@ function VM architectures; not applicable here.)
 
 ---
 
-## 6. Virtual Machine panel
+## 6. Virtual Machine panel — Falcon Tiny (demo-enforced)
 
-The boot loader is virtualized by Themida's internal VM. We leave
-the default VM selection. Notes for later analysis:
+The boot loader is virtualized by Themida's internal VM. In the
+**paid** build, you can select among multiple architectures
+(TIGER, LION, FISH, EAGLE, DOLPHIN, etc.) and set instances.
 
-- Themida generates multiple independent VM architectures (e.g.
-  TIGER, LION, FISH). "Comparing two is like comparing x86 to ARM."
-- The **Instances** column controls how many copies of a VM
-  architecture are generated — even the same name yields different
-  register positions, handlers, and opcode tables each build.
-- This is why the devirt pipeline must be **sample-agnostic**
-  (axiom 1 in `docs/WORKFLOW.md`): per-instance constants are not
-  portable.
+In the **demo**, the protect-time warning confirmed:
+> **Virtualization Macros convert to Falcon Tiny VM**
+
+This means the boot-loader VM in our sample uses the **Falcon
+Tiny** architecture (`falcon64_tiny.vm` in `custom_vms/public/`).
+"Tiny" variants are smaller/faster but still real VMs with their
+own opcode tables, handlers, and register layouts.
+
+Notes for analysis:
+- The devirt pipeline must be **sample-agnostic** (axiom 1 in
+  `docs/WORKFLOW.md`): per-instance constants are not portable.
+- Falcon Tiny's dispatch pattern must be recognized by
+  `src/devirt/vm/detector.rs` — do not hardcode Falcon-specific
+  offsets; detect the pattern.
+- If we later protect a variant with the paid build, the VM
+  architecture may differ (e.g. TIGER), and the detector must
+  still work without code changes.
 
 We do not add custom VM macros to the target. The boot-loader VM
 is the only VM region the demo will inject.
@@ -236,22 +265,94 @@ This section ties the protection choices back to what the unpacker
 and devirt pipeline will see, so future-you doesn't have to
 re-derive it.
 
-| Protection feature we enabled | Where midas must handle it |
+| Protection feature present in sample | Where midas must handle it |
 |---|---|
-| Compression of app/resources/boot loader | `src/unpacker.rs` — emulation runs the decompression stub to OEP. |
+| Compression of app/resources/SecureEngine | `src/unpacker.rs` — emulation runs the decompression stub to OEP. |
 | Anti-Debugger | `src/unpacker.rs` — Unicorn is not a kernel/software debugger, so checks should pass; if they don't, stub the relevant APIs in `src/win64/api/`. |
-| Advanced API-Wrapping | `src/themida/iat.rs` — wrapped IAT recovery at OEP dump time. |
-| Entry Point Obfuscation | If enabled, the very first instructions are VM-virtualized; OEP detection must not assume a plain jump at the entry point. **First thing to disable if OEP recovery fails.** |
-| Boot-loader VM | `src/devirt/vm/detector.rs` — pattern-based detection; constants must come from runtime auto-detection (axiom 1). |
+| Advanced API-Wrapping (if demo includes it) | `src/themida/iat.rs` — wrapped IAT recovery at OEP dump time. ⚠️ Not confirmed in demo UI — verify in trace whether IAT wrapping was actually applied. |
+| Boot-loader VM (Falcon Tiny) | `src/devirt/vm/detector.rs` — pattern-based detection; must recognize Falcon Tiny dispatch. Constants must come from runtime auto-detection (axiom 1). |
 | Demo splash screen | Runs before our code; midas should pass through it. Confirm the trace's pre-OEP region includes it and that OEP is *after* the splash + boot loader. |
-| Anti-File Patching (OFF) | We disabled this, so no `MSG_ID_FILE_CORRUPTED` dialog in the binary. If a future sample needs it on, expect that dialog ID in the trace. |
+| Detect file/registry monitors | Check code present; midas stubs file/registry APIs. If the check calls a stub we don't implement, add it to `src/win64/api/`. |
+| Allow execution under VM/VPC | Prevents VM-detection refusal — good for Unicorn emulation. No specific code to write. |
+
+**Not present in sample (do not expect to reverse these):**
+
+| Feature | Why absent |
+|---|---|
+| Entry Point Virtualization | Left OFF (demo default). If baseline succeeds, re-protect a variant with this ON for a harder test. |
+| Anti-File Patching | OFF. No `MSG_ID_FILE_CORRUPTED` dialog expected. |
+| Anti-Sandbox | OFF. No sandbox-detection code expected. |
+| String Encryption (STR_ENCRYPT) | Demo disables entirely + no macros in source. No string-encryption layer. |
+| Inline VM/MUTATE macros | Source has 0 SecureEngine macros. Only boot-loader VM. |
+| "Some internal protections" | Demo warning says some are disabled. Unknown which — do not assume any specific internal protection is present unless confirmed in trace. |
+
+## 13. Protection log (verbatim, captured at protect-time)
+
+Themida version: **3.2.4.34** (x64)
+
+```
+Input File:  test_target.exe
+Output File: test_target_protected.exe
+
+Examining Imported APIs . . . OK (94 references to wrap)
+
+Virtual Machines Generation:
+  Machine #1 (FALCON64 (Tiny) VM)    — size 166 KB
+  Machine #2 (Internal (Falcon demo) VM) — size 166 KB
+
+Compressing Application/Resources:
+  Original:   259 KB
+  Compressed:  94 KB  (ratio 36%)
+
+Compressing SecureEngine:
+  Original:   2800 KB
+  Compressed: 1479 KB (ratio 52%)
+
+Report:
+  Input File Size:      291.4 kb
+  Output File Size:     1,612.91 kb
+  Increase in Size:     1,321.52 kb
+  MD5 Hash:             ab233038e853d01827c01c5274d2f8b3
+  Elapsed Time:         6 seconds (14 cores)
+  *** File successfully protected ***
+  [Demo Restrictions applied]
+```
+
+### Key facts extracted from the log
+
+| Fact | Value | midas relevance |
+|---|---|---|
+| Themida version | 3.2.4.34 | Pin this for reproducibility — different versions may emit different VM layouts. |
+| VM #1 architecture | FALCON64 (Tiny) | The primary VM protecting the boot loader. Detector must recognize Falcon Tiny dispatch. |
+| VM #2 architecture | Internal (Falcon demo) | A second internal VM, also Falcon-based. Two distinct VM instances in one binary — the detector must not assume a single VM. |
+| VM sizes | 166 KB each | Real VMs, not stubs. Non-trivial to devirt. |
+| API references wrapped | 94 | API wrapping IS applied (this was unconfirmed from UI). `src/themida/iat.rs` must recover 94 wrapped references. |
+| TLS processed | yes | The unpacker must handle TLS callbacks if Themida injected them. |
+| Strings virtualized | none | No string-encryption layer (confirmed). |
+| Compression ratio (app) | 36% | App code is compressed — unpacker must decompress to OEP. |
+| Compression ratio (SecureEngine) | 52% | The protection engine itself is compressed. |
+| Output size | 1,612.91 KB (1,651,622 bytes) | ~5.5× the input. Expected for Themida. |
+| Two VM instances, both Falcon | — | `vm/detector.rs` must handle **multiple** VM contexts. DEVIRT.md already notes "3 unique VM contexts" on prior samples — this aligns. |
+
+### What "Machine #2 (Internal (Falcon demo) VM)" means
+
+Themida generated **two** VMs:
+1. **FALCON64 (Tiny)** — the user-facing VM architecture (from
+   `custom_vms/public/falcon64_tiny.vm`).
+2. **Internal (Falcon demo)** — Themida's own internal protection
+   engine VM, also Falcon-based in the demo (paid builds can use a
+   different architecture for this).
+
+Both are real VMs. The devirt pipeline must treat them as
+independent contexts — do not assume a single VM or a single
+opcode table.
 
 ---
 
-## 12. What the demo did **not** do
+## 14. What the demo did **not** do
 
-Explicit list of protections/features **not** applied, so we don't
-mistakenly attribute them to the sample:
+Explicit list of protections/features **not** applied to this
+sample, so we don't mistakenly attribute them to it:
 
 - No inline SecureEngine macros (VM, MUTATE, STR_ENCRYPT, etc.) —
   the source has none. Only the boot-loader VM is present.
@@ -259,13 +360,22 @@ mistakenly attribute them to the sample:
 - No XBundler embedding of DLLs/data.
 - No custom plugin DLLs.
 - No custom dialog text edits.
+- No Entry Point Virtualization (left OFF).
+- No Anti-File Patching (OFF).
+- No Anti-Sandbox (OFF).
+- No String Encryption (demo disables entirely; source had no
+  macros anyway).
 - No "Favor size over protection" compression variant.
 - No Windows-on-ARM optimization.
 - No Advanced Options compatibility overrides.
 - No paid/license unlock — the demo splash screen remains.
+- **"Some internal protections are disabled"** (demo warning) —
+  unspecified subset of internal protections absent. Unknown
+  which; do not assert any specific internal protection is present.
 
 This means the sample is a **single-layer Themida demo build** with
-default protection options (minus Anti-File Patching). Any behavior
-beyond that in the unpacked output is either original program code
-or a Themida artifact we have not yet characterized — log it, don't
+the demo-default protection options (see section 4 table). The VM
+is Falcon Tiny (demo-enforced). Any behavior beyond the listed
+features in the unpacked output is either original program code or
+a Themida artifact we have not yet characterized — log it, don't
 assume it.
