@@ -247,15 +247,16 @@ We do not need the CLI for the first sample; the GUI path is fine.
 
 ## 10. Post-protection checklist (run before midas)
 
-- [ ] Pre-protection SHA-256 recorded in section 0.
-- [ ] Post-protection SHA-256 recorded in section 0.
-- [ ] Protected EXE deposited in `samples/`.
-- [ ] File size increased vs. original (sanity check).
-- [ ] Protected EXE launches standalone on Windows (the demo
-      splash appears, then the app). If it does **not** start,
-      re-protect with **Entry Point Obfuscation** off (step 4).
-- [ ] Note the demo splash screen is present — do not misread it
-      as part of the protection boot loader in traces.
+- [x] Pre-protection SHA-256 recorded in section 0.
+- [x] Post-protection SHA-256 recorded in section 0.
+- [x] Protected EXE deposited in `samples/test_target_protected.exe`.
+- [x] File size increased vs. original (298,390 → 1,651,622 bytes, ~5.5×).
+- [x] Protected EXE launches standalone on Windows: demo splash
+      appears, then the program prints output identical to the
+      unprotected binary (byte-for-byte match against
+      `expected_output.txt`).
+- [x] Demo splash screen noted — present in pre-OEP region of any
+      future midas trace.
 
 ---
 
