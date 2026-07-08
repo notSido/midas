@@ -9,8 +9,8 @@ use std::time::Instant;
 #[command(about = "Midas - Themida 3.x unpacker for Linux", long_about = None)]
 struct Args {
     /// Input PE file (Themida-protected). Positional argument: the
-    /// *only* thing midas requires on the happy path. See
-    /// `project_1_0_binary_contract` in auto-memory.
+    /// *only* thing midas requires on the happy path. See the
+    /// design axioms in `README.md`.
     #[arg(value_name = "PATH")]
     input: PathBuf,
     
@@ -170,7 +170,7 @@ fn run() -> Result<()> {
     let start_time = Instant::now();
     let mut unpacker = unpacker::Unpacker::new(pe, args.max_instructions, args.verbose);
     // Devirt trace is produced by default — zero-config UX (see
-    // `feedback_zero_config_ux` in auto-memory). The user doesn't
+    // design axioms in `README.md`). The user doesn't
     // have to know it exists; downstream tools consume it to
     // build the VM descriptor + walker. If `--devirt-trace` was
     // passed, use that path; otherwise derive a deterministic

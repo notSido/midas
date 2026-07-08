@@ -33,9 +33,9 @@ each against a commercial packer like Themida 3.x.
 | M2  | Handler discovery, basic-block cluster & dedup | ✅ done | `2dab0b4` |
 | M3  | IR (`Expr` + `Effect`) + iced-x86 → IR lifter | ✅ done — all GPR widths, ZF/SF flags, cmp/test, je/jne/js/jns, unconditional jmp, push/pop/inc/dec/lea/movzx. 99.9% on sample 2 top handler |            |
 | M4  | Per-handler semantics via simplification | ☐ required for semantic dedup (RIP-seq too strict) | |
-| M5  | VM bytecode stream lifter (stretch)        | ☐      |            |
-| M6  | IR simplifier — constant fold + algebraic peephole | ☐ |            |
-| M7  | Output emitter — pseudo-C / lifted x86     | ☐      |            |
+| M5  | VM bytecode stream lifter + concrete evaluator + replay walker | ✅ done — iterative walker, iter 0 validated | `3a7b121`, `5e226b6` |
+| M6  | IR simplifier — constant fold + algebraic peephole | ✅ done | `4f5c553` |
+| M7  | Output emitter — pseudo-C / lifted x86 | ✅ done — whole-program pseudo-C emit | `4f5c553`, `858ca13` |
 | M8  | (If ever needed) `varisat` SAT for predicate resolution | ☐ |            |
 
 ## Module layout
@@ -44,36 +44,34 @@ each against a commercial packer like Themida 3.x.
 src/devirt/
   mod.rs            public entry points
   trace.rs          TraceBuilder (M0) — JSONL recorder, armed at OEP
-  trace_events.rs   Event enum: OepReached, Exec, …
+  trace_events.rs   Event enum: OepReached, Exec, RegsAtRip, …
+  oep_dump.rs       VA-based reader for the unpacker's PE dump
   vm/
     regions.rs      dispatcher candidate finder (M1)
     handlers.rs     handler discovery, clustering, hashing (M2)
-    bytecode.rs     VM bytecode stream reader (M5)
+    detector.rs     VM-pattern detector — returns VmDescriptor (M5 prep)
+    eval.rs         concrete evaluator + replay walker (M5)
   ir/
     expr.rs         Expr AST + RegId/MemCell (M3)
     lifter.rs       iced-x86 Instruction → Expr (M3)
     simplify.rs     constant fold + algebraic peephole (M6)
     emit.rs         IR → pseudo-C or lifted x86 (M7)
-  semantics.rs      per-handler input/output effects (M4)
 
-src/bin/analyze-trace.rs     offline trace analyzer CLI (M1)
+src/bin/analyze-trace.rs     offline trace analyzer CLI
 ```
 
-Directories under `vm/`, `ir/` that don't exist yet will be created as
-their milestone starts.
-
-## End-to-end usage (today, M0+M1 wired)
+## End-to-end usage (today, M0–M7 wired)
 
 ```sh
 # Produce a post-OEP execution trace:
 midas \
-  --input samples/4e26b769...exe \
+  samples/4e26b769...exe \
   --output /tmp/s1_unpacked.exe \
   --devirt-trace /tmp/s1.trace.jsonl \
   --devirt-trace-limit 1000000
 
 # Analyze it offline (no Unicorn needed):
-analyze-trace --input /tmp/s1.trace.jsonl --top 10 --successors-per-candidate 16
+analyze-trace --input /tmp/s1.trace.jsonl --detect-vm
 ```
 
 Reaching OEP on sample 1 needs ~195M instructions, so the default
@@ -180,10 +178,10 @@ following:
   slice. The vast majority of the code reached by the trace is
   *not* VM-protected; it is *control-flow-obfuscated* by threaded
   dispatch + instruction mutation. The non-VM-native
-  deobfuscation pass (item 5 on HANDOFF's numbered path) is
-  therefore the bigger lever — and arguably the M5 work should be
-  re-scoped. See the open question logged in HANDOFF's "when to
-  check in" list.
+  deobfuscation pass (threaded-dispatch resolver, step 3 in the
+  strategic direction below) is therefore the bigger lever — and
+  arguably the M5 work should be re-scoped. See the open question
+  logged in the strategic direction section.
 
 ## Sample 1 recon — the VM *is* the dominant layer
 
@@ -250,11 +248,12 @@ not motivate sample-specific tooling.**
 
 ### Sample-agnostic is axiomatic (design constraint)
 
-See `feedback_sample_agnostic` in auto-memory. All midas code
-must work on any Themida sample with zero hardcoded per-sample
-constants. The VM_PC offset, handler-table base, key offset,
-decrypt op, and dispatcher RIP all live in a `VmDescriptor`
-returned at runtime by the detector; never in code.
+See the design axioms in `README.md` (sample-agnostic is
+  axiomatic). All midas code must work on any Themida sample with
+  zero hardcoded per-sample constants. The VM_PC offset,
+  handler-table base, key offset, decrypt op, and dispatcher RIP
+  all live in a `VmDescriptor` returned at runtime by the detector;
+  never in code.
 
 ### Strategic direction for Deliverable B
 
@@ -273,7 +272,8 @@ One pipeline, sample-agnostic, applied to both samples:
    each handler body to IR, composing a `Vec<Effect>` per VM-
    protected function.
 
-3. **Threaded-dispatch resolver** (non-VM pass, HANDOFF item 5).
+3. **Threaded-dispatch resolver** (non-VM pass, step 3 in the
+   strategic direction below).
    Starts from OEP in the dump; follows static control flow;
    when it hits an indirect branch (`jmp r<reg>` / `ret <var>`),
    resolves targets by value-tracking on the immediately-
@@ -583,13 +583,12 @@ visible in one `cargo build`.
 
 If you're a future session starting fresh:
 
-1. Read this file (`docs/DEVIRT.md`) and the memory entry
-   *"Devirt plan and status"*.
+1. Read this file (`docs/DEVIRT.md`) and `README.md` — together
+   they cover the full pipeline state and design axioms.
 2. `git log dev` — the per-milestone commits carry detailed notes
    in their bodies.
 3. Run both `samples/` through the current `midas` with
    `--devirt-trace` to reproduce today's artifacts before changing
    anything.
-4. The repo-root memory file
-   `/Users/sido/.claude/projects/-Users-sido-midas/memory/` has
-   the current feedback/project guidance.
+4. Build environment is WSL2 Ubuntu on the Windows workstation —
+   Rust toolchain at `~/cargo/bin`. See README "Building" section.

@@ -5,7 +5,7 @@
 //! central loop) rather than the original program. This module hosts the
 //! analysis pipeline that turns that VM execution back into readable code.
 //!
-//! Incremental milestones (see `/Users/sido/.claude/plans/…` for detail):
+//! Incremental milestones (see `docs/DEVIRT.md` for detail):
 //! - **M0** (current): per-instruction trace recorder, armed at OEP.
 //! - **M1**: VM dispatcher + handler region detection from the trace.
 //! - **M2**: handler discovery, clustering, dedup.

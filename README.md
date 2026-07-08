@@ -126,18 +126,29 @@ without explicit renegotiation:
 ## Building
 
 Must be built on Linux; Unicorn's build system depends on Linux
-tooling. The usual setup is a Docker container.
+tooling. The primary dev environment is **WSL2 Ubuntu** on the
+Windows workstation — Rust toolchain already installed there.
+
+```sh
+# From inside WSL2 (Ubuntu-22.04):
+# Clone to Linux home (not /mnt/c) for native IO speeds:
+git clone /mnt/c/Users/MikhailSidorenko/Documents/midas ~/midas
+cd ~/midas
+# One-time setup for Unicorn's C build:
+sudo apt update && sudo apt install -y build-essential cmake libclang-dev clang p7zip-full
+cargo build --release
+# Binary: target/release/midas
+# Helper: target/release/analyze-trace
+```
+
+Alternative: Docker (if you don't have WSL2 set up):
 
 ```sh
 docker run --rm -v "$(pwd):/midas" -w /midas rust:bookworm bash -c '
   apt-get update && apt-get install -y libclang-dev clang cmake p7zip-full
   cargo build --release
 '
-# Binary: target/release/midas
-# Helper: target/release/analyze-trace
 ```
-
-macOS developers: run the build inside a persistent Docker container.
 
 ## Usage
 

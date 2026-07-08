@@ -2,8 +2,8 @@
 //! per-address stats plus the top dispatcher candidates (M1).
 //!
 //! Separate binary (not a subcommand) so it can run without Unicorn / the
-//! emulator being usable — useful on laptops where the Docker build is
-//! elsewhere but the trace file is local.
+//! emulator — useful when only the trace file is available (e.g. analyzing
+//! traces on a machine without the full build toolchain).
 
 use clap::Parser;
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};

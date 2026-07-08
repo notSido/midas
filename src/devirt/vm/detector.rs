@@ -21,7 +21,7 @@
 //! is used.
 //!
 //! **Design axiom:** no sample-specific constants may land in this
-//! code (see `feedback_sample_agnostic` in auto-memory). The detector
+//! code (see the design axioms in `README.md`). The detector
 //! must return correct descriptors for *every* sample in `samples/`,
 //! present and future, without per-sample code paths.
 
