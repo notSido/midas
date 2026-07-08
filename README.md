@@ -222,6 +222,14 @@ All Rust, no C++ bindings beyond Unicorn's internal C.
   notes. The authoritative source for what's been tried, what works,
   and what's next in the devirt pipeline.
 
+## Further reading
+
+- `docs/DEVIRT.md` — devirt milestone plan, findings, architecture
+  notes. The authoritative source for what's been tried, what works,
+  and what's next in the devirt pipeline.
+- `docs/WORKFLOW.md` — dev environment setup, build cycle, and
+  iteration loop. Read this first if you're starting a session.
+
 ## License
 
 GPL-3.0 — see `LICENSE`.
