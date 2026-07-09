@@ -39,6 +39,7 @@ impl Section {
 pub struct PeImage {
     pub image_base: u64,
     pub entry_point_rva: u32,
+    pub size_of_headers: u32,
     pub size_of_image: u32,
     pub subsystem: u16,
     pub sections: Vec<Section>,
@@ -78,6 +79,7 @@ impl PeImage {
         Ok(PeImage {
             image_base: windows_fields.image_base,
             entry_point_rva: pe.entry,
+            size_of_headers: windows_fields.size_of_headers,
             size_of_image: windows_fields.size_of_image,
             subsystem: windows_fields.subsystem,
             sections,
@@ -85,7 +87,8 @@ impl PeImage {
     }
 
     pub fn entry_point_va(&self) -> u64 {
-        self.image_base.saturating_add(u64::from(self.entry_point_rva))
+        self.image_base
+            .saturating_add(u64::from(self.entry_point_rva))
     }
 
     pub fn section_containing_rva(&self, rva: u32) -> Option<&Section> {
@@ -220,6 +223,7 @@ mod tests {
         assert_eq!(image.image_base, 0x140000000);
         assert_eq!(image.entry_point_rva, 0x1000);
         assert_eq!(image.entry_point_va(), 0x140001000);
+        assert_eq!(image.size_of_headers, 0x400);
         assert_eq!(image.size_of_image, 0x4000);
         assert_eq!(image.subsystem, 3);
         assert_eq!(image.sections.len(), 2);
@@ -264,6 +268,7 @@ mod tests {
         let image = PeImage {
             image_base: 0x140000000,
             entry_point_rva: 0x1000,
+            size_of_headers: 0x400,
             size_of_image: 0x10000,
             subsystem: 3,
             sections: vec![Section {
