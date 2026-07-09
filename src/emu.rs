@@ -54,6 +54,24 @@ pub const PEB_BASE: u64 = 0x0000_000f_2000_0000;
 /// Size, in bytes, of the default x64 Process Environment Block mapping.
 pub const PEB_SIZE: u64 = PAGE_SIZE;
 
+/// Offset of `NtTib.StackBase` in the x64 TEB.
+pub const TEB_STACKBASE_OFFSET: u64 = 0x08;
+
+/// Offset of `NtTib.StackLimit` in the x64 TEB.
+pub const TEB_STACKLIMIT_OFFSET: u64 = 0x10;
+
+/// Offset of `NtTib.Self` in the x64 TEB.
+pub const TEB_SELF_OFFSET: u64 = 0x30;
+
+/// Offset of `TEB.ProcessEnvironmentBlock` in the x64 TEB.
+pub const TEB_PEB_OFFSET: u64 = 0x60;
+
+/// Offset of `PEB.BeingDebugged` in the x64 PEB.
+pub const PEB_BEINGDEBUGGED_OFFSET: u64 = 0x02;
+
+/// Offset of `PEB.ImageBaseAddress` in the x64 PEB.
+pub const PEB_IMAGEBASE_OFFSET: u64 = 0x10;
+
 #[derive(Debug, Error)]
 pub enum EmuError {
     #[error("failed to initialize Unicorn: {0}")]
@@ -165,12 +183,44 @@ pub struct RunReport {
     pub registers: Vec<(RegisterX86, u64)>,
 }
 
+#[derive(Debug, Clone)]
+pub enum TraceEvent {
+    Insn {
+        address: u64,
+    },
+    MemRead {
+        address: u64,
+        size: usize,
+        value: u64,
+    },
+    MemWrite {
+        address: u64,
+        size: usize,
+        value: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchHit {
+    pub instruction_index: u64,
+    pub is_write: bool,
+    pub address: u64,
+    pub size: usize,
+    pub rip: u64,
+}
+
 #[derive(Default)]
 struct EmuData {
     executed_addresses: Vec<u64>,
     recent_rips: VecDeque<u64>,
     instr_count: u64,
     last_fault: Option<MemFault>,
+    trace_from: u64,
+    trace_events: Vec<TraceEvent>,
+    trace_active: bool,
+    watch_ranges: Vec<(u64, u64)>,
+    watch_hits: Vec<WatchHit>,
+    watch_hit_cap: usize,
 }
 
 pub struct Emu {
@@ -198,6 +248,16 @@ impl Emu {
                 reg: RegisterX86::GS_BASE,
                 source,
             })?;
+
+        write_u64_mem(
+            &mut uc,
+            TEB_BASE + TEB_STACKBASE_OFFSET,
+            STACK_BASE + STACK_SIZE,
+        )?;
+        write_u64_mem(&mut uc, TEB_BASE + TEB_STACKLIMIT_OFFSET, STACK_BASE)?;
+        write_u64_mem(&mut uc, TEB_BASE + TEB_SELF_OFFSET, TEB_BASE)?;
+        write_u64_mem(&mut uc, TEB_BASE + TEB_PEB_OFFSET, PEB_BASE)?;
+        write_u8_mem(&mut uc, PEB_BASE + PEB_BEINGDEBUGGED_OFFSET, 0)?;
 
         Ok(Self { uc })
     }
@@ -322,7 +382,13 @@ impl Emu {
             }
         }
 
+        self.set_image_base_in_peb(base)?;
+
         Ok(())
+    }
+
+    pub fn set_image_base_in_peb(&mut self, image_base: u64) -> Result<(), EmuError> {
+        self.write_u64(PEB_BASE + PEB_IMAGEBASE_OFFSET, image_base)
     }
 
     pub fn write_reg(&mut self, reg: RegisterX86, val: u64) -> Result<(), EmuError> {
@@ -347,6 +413,10 @@ impl Emu {
                 source,
             })?;
         Ok(bytes)
+    }
+
+    fn write_u64(&mut self, addr: u64, value: u64) -> Result<(), EmuError> {
+        write_u64_mem(&mut self.uc, addr, value)
     }
 
     pub fn run(&mut self, begin: u64, until: u64, count: usize) -> Result<(), EmuError> {
@@ -415,6 +485,244 @@ impl Emu {
             self.uc.emu_start(begin, 0, 0, count)
         };
 
+        self.build_run_report(run_result, max_instructions)
+    }
+
+    /// Run with lightweight execution observation plus capped memory range hits.
+    ///
+    /// This installs hooks and leaves them installed, so it is intended to be
+    /// called once per `Emu` instance. Use a fresh `Emu` for each watched run.
+    pub fn run_watching(
+        &mut self,
+        begin: u64,
+        max_instructions: u64,
+        ranges: &[(u64, u64)],
+        hit_cap: usize,
+    ) -> Result<(RunReport, Vec<WatchHit>), EmuError> {
+        let count =
+            usize::try_from(max_instructions).map_err(|_| EmuError::InstructionCapTooLarge {
+                count: max_instructions,
+            })?;
+
+        {
+            let data = self.uc.get_data_mut();
+            data.instr_count = 0;
+            data.last_fault = None;
+            data.recent_rips.clear();
+            data.watch_ranges.clear();
+            data.watch_ranges.extend_from_slice(ranges);
+            data.watch_hits.clear();
+            data.watch_hit_cap = hit_cap;
+        }
+
+        self.uc
+            .add_code_hook(0, u64::MAX, |uc, address, _size| {
+                let data = uc.get_data_mut();
+                data.instr_count += 1;
+                data.recent_rips.push_back(address);
+                if data.recent_rips.len() > RECENT_RIPS_CAP {
+                    data.recent_rips.pop_front();
+                }
+            })
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        self.uc
+            .add_mem_hook(
+                HookType::MEM_UNMAPPED | HookType::MEM_PROT,
+                0,
+                u64::MAX,
+                |uc, mem_type, address, _size, _value| {
+                    uc.get_data_mut().last_fault = Some(MemFault {
+                        kind: fault_kind_from_mem_type(mem_type),
+                        address,
+                    });
+                    false
+                },
+            )
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        self.uc
+            .add_mem_hook(
+                HookType::MEM_READ | HookType::MEM_WRITE,
+                0,
+                u64::MAX,
+                |uc, mem_type, address, size, _value| {
+                    let should_record = {
+                        let data = uc.get_data();
+                        data.watch_hits.len() < data.watch_hit_cap
+                            && data
+                                .watch_ranges
+                                .iter()
+                                .any(|(start, end)| *start <= address && address < *end)
+                    };
+                    if !should_record {
+                        return false;
+                    }
+
+                    let is_write = match mem_type {
+                        MemType::READ => false,
+                        MemType::WRITE => true,
+                        _ => return false,
+                    };
+                    let rip = uc.reg_read(RegisterX86::RIP).ok().map_or(0, |value| value);
+                    let data = uc.get_data_mut();
+                    let instruction_index = data.instr_count;
+                    data.watch_hits.push(WatchHit {
+                        instruction_index,
+                        is_write,
+                        address,
+                        size,
+                        rip,
+                    });
+                    false
+                },
+            )
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        let run_result = if max_instructions == 0 {
+            Ok(())
+        } else {
+            self.uc.emu_start(begin, 0, 0, count)
+        };
+
+        let report = self.build_run_report(run_result, max_instructions)?;
+        let watch_hits = self.uc.get_data().watch_hits.clone();
+        Ok((report, watch_hits))
+    }
+
+    /// Run with lightweight execution observation plus a windowed detailed trace.
+    ///
+    /// This installs hooks and leaves them installed, so it is intended to be
+    /// called once per `Emu` instance, like [`Emu::run_observed`]. Use a fresh
+    /// `Emu` for each traced run.
+    ///
+    /// Detailed logging starts once the observed instruction count is greater
+    /// than or equal to `max_instructions.saturating_sub(trace_window)`. To trace
+    /// the window immediately before a fault at an initially unknown count, first
+    /// find the faulting instruction count with [`Emu::run_observed`], then call
+    /// this method on a fresh `Emu` with `max_instructions` set to that known
+    /// fault count and `trace_window` set to the desired window.
+    pub fn run_traced(
+        &mut self,
+        begin: u64,
+        max_instructions: u64,
+        trace_window: u64,
+    ) -> Result<(RunReport, Vec<TraceEvent>), EmuError> {
+        let count =
+            usize::try_from(max_instructions).map_err(|_| EmuError::InstructionCapTooLarge {
+                count: max_instructions,
+            })?;
+
+        {
+            let data = self.uc.get_data_mut();
+            data.instr_count = 0;
+            data.last_fault = None;
+            data.recent_rips.clear();
+            data.trace_from = max_instructions.saturating_sub(trace_window);
+            data.trace_events.clear();
+            data.trace_active = false;
+        }
+
+        self.uc
+            .add_code_hook(0, u64::MAX, |uc, address, _size| {
+                let data = uc.get_data_mut();
+                data.instr_count += 1;
+                data.recent_rips.push_back(address);
+                if data.recent_rips.len() > RECENT_RIPS_CAP {
+                    data.recent_rips.pop_front();
+                }
+
+                if data.instr_count >= data.trace_from {
+                    data.trace_active = true;
+                    data.trace_events.push(TraceEvent::Insn { address });
+                }
+            })
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        self.uc
+            .add_mem_hook(
+                HookType::MEM_UNMAPPED | HookType::MEM_PROT,
+                0,
+                u64::MAX,
+                |uc, mem_type, address, _size, _value| {
+                    uc.get_data_mut().last_fault = Some(MemFault {
+                        kind: fault_kind_from_mem_type(mem_type),
+                        address,
+                    });
+                    false
+                },
+            )
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        self.uc
+            .add_mem_hook(
+                HookType::MEM_READ | HookType::MEM_WRITE,
+                0,
+                u64::MAX,
+                |uc, mem_type, address, size, value| {
+                    if !uc.get_data().trace_active {
+                        return false;
+                    }
+
+                    let event = match mem_type {
+                        MemType::READ => TraceEvent::MemRead {
+                            address,
+                            size,
+                            value: read_hook_value(uc, address, size),
+                        },
+                        MemType::WRITE => TraceEvent::MemWrite {
+                            address,
+                            size,
+                            value: value as u64,
+                        },
+                        _ => return false,
+                    };
+
+                    uc.get_data_mut().trace_events.push(event);
+                    false
+                },
+            )
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        let run_result = if max_instructions == 0 {
+            Ok(())
+        } else {
+            self.uc.emu_start(begin, 0, 0, count)
+        };
+
+        let report = self.build_run_report(run_result, max_instructions)?;
+        let trace_events = self.uc.get_data().trace_events.clone();
+        Ok((report, trace_events))
+    }
+
+    pub fn install_code_trace_hook(&mut self) -> Result<(), EmuError> {
+        self.uc
+            .add_code_hook(0, u64::MAX, |uc, address, _size| {
+                uc.get_data_mut().executed_addresses.push(address);
+            })
+            .map(|_| ())
+            .map_err(EmuError::Hook)
+    }
+
+    pub fn executed_addresses(&self) -> Vec<u64> {
+        self.uc.get_data().executed_addresses.clone()
+    }
+
+    pub fn recent_rips(&self) -> Vec<u64> {
+        self.uc.get_data().recent_rips.iter().copied().collect()
+    }
+
+    fn build_run_report(
+        &self,
+        run_result: Result<(), uc_error>,
+        max_instructions: u64,
+    ) -> Result<RunReport, EmuError> {
         let instructions_executed = self.uc.get_data().instr_count;
         let stop_reason = match run_result {
             Ok(()) => {
@@ -449,22 +757,19 @@ impl Emu {
             registers,
         })
     }
+}
 
-    pub fn install_code_trace_hook(&mut self) -> Result<(), EmuError> {
-        self.uc
-            .add_code_hook(0, u64::MAX, |uc, address, _size| {
-                uc.get_data_mut().executed_addresses.push(address);
-            })
-            .map(|_| ())
-            .map_err(EmuError::Hook)
+fn read_hook_value(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> u64 {
+    let read_size = size.min(8);
+    if read_size == 0 {
+        return 0;
     }
 
-    pub fn executed_addresses(&self) -> Vec<u64> {
-        self.uc.get_data().executed_addresses.clone()
-    }
-
-    pub fn recent_rips(&self) -> Vec<u64> {
-        self.uc.get_data().recent_rips.iter().copied().collect()
+    let mut bytes = [0u8; 8];
+    if uc.mem_read(address, &mut bytes[..read_size]).is_ok() {
+        u64::from_le_bytes(bytes)
+    } else {
+        0
     }
 }
 
@@ -543,6 +848,30 @@ fn map_region(
         .map_err(|source| EmuError::Map { addr, size, source })
 }
 
+fn write_u64_mem(
+    uc: &mut Unicorn<'static, EmuData>,
+    addr: u64,
+    value: u64,
+) -> Result<(), EmuError> {
+    let bytes = value.to_le_bytes();
+    uc.mem_write(addr, &bytes)
+        .map_err(|source| EmuError::WriteMem {
+            addr,
+            size: bytes.len(),
+            source,
+        })
+}
+
+fn write_u8_mem(uc: &mut Unicorn<'static, EmuData>, addr: u64, value: u8) -> Result<(), EmuError> {
+    let bytes = [value];
+    uc.mem_write(addr, &bytes)
+        .map_err(|source| EmuError::WriteMem {
+            addr,
+            size: bytes.len(),
+            source,
+        })
+}
+
 fn section_prot(characteristics: u32) -> Prot {
     const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
     const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
@@ -581,7 +910,11 @@ fn align_up(value: u64, align: u64) -> Result<u64, EmuError> {
 mod tests {
     use crate::pe;
 
-    use super::{Emu, FaultKind, RegisterX86, StopReason, RECENT_RIPS_CAP};
+    use super::{
+        Emu, FaultKind, RegisterX86, StopReason, TraceEvent, PEB_BASE, PEB_IMAGEBASE_OFFSET,
+        RECENT_RIPS_CAP, STACK_BASE, STACK_SIZE, TEB_BASE, TEB_PEB_OFFSET, TEB_SELF_OFFSET,
+        TEB_STACKBASE_OFFSET,
+    };
 
     const CODE_BASE: u64 = 0x0000_0000_0040_0000;
     const PE_OFFSET: usize = 0x80;
@@ -604,6 +937,20 @@ mod tests {
 
     fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn read_u64_le(bytes: &[u8]) -> u64 {
+        let mut value = [0u8; 8];
+        value.copy_from_slice(bytes);
+        u64::from_le_bytes(value)
+    }
+
+    fn trace_value_mask(size: usize) -> u64 {
+        if size >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (size * 8)) - 1
+        }
     }
 
     fn minimal_pe64_with_text_pattern() -> Vec<u8> {
@@ -653,6 +1000,25 @@ mod tests {
         bytes[0x400..0x408].copy_from_slice(&[0xcc, 0x48, 0x31, 0xc0, 0xc3, 0x90, 0x90, 0x90]);
 
         bytes
+    }
+
+    #[test]
+    fn new_populates_teb_self_and_peb_pointer() {
+        let emu = Emu::new().unwrap();
+
+        assert_eq!(
+            read_u64_le(&emu.read_mem(TEB_BASE + TEB_SELF_OFFSET, 8).unwrap()),
+            TEB_BASE
+        );
+        assert_eq!(
+            read_u64_le(&emu.read_mem(TEB_BASE + TEB_PEB_OFFSET, 8).unwrap()),
+            PEB_BASE
+        );
+        assert_eq!(
+            read_u64_le(&emu.read_mem(TEB_BASE + TEB_STACKBASE_OFFSET, 8).unwrap()),
+            STACK_BASE + STACK_SIZE
+        );
+        assert_eq!(emu.read_reg(RegisterX86::GS_BASE).unwrap(), TEB_BASE);
     }
 
     #[test]
@@ -747,6 +1113,85 @@ mod tests {
     }
 
     #[test]
+    fn run_traced_captures_window() {
+        let shellcode = [
+            0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+            0x11, // mov rax, 0x1122334455667788
+            0x48, 0x89, 0x44, 0x24, 0xf8, // mov [rsp-8], rax
+            0x48, 0x8b, 0x5c, 0x24, 0xf8, // mov rbx, [rsp-8]
+            0x90, // nop
+        ];
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &shellcode).unwrap();
+        let stack_slot = emu.read_reg(RegisterX86::RSP).unwrap() - 8;
+
+        let (report, trace_events) = emu.run_traced(CODE_BASE, 4, 4).unwrap();
+
+        assert_eq!(report.stop_reason, StopReason::ReachedInstructionCap);
+        assert_eq!(report.instructions_executed, 4);
+        assert!(trace_events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::Insn { address } if *address == CODE_BASE)));
+        assert!(trace_events.iter().any(|event| {
+            matches!(
+                event,
+                TraceEvent::MemWrite {
+                    address,
+                    size,
+                    value,
+                } if *address == stack_slot
+                    && *size == 8
+                    && (*value & trace_value_mask(*size)) == 0x1122_3344_5566_7788
+            )
+        }));
+        assert!(trace_events.iter().any(|event| {
+            matches!(
+                event,
+                TraceEvent::MemRead {
+                    address,
+                    size,
+                    value,
+                } if *address == stack_slot
+                    && *size == 8
+                    && (*value & trace_value_mask(*size)) == 0x1122_3344_5566_7788
+            )
+        }));
+    }
+
+    #[test]
+    fn run_watching_records_range_access() {
+        let shellcode = [
+            0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0x00, 0x00, 0x00, 0x00, // mov rax, 0xCAFEBABE
+            0x48, 0x89, 0x44, 0x24, 0xf0, // mov [rsp-16], rax
+            0x48, 0x8b, 0x5c, 0x24, 0xf0, // mov rbx, [rsp-16]
+            0x90, // nop
+        ];
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &shellcode).unwrap();
+        let stack_slot = emu.read_reg(RegisterX86::RSP).unwrap() - 16;
+
+        let (report, watch_hits) = emu
+            .run_watching(CODE_BASE, 4, &[(stack_slot, stack_slot + 8)], 8)
+            .unwrap();
+
+        assert_eq!(report.stop_reason, StopReason::ReachedInstructionCap);
+        assert!(watch_hits.iter().any(|hit| {
+            hit.address == stack_slot
+                && hit.is_write
+                && hit.instruction_index != 0
+                && (CODE_BASE..CODE_BASE + shellcode.len() as u64).contains(&hit.rip)
+        }));
+        assert!(watch_hits.iter().any(|hit| {
+            hit.address == stack_slot
+                && !hit.is_write
+                && hit.instruction_index != 0
+                && (CODE_BASE..CODE_BASE + shellcode.len() as u64).contains(&hit.rip)
+        }));
+    }
+
+    #[test]
     fn map_image_maps_sections_and_headers() {
         let bytes = minimal_pe64_with_text_pattern();
         let image = pe::PeImage::parse(&bytes).unwrap();
@@ -768,5 +1213,19 @@ mod tests {
         if image.size_of_headers > 0 {
             assert_eq!(emu.read_mem(image.image_base, 1).unwrap(), vec![bytes[0]]);
         }
+    }
+
+    #[test]
+    fn map_image_sets_peb_image_base() {
+        let bytes = minimal_pe64_with_text_pattern();
+        let image = pe::PeImage::parse(&bytes).unwrap();
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_image(&image, &bytes, image.image_base).unwrap();
+
+        assert_eq!(
+            read_u64_le(&emu.read_mem(PEB_BASE + PEB_IMAGEBASE_OFFSET, 8).unwrap()),
+            image.image_base
+        );
     }
 }
