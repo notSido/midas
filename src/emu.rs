@@ -443,6 +443,16 @@ impl Emu {
         Ok(bytes)
     }
 
+    pub(crate) fn write_mem(&mut self, addr: u64, bytes: &[u8]) -> Result<(), EmuError> {
+        self.uc
+            .mem_write(addr, bytes)
+            .map_err(|source| EmuError::WriteMem {
+                addr,
+                size: bytes.len(),
+                source,
+            })
+    }
+
     fn write_u64(&mut self, addr: u64, value: u64) -> Result<(), EmuError> {
         write_u64_mem(&mut self.uc, addr, value)
     }

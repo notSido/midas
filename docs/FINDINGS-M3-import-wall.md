@@ -502,3 +502,39 @@ state). If the configurations diverge internally despite the same final summary,
 trace identifies the missing causal edge. Following that producer chain far enough to
 distinguish an unmodelled read (for example `TEB+0x68` or another structure) from a
 purely internal VM computation remains a multi-handler VM-reversal; the fix is unknown.
+
+## The upstream zero is a missing ntdll critical-section call
+
+The cheaper upstream correlation identified the exact missing resolution: the
+loader's ntdll hash selects `RtlInitializeCriticalSection`. The earlier synthetic
+`ntdll.dll` had an empty export table, so the VM propagated a null target into the
+handler slot documented above. This supersedes the earlier conclusion that fixing
+the wall necessarily required multi-handler VM reversal.
+
+The production slice now gives `ntdll.dll` exactly the eight names observed during
+the initial bootstrap and implements the exercised effect. On x64 the API receives a
+writable 40-byte `RTL_CRITICAL_SECTION` in `RCX`; the model clears all 40 bytes, sets
+the signed 32-bit `LockCount` at offset `+8` to `-1`, returns `NTSTATUS 0`, and
+performs the normal x64 return. Focused tests cover the explicit eight-name export
+table, direct memory/register effects, and an end-to-end call through the synthetic
+ntdll export stub.
+
+Reproduce the sample-dependent result with:
+
+```
+cargo build --release --example run_loader
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+```
+
+The documented sample now handles 15 calls rather than the former 8-call prefix;
+call 9 is `RtlInitializeCriticalSection`, and the run stops later at
+`ReachedUntil`. The two additional on-disk samples produce the same engineering
+result, but their missing version/config/provenance fields in `samples/SAMPLES.md`
+mean they are not yet formal milestone-acceptance evidence.
+
+### New frontier
+
+The critical-section effect fixes this specific null propagation. The next
+`ReachedUntil` after the shared 15-call prefix has not yet been diagnosed by a
+committed production artifact, so no further API behavior is justified by this
+section alone.

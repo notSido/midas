@@ -22,37 +22,25 @@ here. If a capability is not listed, it is not implemented.
 | `LoadLibraryA` stub with a consistent module registry: `LoadLibraryA(name)` returns `0` for a NULL/empty name (a failed load), the mapped synthetic kernel32 base for `"kernel32.dll"`, and otherwise allocates a stable non-null handle per DLL name (same handle on repeat loads, case-insensitively); `GetModuleHandleA` now returns an already-loaded module's handle and `0` for a never-loaded one. No per-sample DLL name is special-cased — the name is read from guest memory. | `cargo test win64::` green: `LoadLibraryA("kernel32.dll")` returns the parseable synthetic base and returns; a NULL name returns `0`; a new DLL yields a stable non-null handle that a later `GetModuleHandleA` then finds (including a mixed-case lookup) while an unloaded name returns `0`; the export-stub trap dispatches a `LoadLibraryA` call. Captured CLI (`run_loader`, all three samples): the loader loads five DLLs in order (`user32`, `advapi32`, `ntdll`, `shell32`, `shlwapi`) then faults `ReadUnmapped` at the first loaded module's `base+0x3c` (`e_lfanew` — the first read of parsing the loaded DLL's PE header) — identical on all three. | M3 |
 | Parseable synthetic modules for every loaded DLL: a per-`Win64Env` registry of synthetic modules; `LoadLibraryA` now maps a parseable PE (DOS + NT headers + export directory) for any loaded DLL — kernel32 with its seeded exports, every other DLL with an **empty** export table for now — so the loader's `base+0x3c`/PE-header/export-directory parse succeeds; the export-call trap reverse-maps a faulting stub across all registered modules | `cargo test win64::` green: a synthetic module built with an empty export set is a parseable PE (MZ / `e_lfanew`=0x80 / `PE\0\0` / export dir with `NumberOfFunctions`=`NumberOfNames`=0); `LoadLibraryA` of a new DLL maps a module whose `base+0x3c` now reads back `0x80` (previously faulted). Captured CLI (`run_loader`, all three samples): after loading the five DLLs the loader parses them, then resolves and **calls** `GetProcAddress` from kernel32 (stub `rva=0x1030`), trapped by name — identical on all three. | M3 |
 | `GetProcAddress(hModule, lpProcName)`: resolves a named export to a **callable** stub — reusing the module's built-in synthetic export stub when present, otherwise synthesizing a read-only non-executable stub from a per-`Win64Env` dynamic arena, deduplicated by name; a later call to a resolved stub faults and dispatches by name via the trap. Ordinal requests (`lpProcName < 0x10000`) return `0` (not yet handled); the DLL/function names are read from guest memory (nothing hardcoded) | `cargo test win64::` green: resolving a name absent from the seeded exports returns a non-null readable arena stub (same address on repeat resolves); resolving a seeded name returns the module's built-in export stub; an ordinal request returns `0`; a call to a resolved arena stub is trapped and dispatched by name. Captured CLI (`run_loader`, all three samples): the loader resolves `GetProcAddress(kernel32, "SetLastError")` then `("GetLastError")` (arena stubs), then transfers control to address `0` — identical on all three. | M3 |
+| Module-specific ntdll bootstrap exports + `RtlInitializeCriticalSection`: loading `ntdll.dll` exposes exactly the eight initially observed ntdll names while other unseeded modules retain empty export tables; calling the resolved initialization stub zeroes the 40-byte x64 critical-section object, sets `LockCount = -1` at `+8`, returns `NTSTATUS 0`, and resumes the caller | `cargo test --all-targets` green (45 tests): an explicit eight-name export-table oracle, a direct API effect test, and an end-to-end ntdll export-stub trap test assert the memory/register/return effects. Captured release `run_loader` CLI on sample 1 handles `RtlInitializeCriticalSection` as API 9 and advances to 15 handled calls; samples 2 and 3 show the same engineering result but are not formal milestone evidence until their provenance is completed. | M3 |
 
 ## Not yet implemented
 
-The Win64 environment is only **partially** implemented: the import-call trap,
-`GetModuleHandleA`, the synthetic kernel32 module, readable-but-non-executable
-export stubs with an export-call trap, a `LoadLibraryA` stub with a consistent
-module registry, parseable synthetic modules for every loaded DLL, and
-`GetProcAddress` exist (above). Current frontier (diagnosed, not yet fixed): after
-the 8 bootstrap APIs the loader runs a Themida bytecode interpreter whose per-op
-dispatch `ret`s to a handler pointer read by double-dereference through its VM
-context (`r13 = **(rbp + *(cursor+6))`). On all three samples that handler reads
-back `0` and the loader `ret`s to address `0` (`ReachedUntil`); traced on sample 1
-to a specific null slot in a handler-pointer table embedded in the unpacked
-`.themida` (`[.themida+0x5bd08] = 0`). A whole-run write trace shows that slot is
-written by the loader's **own VM**: the unpacker fills it with non-zero bytes, then a
-VM "store" handler (`.themida+0xaccf7`, `mov [r9],rbx` with `rbx=0`) copies a `0` out
-of a VM-context slot into it. So the null originates *inside the VM's data flow* (an
-upstream context value that is `0` in our environment), not a missing native write to
-that handler slot. An experiment (return `GetProcAddress` stubs *inside* the module
-image instead of the out-of-image arena) changed the returned addresses by ~4 GiB yet
-left the same observable `run_loader` summary on all three samples (the same 8 APIs and
-`ReachedUntil`). That bundled in-image implementation did not advance the observable
-`run_loader` frontier, but this coarse result does not prove that the internal VM path
-or upstream source slot was unchanged; candidate 1 (arena-address shape) remains
-causally unproven. The experimental
-change was reverted. Pinning the upstream `0`'s origin needs either an isolated
-address-only A/B or an operand/data-dependency trace of writes to
-`rbp + *(rbp+0x123)`, followed as needed by a multi-handler VM-reversal; the fix is
-still unknown and is to be scoped with the human before building.
-`examples/trap_postmortem.rs` reproduces the wall; `docs/FINDINGS-M3-import-wall.md`
-records the full chain, candidate causes, and the in-image-stub experiment.
+The Win64 environment is only **partially** implemented. The earlier 8-call wall,
+its VM-slot diagnosis, and the bounded in-image-stub experiment remain historical
+evidence in `docs/FINDINGS-M3-import-wall.md`; that experiment did not advance the
+observable frontier and did not prove candidate 1 causally false.
+
+The ntdll bootstrap result advances that earlier frontier: the module-specific
+ntdll export table exposes exactly the eight initially observed names, and
+`RtlInitializeCriticalSection` now has its verified initialization effect. All
+three on-disk samples handle the same 15-call prefix, including
+`RtlInitializeCriticalSection` as call 9, then stop at `ReachedUntil`. Samples 2
+and 3 show the same engineering result but are not formal milestone evidence
+until their provenance is completed. The next control-flow target has not yet
+been diagnosed by a committed production artifact. `examples/run_loader.rs`
+reproduces the current wall, and `docs/FINDINGS-M3-import-wall.md` records the
+full finding chain.
 
 Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
 detection, and the IR lifter. None has a passing acceptance artifact yet.
