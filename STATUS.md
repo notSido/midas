@@ -29,13 +29,18 @@ The Win64 environment is only **partially** implemented: the import-call trap,
 `GetModuleHandleA`, the synthetic kernel32 module, readable-but-non-executable
 export stubs with an export-call trap, a `LoadLibraryA` stub with a consistent
 module registry, parseable synthetic modules for every loaded DLL, and
-`GetProcAddress` exist (above). Current frontier: after resolving
-`SetLastError`/`GetLastError` via `GetProcAddress` the loader transfers control to
-address `0` (a NULL indirect branch, `ReachedUntil` on all three samples) — a new
-wall distinct from import/export resolution, to be diagnosed by tracing the
-transfer site (which pointer the loader branches through, and where it expected it
-to be populated). `docs/FINDINGS-M3-import-wall.md` records the reproducible chain
-and this frontier.
+`GetProcAddress` exist (above). Current frontier (diagnosed, not yet fixed): after
+the 8 bootstrap APIs the loader runs a Themida bytecode interpreter whose per-op
+dispatch `ret`s to a handler pointer read by double-dereference through its VM
+context (`r13 = **(rbp + *(cursor+6))`). On all three samples that handler reads
+back `0` and the loader `ret`s to address `0` (`ReachedUntil`); traced on sample 1
+to a specific null slot in a handler-pointer table embedded in the unpacked
+`.themida` (`[.themida+0x5bd08] = 0`, not written during the traced final leg,
+neighbours non-null). Why that slot is `0` is the open question; the fix direction is
+ambiguous (a small API-side-effect gap vs. changing how resolved addresses are
+modelled) and is to be chosen with the human before building.
+`examples/trap_postmortem.rs` reproduces the wall; `docs/FINDINGS-M3-import-wall.md`
+records the full chain and candidate causes.
 
 Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
 detection, and the IR lifter. None has a passing acceptance artifact yet.
