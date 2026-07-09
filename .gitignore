@@ -1,0 +1,9 @@
+/target
+*.exe
+*.zip
+.DS_Store
+/.claude/
+
+# Sample binaries are never committed; only the metadata file is tracked.
+/samples/*
+!/samples/SAMPLES.md

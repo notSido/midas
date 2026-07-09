@@ -1,0 +1,22 @@
+[package]
+name = "midas"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "midas"
+path = "src/main.rs"
+
+[dependencies]
+unicorn-engine = "=2.1.5"
+iced-x86 = "=1.21.0"
+goblin = "=0.10.7"
+clap = { version = "=4.6.1", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+thiserror = "=2.0.18"
+log = "=0.4.33"
+env_logger = "=0.11.11"

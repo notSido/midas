@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, main-rebuild]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        # unicorn-engine-sys builds Unicorn from source (cmake) and generates
+        # bindings with bindgen (libclang).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+  no-hype:
+    # Fail the build if unverifiable hype language appears in docs or comments.
+    # The literal token-list itself (as it appears in docs/CHARTER.md defining
+    # this gate) is allowlisted; any standalone occurrence is rejected.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cringe-grep gate
+        run: |
+          set -euo pipefail
+          pattern='🎉|✅|SUCCESS|BREAKTHROUGH|MAJOR|FINALLY'
+          matches="$(grep -rnE "$pattern" \
+            --include='*.md' --include='*.rs' --include='*.toml' \
+            --exclude-dir=target --exclude-dir=.git . \
+            | grep -vF "$pattern" || true)"
+          if [ -n "$matches" ]; then
+            echo "Hype language found (see docs/CHARTER.md 'no hype' rule):"
+            echo "$matches"
+            exit 1
+          fi
+          echo "No hype language found."
