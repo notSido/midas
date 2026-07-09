@@ -236,3 +236,37 @@ return a synthetic module base for a known DLL), added with a test asserting the
 emulated effect and re-validated on all samples via `run_loader`. The precise DLL(s)
 the loader requests and what it does with the returned base are to be observed once
 the stub returns.
+
+## LoadLibraryA loads five DLLs, then the frontier is the loaded module's header (all three samples)
+
+Reproduce with `cargo run --release --example run_loader -- samples/<sample>.exe`.
+`LoadLibraryA(name)` reads the ASCII name from `RCX` and returns: the process image
+base for a NULL name; the mapped synthetic kernel32 for `"kernel32.dll"`; otherwise a
+stable non-null handle per DLL name (allocated once, returned again on repeat loads).
+`GetModuleHandleA` now returns an already-loaded module's handle and `0` for a
+never-loaded one. Only kernel32 is special-cased (it is the module whose synthetic
+export table we provide); every other DLL takes the same generic handle path, so the
+mechanism is sample-agnostic — the DLL names come from guest memory, none is hardcoded.
+
+- After `GetModuleHandleA("kernel32.dll")` the loader calls `LoadLibraryA` **five**
+  times, requesting — in this order, identically on all three samples —
+  `user32.dll`, `advapi32.dll`, `ntdll.dll`, `shell32.dll`, `shlwapi.dll`. This fixed
+  list across independently-protected binaries is Themida-loader behaviour, not a
+  per-payload quirk.
+- The run then stops with `ReadUnmapped` at `first_loaded_base + 0x3c` (the fault
+  address decodes to `FAKE_MODULE_BASE_START + FAKE_MODULE_BASE_STEP + 0x3c`, i.e. the
+  base handed back for the *first* `LoadLibraryA` (`user32.dll`) plus `e_lfanew`). So,
+  exactly as it did for the kernel32 handle, the loader parses the PE header of a
+  module it loaded — one level down.
+- Captured CLI artifact, not a committed test (long, sample-dependent). The
+  `LoadLibraryA` handle semantics and the export-stub dispatch of `LoadLibraryA` are
+  covered by committed `cargo test` cases.
+
+### What this justifies building next
+
+Generalise the synthetic-module machinery (today kernel32-only) so a module returned
+by `LoadLibraryA` is a **mapped, parseable** PE — DOS + NT headers + an export
+directory — reusing the existing `SyntheticModule` builder, seeded with each DLL's
+export **names**. Then the loader's `base+0x3c` header parse succeeds and it proceeds
+to walk that module's exports, revealing the next resolution/API step (observed, then
+implemented, one at a time, re-validated on all samples).

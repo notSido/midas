@@ -19,19 +19,22 @@ here. If a capability is not listed, it is not implemented.
 | Import-call trap + `GetModuleHandleA`: run the loader, and on a fetch-fault at an unbound IAT thunk (an image RVA landing on a valid `IMAGE_IMPORT_BY_NAME`), resolve the function name from the PE's import table, emulate the API, set `RAX`, return to the on-stack address, and continue (`emu::Emu::resume` enables the fault-and-resume loop) | `cargo test win64::` green: import-by-name resolution from a synthetic image; `GetModuleHandleA` returns a non-null base and performs the return; end-to-end trap handles a synthetic unbound-import call. | M3 |
 | Synthetic kernel32 module + export-call trap: `GetModuleHandleA("kernel32.dll")` maps a minimal synthetic PE32+ with a real export directory (seeded export names); the loader's manual export walk resolves a function, and a call to a resolved export stub is trapped and dispatched by export name (`GetModuleHandleA(NULL)` returns the process image base) | `cargo test win64::` green: the synthetic kernel32 is parseable via guest reads (MZ/e_lfanew/`PE`/export names), `GetModuleHandleA` exposes `[base+0x3c]`, stub addresses reverse-map to export names, and the trap reports an unimplemented export call by name. | M3 |
 | Readable-but-non-executable export stubs: the synthetic kernel32 image and its export-stub region are mapped read-only (no EXECUTE), so the loader's inspection of a resolved function's code bytes succeeds while *calling* a stub faults `FetchProt`; the export-call trap dispatches on `FetchProt` as well as `FetchUnmapped` (`emu::Emu::map_readonly`) | `cargo test` green: `map_readonly` maps a region that reads back yet faults `FetchProt` when executed; the synthetic stub region reads back as mapped bytes; the export-call trap dispatches a `FetchProt` stub call by name. Captured CLI (`run_loader`, all three samples): after `GetModuleHandleA` the loader reads and then **calls** the resolved export, trapped by name as `LoadLibraryA` (identical on all three). | M3 |
+| `LoadLibraryA` stub with a consistent module registry: `LoadLibraryA(name)` returns the process image base for a NULL name, the mapped synthetic kernel32 base for `"kernel32.dll"`, and otherwise allocates a stable non-null handle per DLL name (same handle on repeat loads); `GetModuleHandleA` now returns an already-loaded module's handle and `0` for a never-loaded one. No per-sample DLL name is special-cased — the name is read from guest memory. | `cargo test win64::` green: `LoadLibraryA("kernel32.dll")` returns the parseable synthetic base and returns; a NULL name returns the image base; a new DLL yields a stable non-null handle that a later `GetModuleHandleA` then finds while an unloaded name returns `0`; the export-stub trap dispatches a `LoadLibraryA` call. Captured CLI (`run_loader`, all three samples): the loader loads five DLLs in order (`user32`, `advapi32`, `ntdll`, `shell32`, `shlwapi`) then faults `ReadUnmapped` at the first loaded module's `base+0x3c` (parsing the loaded DLL's PE header) — identical on all three. | M3 |
 
 ## Not yet implemented
 
 The Win64 environment is only **partially** implemented: the import-call trap,
-`GetModuleHandleA`, the synthetic kernel32 module, and readable-but-non-executable
-export stubs with an export-call trap exist (above). What remains for the win64
-layer: the actual API stubs the loader calls next — the observed next call on all
-three samples is `LoadLibraryA`, followed (unverified) by `GetProcAddress`,
-`VirtualAlloc`, … — each added when observed; and seeding the export names from
-the real `samples/kernel32.dll` for complete resolution regardless of which
-function the loader wants. `docs/FINDINGS-M3-import-wall.md` records the
-reproducible chain and the current frontier (after `GetModuleHandleA` the loader
-resolves, inspects, and calls `LoadLibraryA`).
+`GetModuleHandleA`, the synthetic kernel32 module, readable-but-non-executable
+export stubs with an export-call trap, and a `LoadLibraryA` stub with a consistent
+module registry exist (above). What remains for the win64 layer: making the
+modules returned by `LoadLibraryA` **parseable** — the loader next reads the first
+loaded module's `base+0x3c` (`e_lfanew`) and walks its PE header exactly as it did
+for kernel32, so the synthetic-module machinery must be generalised to any loaded
+DLL (mapped image + export directory), seeded with each DLL's export names; then
+the further API stubs the loader calls (`GetProcAddress`, `VirtualAlloc`, …), each
+added when observed. `docs/FINDINGS-M3-import-wall.md` records the reproducible
+chain and the current frontier (after loading `user32`/`advapi32`/`ntdll`/`shell32`/
+`shlwapi` the loader parses the first loaded module's PE header).
 
 Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
 detection, and the IR lifter. None has a passing acceptance artifact yet.
