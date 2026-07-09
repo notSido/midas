@@ -85,7 +85,7 @@ impl PeImage {
     }
 
     pub fn entry_point_va(&self) -> u64 {
-        self.image_base + u64::from(self.entry_point_rva)
+        self.image_base.saturating_add(u64::from(self.entry_point_rva))
     }
 
     pub fn section_containing_rva(&self, rva: u32) -> Option<&Section> {
@@ -94,9 +94,17 @@ impl PeImage {
             .find(|section| section.contains_rva(rva))
     }
 
+    /// Map an RVA to a file offset within its section's raw data.
+    ///
+    /// Returns `None` when the RVA falls in a section's virtual-only tail (where
+    /// `virtual_size > size_of_raw_data`, common in protected binaries): such an
+    /// RVA has no backing bytes in the file, so no valid file offset exists.
     pub fn rva_to_file_offset(&self, rva: u32) -> Option<u64> {
         let section = self.section_containing_rva(rva)?;
         let section_delta = rva.checked_sub(section.virtual_address)?;
+        if section_delta >= section.size_of_raw_data {
+            return None;
+        }
         u64::from(section.pointer_to_raw_data).checked_add(u64::from(section_delta))
     }
 }
@@ -249,6 +257,37 @@ mod tests {
     }
 
     #[test]
+    fn rva_to_file_offset_none_in_virtual_only_tail() {
+        // A section whose virtual_size (0x2000) exceeds size_of_raw_data (0x200):
+        // RVAs in [va + size_of_raw_data, va + virtual_size) are backed by no
+        // file bytes and must map to None; RVAs within the raw range still map.
+        let image = PeImage {
+            image_base: 0x140000000,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x10000,
+            subsystem: 3,
+            sections: vec![Section {
+                name: ".text".to_owned(),
+                virtual_address: 0x1000,
+                virtual_size: 0x2000,
+                pointer_to_raw_data: 0x400,
+                size_of_raw_data: 0x200,
+                characteristics: 0x60000020,
+            }],
+        };
+
+        // Inside the raw-backed range.
+        assert_eq!(image.rva_to_file_offset(0x1000), Some(0x400));
+        assert_eq!(image.rva_to_file_offset(0x11ff), Some(0x5ff));
+        // First RVA past the raw data but still inside virtual_size: no bytes.
+        assert!(image.section_containing_rva(0x1200).is_some());
+        assert_eq!(image.rva_to_file_offset(0x1200), None);
+        assert_eq!(image.rva_to_file_offset(0x2fff), None);
+        // Outside the section entirely.
+        assert_eq!(image.rva_to_file_offset(0x3000), None);
+    }
+
+    #[test]
     fn serde_round_trip() {
         let image = PeImage::parse(&minimal_pe64()).expect("minimal PE64 should parse");
         let json = serde_json::to_string(&image).expect("image should serialize");
@@ -258,31 +297,48 @@ mod tests {
     }
 
     #[test]
-    fn parses_real_sample_if_present() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/test_target_protected.exe");
-        if !path.exists() {
-            return;
+    fn parses_real_samples_if_present() {
+        // Sample binaries are gitignored and absent in CI; iterate over every
+        // *.exe in samples/ so the check is sample-agnostic and covers whatever
+        // real samples exist locally. Assert only invariants that hold for ANY
+        // valid PE64 — no hardcoded per-sample constants.
+        let samples_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples");
+        let entries = match fs::read_dir(&samples_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        let mut checked = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("exe") {
+                continue;
+            }
+
+            let bytes = fs::read(&path).expect("sample should be readable");
+            let image = PeImage::parse(&bytes).expect("sample should parse as PE64");
+
+            println!(
+                "sample {}: image_base={:#x}, entry_point_rva={:#x}, sections={}",
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                image.image_base,
+                image.entry_point_rva,
+                image.sections.len()
+            );
+
+            assert_ne!(image.image_base, 0);
+            assert!(!image.sections.is_empty());
+            assert!(image.entry_point_rva < image.size_of_image);
+
+            let file_len = bytes.len() as u64;
+            for section in &image.sections {
+                let raw_end =
+                    u64::from(section.pointer_to_raw_data) + u64::from(section.size_of_raw_data);
+                assert!(raw_end <= file_len);
+            }
+            checked += 1;
         }
 
-        let bytes = fs::read(&path).expect("sample should be readable");
-        let image = PeImage::parse(&bytes).expect("sample should parse as PE64");
-
-        println!(
-            "sample PE64: image_base={:#x}, entry_point_rva={:#x}, sections={}",
-            image.image_base,
-            image.entry_point_rva,
-            image.sections.len()
-        );
-
-        assert_ne!(image.image_base, 0);
-        assert!(!image.sections.is_empty());
-        assert!(image.entry_point_rva < image.size_of_image);
-
-        let file_len = bytes.len() as u64;
-        for section in &image.sections {
-            let raw_end =
-                u64::from(section.pointer_to_raw_data) + u64::from(section.size_of_raw_data);
-            assert!(raw_end <= file_len);
-        }
+        println!("parsed {checked} real sample(s)");
     }
 }

@@ -12,8 +12,8 @@ hypotheses to re-confirm against disassembly before midas relies on them.
 ## Sample inventory
 
 Two distinct samples are required to satisfy the "sample-agnostic, zero
-hardcoded per-sample constants" acceptance criterion. **Only one is present so
-far**; a second must be provided before that criterion can be met.
+hardcoded per-sample constants" acceptance criterion. **Two samples are now
+present on disk** (both gitignored).
 
 ### 1. `test_target_protected.exe`
 
@@ -30,8 +30,20 @@ far**; a second must be provided before that criterion can be met.
 | API wrapping (per protection log) | 94 imported-API references wrapped. |
 | Provenance | Built from `test_target.c` — a single-translation-unit, kernel32-only C program (no CRT I/O, integer-only). Pre-protection binary SHA-256 `2e1f5a921bae7483d21221adaf770fa7e71ea6fe700cd73e1eda6976dfe84f29`, 298,390 bytes. Verified to run standalone on Windows (demo splash then identical program output). |
 
-### 2. (second sample — not yet provided)
+### 2. `test_target2_protected.exe`
 
-Required before the "two distinct samples" generality criterion in
-`docs/CHARTER.md` can be satisfied. STOP and request it at the M3→M4 boundary if
-still absent.
+| Field | Value |
+|---|---|
+| Filename | `samples/test_target2_protected.exe` |
+| SHA-256 | `1f583d70d7bd0655cd873415dd818adeee8215769d73754065719d133f45f3ee` |
+| Size | 1,903,014 bytes |
+| Format | PE32+ (PE64) console executable, x86-64, 23 sections (per `objdump`: ImageBase `0x140000000`, AddressOfEntryPoint `0x33d058`, Subsystem 3 Windows CUI) |
+| Protector | Themida (provenance to be supplied by the sample author) |
+| Themida version | *to be supplied by author* |
+| Config | *to be supplied by author* |
+| Provenance | Second distinct sample, deposited on disk 2026-07-09. Themida version/config, source program, and pre-protection hash are **not yet recorded** — the fields above marked "to be supplied" must be filled in by the author before this sample is relied on for a milestone artifact. The SHA-256, size, and format fields were computed directly from the on-disk binary. |
+
+> The verified facts (hash, size, format, and the `objdump`-read header values)
+> are direct observations of the deposited file. The Themida version/config and
+> source provenance are placeholders until the author records them; do not treat
+> them as known.
