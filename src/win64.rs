@@ -321,8 +321,12 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
         }
         "LoadLibraryA" => {
             let module_name = read_arg_ascii_z(emu, RegisterX86::RCX)?;
+            // Unlike GetModuleHandle(NULL) (which yields the process image base),
+            // LoadLibrary of a NULL/empty name is a failed load: return 0. The
+            // guest passes an ASCII DLL name; `read_arg_ascii_z` maps both a NULL
+            // pointer and a pointer to "" to the empty string, both handled here.
             let base = if module_name.is_empty() {
-                env.image_base
+                0
             } else if module_name.eq_ignore_ascii_case("kernel32.dll") {
                 env.ensure_kernel32(emu)?
             } else {
@@ -895,7 +899,9 @@ mod tests {
     }
 
     #[test]
-    fn loadlibrarya_null_returns_image_base() {
+    fn loadlibrarya_null_returns_zero() {
+        // LoadLibrary(NULL) is a failed load (returns 0), NOT the image base —
+        // that is GetModuleHandle(NULL)'s semantics, not LoadLibrary's.
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
 
@@ -911,10 +917,12 @@ mod tests {
             outcome,
             ApiOutcome::Handled {
                 name: "LoadLibraryA".to_owned(),
-                ret: IMAGE_BASE
+                ret: 0
             }
         );
-        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), IMAGE_BASE);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), stack_address + 8);
     }
 
     #[test]
@@ -924,6 +932,9 @@ mod tests {
         let mut data = vec![0u8; 0x1000];
         data[..b"user32.dll\0".len()].copy_from_slice(b"user32.dll\0");
         data[0x80..0x80 + b"gdi32.dll\0".len()].copy_from_slice(b"gdi32.dll\0");
+        // Same module as the load above, different casing: the registry keys on
+        // the lowercased name, so this must resolve to the same handle.
+        data[0x100..0x100 + b"USER32.DLL\0".len()].copy_from_slice(b"USER32.DLL\0");
         emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
             .unwrap();
 
@@ -962,6 +973,20 @@ mod tests {
         let found = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
         assert_eq!(
             found,
+            ApiOutcome::Handled {
+                name: "GetModuleHandleA".to_owned(),
+                ret: user32_base
+            }
+        );
+
+        // Case-insensitive handle reuse: "USER32.DLL" resolves to the handle
+        // allocated for the lowercased "user32.dll" load above.
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA) + 0x100)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let found_mixed_case = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
+        assert_eq!(
+            found_mixed_case,
             ApiOutcome::Handled {
                 name: "GetModuleHandleA".to_owned(),
                 ret: user32_base
@@ -1061,8 +1086,11 @@ mod tests {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
-        let module =
-            SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", KERNEL32_EXPORTS);
+        // Reserve kernel32's base through the registry (as the real
+        // ensure_kernel32 path does), so the subsequent user32 load gets a
+        // DISTINCT base instead of aliasing kernel32's.
+        let kernel32_base = env.module_base("kernel32.dll");
+        let module = SyntheticModule::build(kernel32_base, "kernel32.dll", KERNEL32_EXPORTS);
         let load_library_rva = *module.exports.get("LoadLibraryA").unwrap();
         let load_library_addr = module.base + u64::from(load_library_rva);
         module.map_into(&mut emu).unwrap();
@@ -1089,7 +1117,10 @@ mod tests {
 
         assert_eq!(result.handled, vec!["LoadLibraryA".to_owned()]);
         assert_eq!(result.stop, TrapStop::InstructionCap);
-        assert_ne!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        // user32's handle must be non-null and distinct from kernel32's base.
+        let user32_base = emu.read_reg(RegisterX86::RAX).unwrap();
+        assert_ne!(user32_base, 0);
+        assert_ne!(user32_base, kernel32_base);
     }
 
     #[test]

@@ -250,14 +250,17 @@ mechanism is sample-agnostic — the DLL names come from guest memory, none is h
 
 - After `GetModuleHandleA("kernel32.dll")` the loader calls `LoadLibraryA` **five**
   times, requesting — in this order, identically on all three samples —
-  `user32.dll`, `advapi32.dll`, `ntdll.dll`, `shell32.dll`, `shlwapi.dll`. This fixed
-  list across independently-protected binaries is Themida-loader behaviour, not a
-  per-payload quirk.
+  `user32.dll`, `advapi32.dll`, `ntdll.dll`, `shell32.dll`, `shlwapi.dll`. That the
+  same fixed list appears across three independently-protected binaries is evidence
+  of shared Themida-loader behaviour (not a per-payload quirk), though not a proof
+  across all Themida 3.2.4.34 binaries.
 - The run then stops with `ReadUnmapped` at `first_loaded_base + 0x3c` (the fault
   address decodes to `FAKE_MODULE_BASE_START + FAKE_MODULE_BASE_STEP + 0x3c`, i.e. the
-  base handed back for the *first* `LoadLibraryA` (`user32.dll`) plus `e_lfanew`). So,
-  exactly as it did for the kernel32 handle, the loader parses the PE header of a
-  module it loaded — one level down.
+  base handed back for the *first* `LoadLibraryA` (`user32.dll`) plus `0x3c`). `0x3c`
+  is `e_lfanew` in the DOS header, so — exactly as it did for the kernel32 handle —
+  the loader has *begun* parsing the PE header of a module it loaded (this artifact
+  captures the first header read; the subsequent export walk is not yet observed
+  because the image is unmapped). One level down from kernel32.
 - Captured CLI artifact, not a committed test (long, sample-dependent). The
   `LoadLibraryA` handle semantics and the export-stub dispatch of `LoadLibraryA` are
   covered by committed `cargo test` cases.
