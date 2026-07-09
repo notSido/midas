@@ -272,6 +272,10 @@ impl Win64Env {
         base
     }
 
+    fn loaded_base(&self, name: &str) -> Option<u64> {
+        self.modules.get(&name.to_ascii_lowercase()).copied()
+    }
+
     fn ensure_kernel32(&mut self, emu: &mut Emu) -> Result<u64, EmuError> {
         if let Some(kernel32) = &self.kernel32 {
             return Ok(kernel32.base);
@@ -306,7 +310,27 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             } else if module_name.eq_ignore_ascii_case("kernel32.dll") {
                 env.ensure_kernel32(emu)?
             } else {
+                env.loaded_base(&module_name).unwrap_or(0)
+            };
+            emu.write_reg(RegisterX86::RAX, base)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: base,
+            })
+        }
+        "LoadLibraryA" => {
+            let module_name = read_arg_ascii_z(emu, RegisterX86::RCX)?;
+            // Unlike GetModuleHandle(NULL) (which yields the process image base),
+            // LoadLibrary of a NULL/empty name is a failed load: return 0. The
+            // guest passes an ASCII DLL name; `read_arg_ascii_z` maps both a NULL
+            // pointer and a pointer to "" to the empty string, both handled here.
+            let base = if module_name.is_empty() {
                 0
+            } else if module_name.eq_ignore_ascii_case("kernel32.dll") {
+                env.ensure_kernel32(emu)?
+            } else {
+                env.module_base(&module_name)
             };
             emu.write_reg(RegisterX86::RAX, base)?;
             api_return(emu)?;
@@ -850,6 +874,139 @@ mod tests {
     }
 
     #[test]
+    fn loadlibrarya_kernel32_returns_synthetic_base_and_returns() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        map_module_name(&mut emu);
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+
+        let outcome = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        let ApiOutcome::Handled { ret, .. } = outcome else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+
+        assert_ne!(ret, 0);
+        assert_eq!(read_u32_emu(&emu, ret + 0x3c), 0x80);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), stack_address + 8);
+    }
+
+    #[test]
+    fn loadlibrarya_null_returns_zero() {
+        // LoadLibrary(NULL) is a failed load (returns 0), NOT the image base —
+        // that is GetModuleHandle(NULL)'s semantics, not LoadLibrary's.
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+
+        let outcome = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        assert_eq!(
+            outcome,
+            ApiOutcome::Handled {
+                name: "LoadLibraryA".to_owned(),
+                ret: 0
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), stack_address + 8);
+    }
+
+    #[test]
+    fn loadlibrarya_allocates_consistent_handle_and_getmodulehandle_finds_it() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut data = vec![0u8; 0x1000];
+        data[..b"user32.dll\0".len()].copy_from_slice(b"user32.dll\0");
+        data[0x80..0x80 + b"gdi32.dll\0".len()].copy_from_slice(b"gdi32.dll\0");
+        // Same module as the load above, different casing: the registry keys on
+        // the lowercased name, so this must resolve to the same handle.
+        data[0x100..0x100 + b"USER32.DLL\0".len()].copy_from_slice(b"USER32.DLL\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let first = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        let ApiOutcome::Handled {
+            ret: user32_base, ..
+        } = first
+        else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+        assert_ne!(user32_base, 0);
+
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let second = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        assert_eq!(
+            second,
+            ApiOutcome::Handled {
+                name: "LoadLibraryA".to_owned(),
+                ret: user32_base
+            }
+        );
+
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let found = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
+        assert_eq!(
+            found,
+            ApiOutcome::Handled {
+                name: "GetModuleHandleA".to_owned(),
+                ret: user32_base
+            }
+        );
+
+        // Case-insensitive handle reuse: "USER32.DLL" resolves to the handle
+        // allocated for the lowercased "user32.dll" load above.
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA) + 0x100)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let found_mixed_case = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
+        assert_eq!(
+            found_mixed_case,
+            ApiOutcome::Handled {
+                name: "GetModuleHandleA".to_owned(),
+                ret: user32_base
+            }
+        );
+
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA) + 0x80)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let missing = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
+        assert_eq!(
+            missing,
+            ApiOutcome::Handled {
+                name: "GetModuleHandleA".to_owned(),
+                ret: 0
+            }
+        );
+    }
+
+    #[test]
     fn trap_handles_getmodulehandlea_end_to_end() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
@@ -922,6 +1079,48 @@ mod tests {
                 rva: virtual_alloc_rva
             }
         );
+    }
+
+    #[test]
+    fn trap_dispatches_loadlibrarya_via_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        // Reserve kernel32's base through the registry (as the real
+        // ensure_kernel32 path does), so the subsequent user32 load gets a
+        // DISTINCT base instead of aliasing kernel32's.
+        let kernel32_base = env.module_base("kernel32.dll");
+        let module = SyntheticModule::build(kernel32_base, "kernel32.dll", KERNEL32_EXPORTS);
+        let load_library_rva = *module.exports.get("LoadLibraryA").unwrap();
+        let load_library_addr = module.base + u64::from(load_library_rva);
+        module.map_into(&mut emu).unwrap();
+        env.kernel32 = Some(module);
+
+        let mut data = vec![0u8; 0x1000];
+        data[..b"user32.dll\0".len()].copy_from_slice(b"user32.dll\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&(IMAGE_BASE + u64::from(DATA_RVA)).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&load_library_addr.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0]);
+        code.extend_from_slice(&[0xeb, 0xfe]);
+
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["LoadLibraryA".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        // user32's handle must be non-null and distinct from kernel32's base.
+        let user32_base = emu.read_reg(RegisterX86::RAX).unwrap();
+        assert_ne!(user32_base, 0);
+        assert_ne!(user32_base, kernel32_base);
     }
 
     #[test]
