@@ -35,10 +35,13 @@ dispatch `ret`s to a handler pointer read by double-dereference through its VM
 context (`r13 = **(rbp + *(cursor+6))`). On all three samples that handler reads
 back `0` and the loader `ret`s to address `0` (`ReachedUntil`); traced on sample 1
 to a specific null slot in a handler-pointer table embedded in the unpacked
-`.themida` (`[.themida+0x5bd08] = 0`, not written during the traced final leg,
-neighbours non-null). Why that slot is `0` is the open question; the fix direction is
-ambiguous (a small API-side-effect gap vs. changing how resolved addresses are
-modelled) and is to be chosen with the human before building.
+`.themida` (`[.themida+0x5bd08] = 0`). A whole-run write trace shows that slot is
+written by the loader's **own VM**: the unpacker fills it with non-zero bytes, then a
+VM "store" handler (`.themida+0xaccf7`, `mov [r9],rbx` with `rbx=0`) copies a `0` out
+of a VM-context slot into it. So the null originates *inside the VM's data flow* (an
+upstream context value that is `0` in our environment), not a missing native write.
+Pinning that origin needs a multi-handler VM-reversal; the fix is still unknown and
+is to be scoped with the human before building.
 `examples/trap_postmortem.rs` reproduces the wall; `docs/FINDINGS-M3-import-wall.md`
 records the full chain and candidate causes.
 

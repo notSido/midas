@@ -408,3 +408,44 @@ The fix direction is **ambiguous** and should be chosen with the human before
 building: it may be a small API-semantics gap (2) or a larger change to how resolved
 addresses are modelled (1). `examples/trap_postmortem.rs` reproduces the wall; the
 per-sample capture used a one-shot instruction cap at the final `0x5caf1`.
+
+## Whole-run write trace: the loader's own VM stores the 0 (candidate 3 resolved)
+
+Method: a temporary persistent write-watch on the 8-byte slot `0x14005bd08` that
+survives the trap's per-API `resume` legs (a `MEM_WRITE` hook filtered to the slot,
+recording writer RIP + value). Sample 1.
+
+The slot **is** written during the run — 9 writes, and the last one wins:
+
+- During initial decompression the unpacker fills the slot with **non-zero** bytes
+  (`.themida+0x30b074` `mov [rdi],al` → `64 96 1e 73 …`, then `.themida+0x30b144`
+  `rep movsb`).
+- **Later**, a single **8-byte write** `mov [r9],rbx` at `.themida+0xaccf7`
+  (`r9 = 0x14005bd08`, `rbx = 0`) **zeroes the whole slot**. Nothing writes it after
+  that, so it reads back `0` when the dispatcher later loads it as a handler.
+
+So candidate cause 3 (a self-decrypt/relocation pass we hadn't traced) is the writer,
+but it does not *populate* the slot — it *nulls* it. And `0xaccf7` is itself a **VM
+"store" handler**:
+
+```
+rbx = *(rbp + *(rbp+0x123))   ; read a value from a VM-context slot  -> 0
+mov [r9], rbx                 ; store it into 0x14005bd08
+```
+
+i.e. the interpreter copied a `0` **out of its own context** into the handler slot.
+The null therefore originates *inside the VM's data flow* — an upstream VM-context
+value that is `0` in our environment — not a missing native write and not (directly)
+the arena-address shape or a `TEB` field. Candidate causes 1 and 2 are not ruled in
+by this; the true origin is whatever produced that upstream `0`.
+
+### Consequence
+
+Pinning the origin means following the VM's data flow backwards across many handlers
+(each reads/writes `rbp`-relative context slots and advances the `[rbp+0xB2]` cursor)
+to the op that should have produced a non-zero value and didn't. That is a
+substantial VM-reversal effort and the fix is still unknown — it should be scoped
+with the human before building. A promising cheaper cut first: correlate the upstream
+VM-context slot (`rbp + *(rbp+0x123)`) with the two values the environment most
+plausibly perturbs at this point — the `GetProcAddress` results for
+`SetLastError`/`GetLastError` — by watching writes to that slot across the run.
