@@ -290,6 +290,28 @@ impl Emu {
             })
     }
 
+    pub fn map_readonly(&mut self, base: u64, bytes: &[u8]) -> Result<(), EmuError> {
+        let len = u64::try_from(bytes.len()).map_err(|_| EmuError::CodeTooLarge)?;
+        let size = align_up(len.max(1), PAGE_SIZE)?;
+        base.checked_add(size)
+            .ok_or(EmuError::AddressRangeOverflow { base, size })?;
+
+        self.uc
+            .mem_map(base, size, Prot::READ)
+            .map_err(|source| EmuError::Map {
+                addr: base,
+                size,
+                source,
+            })?;
+        self.uc
+            .mem_write(base, bytes)
+            .map_err(|source| EmuError::WriteMem {
+                addr: base,
+                size: bytes.len(),
+                source,
+            })
+    }
+
     pub fn map_image(
         &mut self,
         image: &pe::PeImage,
@@ -1069,6 +1091,26 @@ mod tests {
             .registers
             .iter()
             .any(|(reg, _value)| *reg == RegisterX86::RIP));
+    }
+
+    #[test]
+    fn map_readonly_maps_readable_non_executable_memory() {
+        let bytes = [0x90, 0x90, 0x90, 0x90];
+        let mut emu = Emu::new().unwrap();
+        emu.map_readonly(CODE_BASE, &bytes).unwrap();
+
+        assert_eq!(emu.read_mem(CODE_BASE, bytes.len()).unwrap(), bytes);
+
+        emu.write_reg(RegisterX86::RIP, CODE_BASE).unwrap();
+        let report = emu.run_observed(CODE_BASE, 16).unwrap();
+
+        match &report.stop_reason {
+            StopReason::MemoryFault(fault) => {
+                assert_eq!(fault.kind, FaultKind::FetchProt);
+                assert_eq!(fault.address, CODE_BASE);
+            }
+            other => panic!("expected memory fault, got {other:?}"),
+        }
     }
 
     #[test]

@@ -201,3 +201,33 @@ the execute fault (`FetchProt`/`FetchUnmapped`) in the export-call trap. Seeding
 the export **names** from the real `samples/kernel32.dll` (1664 names, see
 `samples/SAMPLES.md`) gives complete resolution regardless of which function the
 loader wants.
+
+## Readable stubs move the frontier to LoadLibraryA (all three samples)
+
+Reproduce with `cargo run --release --example run_loader -- samples/<sample>.exe`.
+With the synthetic kernel32 image and its export-stub region now mapped
+**read-only** (`emu::Emu::map_readonly`; no EXECUTE anywhere in the module) and the
+export-call trap dispatching on `FetchProt` as well as `FetchUnmapped`:
+
+- The loader's inspection read of the resolved export's bytes now **succeeds** (the
+  earlier `ReadUnmapped` at the stub is gone), and the loader proceeds to **call**
+  that export. The call lands on a mapped-but-non-executable stub, faulting
+  `FetchProt`, which the trap catches and dispatches by name.
+- On **all three** samples the run is now identical: one handled API
+  (`GetModuleHandleA`), then a stop at an unhandled export call resolved by name to
+  **`LoadLibraryA`** (stub RVA `0x1040` = slot 4 in the name-sorted synthetic export
+  table). So the loader's bootstrap sequence is
+  `GetModuleHandleA("kernel32.dll")` → resolve/inspect/**call `LoadLibraryA`**.
+- This is a captured CLI artifact, not a committed test (long, sample-dependent).
+  The `FetchProt` mechanism and the readable-stub read are covered by committed
+  `cargo test` cases.
+
+### What this justifies building next
+
+Implement `LoadLibraryA` as the next win64 API stub — observed on all three samples,
+so it is Themida-loader behaviour, not overfitting. Its argument is an ASCII module
+name in `RCX`; the natural semantics mirror `GetModuleHandleA`'s module path (map /
+return a synthetic module base for a known DLL), added with a test asserting the
+emulated effect and re-validated on all samples via `run_loader`. The precise DLL(s)
+the loader requests and what it does with the returned base are to be observed once
+the stub returns.
