@@ -35,8 +35,8 @@ dispatch `ret`s to a handler pointer read by double-dereference through its VM
 context (`r13 = **(rbp + *(cursor+6))`). On all three samples that handler reads
 back `0` and the loader `ret`s to address `0` (`ReachedUntil`); traced on sample 1
 to a specific null slot in a handler-pointer table embedded in the unpacked
-`.themida` (`[.themida+0x5bd08] = 0`, never written during the run, neighbours
-non-null). Why that slot is `0` is the open question; the fix direction is
+`.themida` (`[.themida+0x5bd08] = 0`, not written during the traced final leg,
+neighbours non-null). Why that slot is `0` is the open question; the fix direction is
 ambiguous (a small API-side-effect gap vs. changing how resolved addresses are
 modelled) and is to be chosen with the human before building.
 `examples/trap_postmortem.rs` reproduces the wall; `docs/FINDINGS-M3-import-wall.md`

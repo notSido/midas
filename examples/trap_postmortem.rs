@@ -90,15 +90,14 @@ fn run() -> Result<(), String> {
         }
     }
 
-    println!("\n[RSP] window:");
+    println!("\n[RSP] window ([rsp-8] is the value a `ret` at the stop would have consumed):");
     if let Ok(rsp) = emu.read_reg(RegisterX86::RSP) {
         for i in -1i64..8 {
-            let a = (rsp as i64 + i * 8) as u64;
+            let a = rsp.wrapping_add((i * 8) as u64);
             match emu.read_mem(a, 8) {
                 Ok(b) => {
                     let v = u64::from_le_bytes(b.as_slice().try_into().unwrap());
-                    let note = if i == -1 { "  <- value a trailing `ret` consumed" } else { "" };
-                    println!("  [rsp{:+#05x}] 0x{a:016x} = 0x{v:016x}{note}", i * 8);
+                    println!("  [rsp{:+#05x}] 0x{a:016x} = 0x{v:016x}", i * 8);
                 }
                 Err(_) => println!("  [rsp{:+#05x}] 0x{a:016x} = <unreadable>", i * 8),
             }

@@ -372,17 +372,18 @@ The chain resolves to a genuine null in a handler-pointer table:
 
 ```
 rbp                     = 0x14006f9e0            (VM context, in .themida)
-r13 = rbp + *(cursor+6) = 0x14006fa68            (*(cursor+6) = 0x88)
-[r13]                   = 0x14005bd08            (pointer into a .themida table)
-[[r13]] = [0x14005bd08] = 0x0                    (the null handler -> ret target)
+rbp + *(cursor+6)       = 0x14006fa68            (*(cursor+6) = 0x88)
+[rbp + *(cursor+6)]     = 0x14005bd08            (pointer into a .themida table)
+r13 = [0x14005bd08]     = 0x0                    (the null handler -> ret target)
 ```
 
 `.themida+0x5bd08` is one 8-byte slot in a handler-pointer table embedded in the
 *unpacked* `.themida`; its neighbours hold valid handlers (e.g. `[0x5bd18] =
-0x1400dc1f7`), but this entry is `0`. It is **never written during the run** — it is
-already 0 when the interpreter reaches it. The 24 preceding VM ops read valid
-handlers from the analogous slot (e.g. `[…] = 0x140053xxx`); only this 25th op reads
-a null.
+0x1400dc1f7`), but this entry is `0`. It is **not written during the traced final
+leg** (the post-`GetProcAddress` segment) — it is already 0 when the interpreter
+reaches it; whether it is written earlier in the run is candidate cause 3 below (an
+un-run whole-run write trace). The 24 preceding VM ops read valid handlers from the
+analogous slot (e.g. `[…] = 0x140053xxx`); only this 25th op reads a null.
 
 **Open question (the crux for the fix).** Why is `[0x14005bd08]` zero — i.e. what
 was supposed to populate this handler slot before the interpreter reached it. It is
