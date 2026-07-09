@@ -180,3 +180,24 @@ module base:
   module + export resolution is the next win64 step. This mirrors the classic
   "get `DllBase`, then parse exports" technique (cf. the PEB/Ldr write-ups),
   reached here via `GetModuleHandleA` rather than a `PEB->Ldr` walk.
+
+## Progression through the export walk (both samples)
+
+With a synthetic kernel32 PE (DOS + NT headers + a real export directory) mapped
+at the `GetModuleHandleA` base, the loader parses the export table successfully
+and advances past the `e_lfanew` read. It then resolves an export and **reads the
+resolved function's code bytes**: sample 1 faults with `ReadUnmapped` at
+`kernel32_base + 0x2040`, which is stub slot 4 (`STUB_REGION_RVA 0x2000 + 4*16`) =
+`LoadLibraryA` (exports are name-sorted). i.e. after obtaining kernel32's base the
+loader resolves `LoadLibraryA` and inspects its bytes before use (a common
+anti-hook / relocation check).
+
+Consequence for the design: the export **stub region must be readable** (mapped
+read-only) so the loader can inspect a resolved function's bytes, while remaining
+**non-executable** so that *calling* the stub still faults and is trapped/dispatched.
+The current slice leaves the stub region unmapped (calls fault as intended, but
+reads do not), so the next step is readable-but-non-executable stubs plus handling
+the execute fault (`FetchProt`/`FetchUnmapped`) in the export-call trap. Seeding
+the export **names** from the real `samples/kernel32.dll` (1664 names, see
+`samples/SAMPLES.md`) gives complete resolution regardless of which function the
+loader wants.

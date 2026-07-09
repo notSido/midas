@@ -3,7 +3,7 @@ use std::{env, fs, process};
 use midas::{
     emu::Emu,
     pe::PeImage,
-    win64::{read_import_by_name, run_with_import_trap, TrapStop, Win64Env},
+    win64::{run_with_import_trap, TrapStop, Win64Env},
 };
 
 const DEFAULT_PER_RUN_CAP: u64 = 60_000_000;
@@ -34,7 +34,7 @@ fn run() -> Result<(), String> {
     emu.map_image(&image, &bytes, image.image_base)
         .map_err(|error| format!("failed to map image: {error}"))?;
 
-    let mut env = Win64Env::new();
+    let mut env = Win64Env::new(image.image_base);
     let result = run_with_import_trap(
         &mut env,
         &mut emu,
@@ -50,7 +50,7 @@ fn run() -> Result<(), String> {
         println!("  {:03}: {name}", index + 1);
     }
 
-    println!("stop: {}", format_stop(&emu, &image, &result.stop));
+    println!("stop: {}", format_stop(&image, &result.stop));
     Ok(())
 }
 
@@ -71,15 +71,10 @@ where
     }
 }
 
-fn format_stop(emu: &Emu, image: &PeImage, stop: &TrapStop) -> String {
+fn format_stop(_image: &PeImage, stop: &TrapStop) -> String {
     match stop {
         TrapStop::UnhandledApi { name, rva } => {
-            let resolved = read_import_by_name(emu, image.image_base, image.size_of_image, *rva)
-                .map_or_else(
-                    || "unresolved import-by-name".to_owned(),
-                    |resolved| format!("import-by-name={resolved}"),
-                );
-            format!("unhandled API {name} at rva=0x{rva:08x} ({resolved})")
+            format!("unhandled API {name} at export-stub or import rva=0x{rva:08x}")
         }
         TrapStop::UnexpectedFault { address } => {
             format!("unexpected fetch fault at 0x{address:016x}")
