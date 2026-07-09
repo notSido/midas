@@ -2359,3 +2359,77 @@ poll. It does not establish a Windows startup thunk, TLS initialization,
 scheduling, clean thread return, termination, or an OEP. The terminal zero
 remains diagnostic state whose source must be traced before scheduler lifecycle
 work can classify it.
+
+## Persistent cross-resume watching reproduces the poll-cell accesses
+
+The persistent watch diagnostic was independently reproduced against the formal
+sample artifact with SHA-256
+`8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf`:
+
+```text
+cargo run --locked --release --example trace_slot -- samples/test_target_protected.exe 14005aae0 14005aae1 64 60000000 39
+```
+
+The relevant captured accesses were:
+
+| Access | Global instruction | RIP | Instruction |
+|---|---:|---:|---|
+| write | 425458 | `0x000000014030b1c5` | `rep movsb` |
+| read | 35096805 | `0x000000014005ffeb` | `cmp byte [r12],dil` |
+| read | 35100332 | `0x000000014005ffeb` | `cmp byte [r12],dil` |
+
+The final watched byte was `00`. The run handled call 39 as `Sleep`, then
+stopped at the next API boundary because `max_calls` was reached. The watched interval
+`[0x000000014005aae0, 0x000000014005aae1)` is one byte. Memory accesses are
+matched by true half-open overlap, so an access is not required to begin inside
+the watched interval. The persistent watch and its global instruction counter
+remain live across resume legs; the instruction numbers above therefore share
+one timeline rather than restarting after each trapped API call. This reproduces
+the previously documented poll-cell observation: the same cell is written by
+the `rep movsb` path, later read by the `cmp byte [r12],dil` poll, and remains
+zero at the bounded stop.
+
+The production APIs use one overlap helper for both the existing `run_watching`
+path and persistent watching. Synthetic coverage records an 8-byte access when
+only an interior byte is watched; adjacent, empty, and reversed ranges do not
+match, while overflow edges retain nonwrapping overlap behavior. Persistent-hit
+read and write value capture preserves the recorded value for access sizes
+`0..=8`, including zero, and returns `None` for wider accesses rather than
+exposing partial or raw data. The legacy `run_traced` value behavior is unchanged.
+
+`trace_slot` bounds both watch-derived outputs it can retain or dump. Its hit cap
+defaults to 4,096 and values above 16,384 are rejected because every retained hit owns an
+18-register snapshot. The requested watched span still uses checked arithmetic;
+the final dump reads and formats at most its first 4,096 bytes and emits an
+explicit truncation message when more bytes were requested. Each printed hit
+includes all 18 captured registers, including `RCX`, `RSI`, `RDI`, and `R12`, so
+the operands of the two observed instructions are present in the diagnostic.
+
+The focused synthetic tests are
+`persistent_watch_survives_resume_legs_and_records_values`,
+`persistent_watch_hit_cap_is_honored_across_resume_legs`,
+`persistent_watch_value_helpers_preserve_zero_through_eight_and_reject_wider`,
+`run_watching_records_access_overlapping_an_interior_watched_byte`,
+`access_overlap_covers_interior_adjacent_empty_reversed_and_overflow_ranges`,
+`hit_cap_validation_preserves_default_and_enforces_maximum`,
+`final_dump_plan_is_checked_bounded_and_explicit`,
+`register_format_covers_the_complete_snapshot`, and
+`trap_reports_null_control_transfer_for_ret_to_zero`.
+
+`TrapStop::NullControlTransfer` now classifies `StopReason::ReachedUntil` when
+the final RIP is zero. It is an unexpected diagnostic state only: it is not normal thread
+exit, lifecycle completion, OEP, or a fix for terminal-zero provenance.
+Historical `ReachedUntil` and `Other("ReachedUntil")` captures remain accurate
+labels for their older checkpoints before this classifier; they are not
+retroactively reinterpreted.
+
+The verification matrix is:
+
+```text
+cargo fmt
+cargo fmt --check
+cargo build --all-targets
+cargo test --all-targets              # 129 passed (126 library, 3 trace_slot)
+cargo clippy --all-targets -- -D warnings
+git diff --check
+```

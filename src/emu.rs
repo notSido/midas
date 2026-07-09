@@ -234,11 +234,26 @@ pub struct WatchHit {
     pub rip: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentWatchHit {
+    pub global_instruction_index: u64,
+    pub is_write: bool,
+    pub address: u64,
+    pub size: usize,
+    pub rip: u64,
+    /// The value of the full access (up to eight bytes), not only the bytes
+    /// intersecting the watched range. Accesses wider than eight bytes and
+    /// failed reads have no captured value.
+    pub value: Option<u64>,
+    pub registers: Vec<(RegisterX86, u64)>,
+}
+
 #[derive(Default)]
 struct EmuData {
     executed_addresses: Vec<u64>,
     recent_rips: VecDeque<u64>,
     instr_count: u64,
+    total_instr_count: u64,
     last_fault: Option<MemFault>,
     trace_from: u64,
     trace_events: Vec<TraceEvent>,
@@ -246,6 +261,9 @@ struct EmuData {
     watch_ranges: Vec<(u64, u64)>,
     watch_hits: Vec<WatchHit>,
     watch_hit_cap: usize,
+    persistent_watch_ranges: Vec<(u64, u64)>,
+    persistent_watch_hits: Vec<PersistentWatchHit>,
+    persistent_watch_hit_cap: usize,
 }
 
 /// An opaque, reusable snapshot of Unicorn CPU state owned by one [`Emu`].
@@ -262,6 +280,7 @@ pub struct Emu {
     uc: Unicorn<'static, EmuData>,
     observation_hooks_installed: bool,
     cpu_context_owner: Rc<()>,
+    persistent_watch_hook_installed: bool,
 }
 
 impl Emu {
@@ -302,6 +321,7 @@ impl Emu {
             uc,
             observation_hooks_installed: false,
             cpu_context_owner: Rc::new(()),
+            persistent_watch_hook_installed: false,
         };
         emu.ensure_observation_hooks()?;
         Ok(emu)
@@ -643,6 +663,37 @@ impl Emu {
         self.resume(begin, max_instructions)
     }
 
+    /// Configure a trap-aware memory watch that persists across [`Emu::resume`]
+    /// calls.
+    ///
+    /// Ranges are half-open (`start..end`). Any memory access that overlaps a
+    /// configured range is recorded until `hit_cap` hits have been retained.
+    /// The underlying memory hook remains installed for this [`Emu`]'s
+    /// lifetime; reconfiguration replaces the ranges and retained hits.
+    pub fn configure_persistent_watch(
+        &mut self,
+        ranges: &[(u64, u64)],
+        hit_cap: usize,
+    ) -> Result<(), EmuError> {
+        self.ensure_observation_hooks()?;
+        self.ensure_persistent_watch_hook()?;
+
+        let data = self.uc.get_data_mut();
+        data.persistent_watch_ranges.clear();
+        data.persistent_watch_ranges.extend_from_slice(ranges);
+        data.persistent_watch_hits.clear();
+        data.persistent_watch_hit_cap = hit_cap;
+        Ok(())
+    }
+
+    pub fn clear_persistent_watch_hits(&mut self) {
+        self.uc.get_data_mut().persistent_watch_hits.clear();
+    }
+
+    pub fn persistent_watch_hits(&self) -> Vec<PersistentWatchHit> {
+        self.uc.get_data().persistent_watch_hits.clone()
+    }
+
     /// Run with lightweight execution observation plus capped memory range hits.
     ///
     /// This installs hooks and leaves them installed, so it is intended to be
@@ -679,10 +730,7 @@ impl Emu {
                     let should_record = {
                         let data = uc.get_data();
                         data.watch_hits.len() < data.watch_hit_cap
-                            && data
-                                .watch_ranges
-                                .iter()
-                                .any(|(start, end)| *start <= address && address < *end)
+                            && access_overlaps_ranges(address, size, &data.watch_ranges)
                     };
                     if !should_record {
                         return false;
@@ -872,6 +920,7 @@ impl Emu {
             .add_code_hook(0, u64::MAX, |uc, address, _size| {
                 let data = uc.get_data_mut();
                 data.instr_count += 1;
+                data.total_instr_count += 1;
                 data.recent_rips.push_back(address);
                 if data.recent_rips.len() > RECENT_RIPS_CAP {
                     data.recent_rips.pop_front();
@@ -899,23 +948,117 @@ impl Emu {
         self.observation_hooks_installed = true;
         Ok(())
     }
+
+    fn ensure_persistent_watch_hook(&mut self) -> Result<(), EmuError> {
+        if self.persistent_watch_hook_installed {
+            return Ok(());
+        }
+
+        self.uc
+            .add_mem_hook(
+                HookType::MEM_READ | HookType::MEM_WRITE,
+                0,
+                u64::MAX,
+                |uc, mem_type, address, size, value| {
+                    let is_write = match mem_type {
+                        MemType::READ => false,
+                        MemType::WRITE => true,
+                        _ => return false,
+                    };
+
+                    let should_record = {
+                        let data = uc.get_data();
+                        data.persistent_watch_hits.len() < data.persistent_watch_hit_cap
+                            && access_overlaps_ranges(address, size, &data.persistent_watch_ranges)
+                    };
+                    if !should_record {
+                        return false;
+                    }
+
+                    let value = if is_write {
+                        write_hook_value_opt(value as u64, size)
+                    } else {
+                        read_hook_value_opt(uc, address, size)
+                    };
+                    let rip = uc.reg_read(RegisterX86::RIP).ok().map_or(0, |value| value);
+                    let registers = snapshot_registers(uc);
+
+                    let data = uc.get_data_mut();
+                    data.persistent_watch_hits.push(PersistentWatchHit {
+                        global_instruction_index: data.total_instr_count,
+                        is_write,
+                        address,
+                        size,
+                        rip,
+                        value,
+                        registers,
+                    });
+                    false
+                },
+            )
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        self.persistent_watch_hook_installed = true;
+        Ok(())
+    }
 }
 
 fn read_hook_value(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> u64 {
-    let read_size = size.min(8);
-    if read_size == 0 {
-        return 0;
+    read_hook_value_opt(uc, address, size.min(8)).unwrap_or(0)
+}
+
+fn read_hook_value_opt(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> Option<u64> {
+    if size > 8 {
+        return None;
+    }
+    if size == 0 {
+        return Some(0);
     }
 
     let mut bytes = [0u8; 8];
-    if uc.mem_read(address, &mut bytes[..read_size]).is_ok() {
-        u64::from_le_bytes(bytes)
+    if uc.mem_read(address, &mut bytes[..size]).is_ok() {
+        Some(u64::from_le_bytes(bytes))
     } else {
-        0
+        None
     }
 }
 
-fn snapshot_registers(uc: &Unicorn<'static, EmuData>) -> Vec<(RegisterX86, u64)> {
+fn write_hook_value_opt(value: u64, size: usize) -> Option<u64> {
+    (size <= 8).then(|| mask_hook_value(value, size))
+}
+
+fn mask_hook_value(value: u64, size: usize) -> u64 {
+    let bits = size.saturating_mul(8);
+    if bits >= u64::BITS as usize {
+        value
+    } else if bits == 0 {
+        0
+    } else {
+        value & ((1u64 << bits) - 1)
+    }
+}
+
+fn access_overlaps_ranges(address: u64, size: usize, ranges: &[(u64, u64)]) -> bool {
+    let Ok(size) = u64::try_from(size) else {
+        return false;
+    };
+    if size == 0 {
+        return false;
+    }
+
+    let Some(access_end) = address.checked_add(size) else {
+        return ranges
+            .iter()
+            .any(|(start, end)| start < end && address < *end);
+    };
+
+    ranges
+        .iter()
+        .any(|(start, end)| start < end && address < *end && *start < access_end)
+}
+
+fn snapshot_registers(uc: &Unicorn<'_, EmuData>) -> Vec<(RegisterX86, u64)> {
     REGISTER_SNAPSHOT_ORDER
         .iter()
         .filter_map(|&reg| uc.reg_read(reg).ok().map(|value| (reg, value)))
@@ -1053,9 +1196,10 @@ mod tests {
     use crate::pe;
 
     use super::{
-        map_region, Emu, EmuError, FaultKind, RegisterX86, StopReason, TraceEvent, PAGE_SIZE,
-        PEB_BASE, PEB_IMAGEBASE_OFFSET, RECENT_RIPS_CAP, STACK_BASE, STACK_SIZE, TEB_BASE,
-        TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_STACKBASE_OFFSET,
+        access_overlaps_ranges, map_region, read_hook_value_opt, write_hook_value_opt, Emu,
+        EmuError, FaultKind, RegisterX86, StopReason, TraceEvent, PAGE_SIZE, PEB_BASE,
+        PEB_IMAGEBASE_OFFSET, RECENT_RIPS_CAP, REGISTER_SNAPSHOT_ORDER, STACK_BASE, STACK_SIZE,
+        TEB_BASE, TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_STACKBASE_OFFSET,
     };
     use unicorn_engine::unicorn_const::Prot;
 
@@ -1154,6 +1298,25 @@ mod tests {
             emu.uc.reg_read_long(RegisterX86::XMM0).unwrap().as_ref(),
             seed.xmm0.as_slice()
         );
+    }
+
+    fn persistent_watch_shellcode(marker: u64, value: u64) -> Vec<u8> {
+        let mut shellcode = Vec::new();
+        shellcode.extend_from_slice(&[0x49, 0xb9]);
+        shellcode.extend_from_slice(&marker.to_le_bytes());
+        shellcode.extend_from_slice(&[0x48, 0xc7, 0x44, 0x24, 0xf8, 0, 0, 0, 0]);
+        shellcode.extend_from_slice(&[0x48, 0x8b, 0x5c, 0x24, 0xf8]);
+        shellcode.extend_from_slice(&[0x48, 0xb8]);
+        shellcode.extend_from_slice(&value.to_le_bytes());
+        shellcode.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0xf0]);
+        shellcode.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 0xf0]);
+        shellcode
+    }
+
+    fn register_value(registers: &[(RegisterX86, u64)], reg: RegisterX86) -> Option<u64> {
+        registers
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == reg).then_some(*value))
     }
 
     fn minimal_pe64_with_text_pattern() -> Vec<u8> {
@@ -1651,7 +1814,7 @@ mod tests {
     }
 
     #[test]
-    fn run_watching_records_range_access() {
+    fn run_watching_records_access_overlapping_an_interior_watched_byte() {
         let shellcode = [
             0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0x00, 0x00, 0x00, 0x00, // mov rax, 0xCAFEBABE
             0x48, 0x89, 0x44, 0x24, 0xf0, // mov [rsp-16], rax
@@ -1664,7 +1827,7 @@ mod tests {
         let stack_slot = emu.read_reg(RegisterX86::RSP).unwrap() - 16;
 
         let (report, watch_hits) = emu
-            .run_watching(CODE_BASE, 4, &[(stack_slot, stack_slot + 8)], 8)
+            .run_watching(CODE_BASE, 4, &[(stack_slot + 4, stack_slot + 5)], 8)
             .unwrap();
 
         assert_eq!(report.stop_reason, StopReason::ReachedInstructionCap);
@@ -1680,6 +1843,135 @@ mod tests {
                 && hit.instruction_index != 0
                 && (CODE_BASE..CODE_BASE + shellcode.len() as u64).contains(&hit.rip)
         }));
+    }
+
+    #[test]
+    fn persistent_watch_survives_resume_legs_and_records_values() {
+        let marker = 0x1234_5678_9abc_def0;
+        let stored_value = 0x1122_3344_5566_7788;
+        let shellcode = persistent_watch_shellcode(marker, stored_value);
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &shellcode).unwrap();
+        let rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let zero_slot = rsp - 8;
+        let value_slot = rsp - 16;
+
+        emu.configure_persistent_watch(
+            &[
+                (zero_slot + 4, zero_slot + 5),
+                (value_slot + 4, value_slot + 8),
+            ],
+            8,
+        )
+        .unwrap();
+
+        let first_report = emu.resume(CODE_BASE, 3).unwrap();
+        assert_eq!(first_report.stop_reason, StopReason::ReachedInstructionCap);
+        let first_hits = emu.persistent_watch_hits();
+        assert_eq!(first_hits.len(), 2);
+        assert_eq!(first_hits[0].address, zero_slot);
+        assert!(first_hits[0].is_write);
+        assert_eq!(first_hits[0].value, Some(0));
+        assert_eq!(first_hits[0].registers.len(), REGISTER_SNAPSHOT_ORDER.len());
+        assert_eq!(first_hits[1].address, zero_slot);
+        assert!(!first_hits[1].is_write);
+        assert_eq!(first_hits[1].value, Some(0));
+        assert!(first_hits[0].global_instruction_index < first_hits[1].global_instruction_index);
+        assert_eq!(
+            register_value(&first_hits[0].registers, RegisterX86::R9),
+            Some(marker)
+        );
+        assert_eq!(
+            register_value(&first_hits[0].registers, RegisterX86::RSP),
+            Some(rsp)
+        );
+
+        let second_report = emu.resume(first_report.final_rip, 3).unwrap();
+        assert_eq!(second_report.stop_reason, StopReason::ReachedInstructionCap);
+        let all_hits = emu.persistent_watch_hits();
+        assert_eq!(all_hits.len(), 4);
+        assert_eq!(&all_hits[..2], &first_hits[..]);
+        assert_eq!(all_hits[2].address, value_slot);
+        assert!(all_hits[2].is_write);
+        assert_eq!(all_hits[2].value, Some(stored_value));
+        assert_eq!(all_hits[3].address, value_slot);
+        assert!(!all_hits[3].is_write);
+        assert_eq!(all_hits[3].value, Some(stored_value));
+        assert!(all_hits[1].global_instruction_index < all_hits[2].global_instruction_index);
+        assert!(all_hits
+            .iter()
+            .all(|hit| (CODE_BASE..CODE_BASE + shellcode.len() as u64).contains(&hit.rip)));
+
+        emu.clear_persistent_watch_hits();
+        assert!(emu.persistent_watch_hits().is_empty());
+    }
+
+    #[test]
+    fn persistent_watch_hit_cap_is_honored_across_resume_legs() {
+        let shellcode = persistent_watch_shellcode(0x99, 0x88);
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &shellcode).unwrap();
+        let rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        emu.configure_persistent_watch(&[(rsp - 16, rsp)], 3)
+            .unwrap();
+
+        let first_report = emu.resume(CODE_BASE, 3).unwrap();
+        assert_eq!(emu.persistent_watch_hits().len(), 2);
+
+        emu.resume(first_report.final_rip, 3).unwrap();
+        let hits = emu.persistent_watch_hits();
+        assert_eq!(hits.len(), 3);
+        assert!(hits[0].global_instruction_index < hits[1].global_instruction_index);
+        assert!(hits[1].global_instruction_index < hits[2].global_instruction_index);
+    }
+
+    #[test]
+    fn access_overlap_covers_interior_adjacent_empty_reversed_and_overflow_ranges() {
+        assert!(access_overlaps_ranges(0x1000, 8, &[(0x1004, 0x1005)]));
+        assert!(!access_overlaps_ranges(0x1000, 8, &[(0x0fff, 0x1000)]));
+        assert!(!access_overlaps_ranges(0x1000, 8, &[(0x1008, 0x1009)]));
+        assert!(!access_overlaps_ranges(0x1000, 8, &[(0x1004, 0x1004)]));
+        assert!(!access_overlaps_ranges(0x1000, 8, &[(0x1005, 0x1004)]));
+
+        assert!(access_overlaps_ranges(
+            u64::MAX - 3,
+            8,
+            &[(u64::MAX - 2, u64::MAX)]
+        ));
+        assert!(!access_overlaps_ranges(
+            u64::MAX - 3,
+            8,
+            &[(0x1000, 0x2000)]
+        ));
+    }
+
+    #[test]
+    fn persistent_watch_value_helpers_preserve_zero_through_eight_and_reject_wider() {
+        let value = 0x1122_3344_5566_7788_u64;
+        let mut emu = Emu::new().unwrap();
+        emu.write_mem(STACK_BASE, &value.to_le_bytes()).unwrap();
+
+        for size in 0..=8 {
+            let expected = if size == 0 {
+                0
+            } else if size == 8 {
+                value
+            } else {
+                value & ((1_u64 << (size * 8)) - 1)
+            };
+            assert_eq!(write_hook_value_opt(value, size), Some(expected));
+            assert_eq!(
+                read_hook_value_opt(&emu.uc, STACK_BASE, size),
+                Some(expected)
+            );
+        }
+
+        assert_eq!(write_hook_value_opt(value, 9), None);
+        assert_eq!(read_hook_value_opt(&emu.uc, STACK_BASE, 9), None);
+        assert_eq!(read_hook_value_opt(&emu.uc, 0xdead_beef, 8), None);
     }
 
     #[test]

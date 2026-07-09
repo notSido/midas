@@ -1219,6 +1219,7 @@ pub enum TrapStop {
     UnhandledApi { name: String, rva: u32 },
     UnexpectedFault { address: u64 },
     InstructionCap,
+    NullControlTransfer,
     Other(String),
 }
 
@@ -1338,6 +1339,12 @@ pub fn run_with_import_trap(
                 return Ok(TrapRun {
                     handled,
                     stop: TrapStop::InstructionCap,
+                });
+            }
+            StopReason::ReachedUntil if report.final_rip == 0 => {
+                return Ok(TrapRun {
+                    handled,
+                    stop: TrapStop::NullControlTransfer,
                 });
             }
             other => {
@@ -5501,6 +5508,26 @@ mod tests {
             ),
             image.entry_point_va() + 22
         );
+    }
+
+    #[test]
+    fn trap_reports_null_control_transfer_for_ret_to_zero() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+
+        let code = [
+            0x6a, 0x00, // push 0
+            0xc3, // ret
+        ];
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, Vec::<String>::new());
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
     }
 
     #[test]
