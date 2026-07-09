@@ -101,6 +101,15 @@ pub enum EmuError {
         source: uc_error,
     },
 
+    #[error("failed to inspect mapped memory regions: {0}")]
+    MemoryRegions(#[source] uc_error),
+
+    #[error("cannot write unmapped memory at 0x{addr:016x} ({size:#x} bytes)")]
+    WriteUnmapped { addr: u64, size: usize },
+
+    #[error("cannot write protected memory at 0x{addr:016x} ({size:#x} bytes)")]
+    WriteProt { addr: u64, size: usize },
+
     #[error("failed to write register {reg:?}: {source}")]
     WriteReg {
         reg: RegisterX86,
@@ -444,6 +453,38 @@ impl Emu {
     }
 
     pub(crate) fn write_mem(&mut self, addr: u64, bytes: &[u8]) -> Result<(), EmuError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let size = bytes.len();
+        let size_u64 = u64::try_from(size).map_err(|_| EmuError::CodeTooLarge)?;
+        let end = addr
+            .checked_add(size_u64 - 1)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: addr,
+                size: size_u64,
+            })?;
+        let regions = self.uc.mem_regions().map_err(EmuError::MemoryRegions)?;
+        let mut cursor = addr;
+        while cursor <= end {
+            let region = regions
+                .iter()
+                .find(|region| region.begin <= cursor && cursor <= region.end)
+                .ok_or(EmuError::WriteUnmapped { addr: cursor, size })?;
+            if region.perms & Prot::WRITE.0 == 0 {
+                return Err(EmuError::WriteProt { addr: cursor, size });
+            }
+            if region.end >= end {
+                break;
+            }
+            cursor = region
+                .end
+                .checked_add(1)
+                .ok_or(EmuError::AddressRangeOverflow {
+                    base: addr,
+                    size: size_u64,
+                })?;
+        }
         self.uc
             .mem_write(addr, bytes)
             .map_err(|source| EmuError::WriteMem {
@@ -916,10 +957,11 @@ mod tests {
     use crate::pe;
 
     use super::{
-        Emu, FaultKind, RegisterX86, StopReason, TraceEvent, PEB_BASE, PEB_IMAGEBASE_OFFSET,
-        RECENT_RIPS_CAP, STACK_BASE, STACK_SIZE, TEB_BASE, TEB_PEB_OFFSET, TEB_SELF_OFFSET,
-        TEB_STACKBASE_OFFSET,
+        map_region, Emu, EmuError, FaultKind, RegisterX86, StopReason, TraceEvent, PAGE_SIZE,
+        PEB_BASE, PEB_IMAGEBASE_OFFSET, RECENT_RIPS_CAP, STACK_BASE, STACK_SIZE, TEB_BASE,
+        TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_STACKBASE_OFFSET,
     };
+    use unicorn_engine::unicorn_const::Prot;
 
     const CODE_BASE: u64 = 0x0000_0000_0040_0000;
     const PE_OFFSET: usize = 0x80;
@@ -1059,6 +1101,96 @@ mod tests {
             emu.read_mem(initial_rsp - 8, 8).unwrap(),
             0xdead_beefu64.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn write_mem_writable_stack_roundtrip() {
+        let mut emu = Emu::new().unwrap();
+        let address = STACK_BASE + 0x100;
+        emu.write_mem(address, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(emu.read_mem(address, 4).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn write_mem_rejects_readonly_mapping() {
+        let mut emu = Emu::new().unwrap();
+        emu.map_readonly(CODE_BASE, &[0; 8]).unwrap();
+        assert!(matches!(
+            emu.write_mem(CODE_BASE, &[1]),
+            Err(EmuError::WriteProt { .. })
+        ));
+    }
+
+    #[test]
+    fn write_mem_rejects_unmapped_range() {
+        let mut emu = Emu::new().unwrap();
+        let address = 0x0000_0000_1234_5000;
+        assert!(matches!(
+            emu.write_mem(address, &[1]),
+            Err(EmuError::WriteUnmapped { .. })
+        ));
+    }
+
+    #[test]
+    fn write_mem_handles_adjacent_writable_regions() {
+        let mut emu = Emu::new().unwrap();
+        let base = 0x0000_0000_0800_0000;
+        map_region(&mut emu.uc, base, PAGE_SIZE, Prot::READ | Prot::WRITE).unwrap();
+        map_region(
+            &mut emu.uc,
+            base + PAGE_SIZE,
+            PAGE_SIZE,
+            Prot::READ | Prot::WRITE,
+        )
+        .unwrap();
+        let address = base + PAGE_SIZE - 2;
+        emu.write_mem(address, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(emu.read_mem(address, 4).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn write_mem_rejects_crossing_protected_range_without_partial_write() {
+        let mut emu = Emu::new().unwrap();
+        let base = 0x0000_0000_0900_0000;
+        map_region(&mut emu.uc, base, PAGE_SIZE, Prot::READ | Prot::WRITE).unwrap();
+        map_region(&mut emu.uc, base + PAGE_SIZE, PAGE_SIZE, Prot::READ).unwrap();
+        let address = base + PAGE_SIZE - 2;
+        assert!(matches!(
+            emu.write_mem(address, &[1, 2, 3, 4]),
+            Err(EmuError::WriteProt { .. })
+        ));
+        assert_eq!(emu.read_mem(address, 2).unwrap(), vec![0, 0]);
+    }
+
+    #[test]
+    fn write_mem_rejects_crossing_unmapped_gap_without_partial_write() {
+        let mut emu = Emu::new().unwrap();
+        let base = 0x0000_0000_0a00_0000;
+        map_region(&mut emu.uc, base, PAGE_SIZE, Prot::READ | Prot::WRITE).unwrap();
+        let address = base + PAGE_SIZE - 2;
+        emu.write_mem(address, &[0xaa, 0xbb]).unwrap();
+        assert!(matches!(
+            emu.write_mem(address, &[1, 2, 3, 4]),
+            Err(EmuError::WriteUnmapped { .. })
+        ));
+        assert_eq!(emu.read_mem(address, 2).unwrap(), vec![0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn write_mem_rejects_address_range_overflow() {
+        let mut emu = Emu::new().unwrap();
+        let base = u64::MAX - 1;
+        assert!(matches!(
+            emu.write_mem(base, &[1, 2]),
+            Err(EmuError::WriteUnmapped { addr, size: 2 }) if addr == base
+        ));
+        assert!(matches!(
+            emu.write_mem(base, &[1, 2, 3]),
+            Err(EmuError::AddressRangeOverflow {
+                base: value,
+                size: 3
+            }) if value == base
+        ));
     }
 
     #[test]

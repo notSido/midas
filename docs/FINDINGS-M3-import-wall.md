@@ -506,10 +506,10 @@ purely internal VM computation remains a multi-handler VM-reversal; the fix is u
 ## The upstream zero is a missing ntdll critical-section call
 
 The cheaper upstream correlation identified the exact missing resolution: the
-loader's ntdll hash selects `RtlInitializeCriticalSection`. The earlier synthetic
-`ntdll.dll` had an empty export table, so the VM propagated a null target into the
-handler slot documented above. This supersedes the earlier conclusion that fixing
-the wall necessarily required multi-handler VM reversal.
+bootstrap export walk selects `RtlInitializeCriticalSection` from ntdll. The
+earlier synthetic `ntdll.dll` had an empty export table, so the VM propagated a null
+target into the handler slot documented above. This supersedes the earlier
+conclusion that fixing the wall necessarily required multi-handler VM reversal.
 
 The production slice now gives `ntdll.dll` exactly the eight names observed during
 the initial bootstrap and implements the exercised effect. On x64 the API receives a
@@ -531,6 +531,28 @@ call 9 is `RtlInitializeCriticalSection`, and the run stops later at
 `ReachedUntil`. The two additional on-disk samples produce the same engineering
 result, but their missing version/config/provenance fields in `samples/SAMPLES.md`
 mean they are not yet formal milestone-acceptance evidence.
+
+Exact sample-1 output:
+
+```
+handled APIs:
+  001: GetModuleHandleA
+  002: LoadLibraryA
+  003: LoadLibraryA
+  004: LoadLibraryA
+  005: LoadLibraryA
+  006: LoadLibraryA
+  007: GetProcAddress
+  008: GetProcAddress
+  009: RtlInitializeCriticalSection
+  010: GetModuleHandleA
+  011: LoadLibraryA
+  012: GetModuleHandleA
+  013: LoadLibraryA
+  014: GetModuleHandleA
+  015: LoadLibraryA
+stop: ReachedUntil
+```
 
 ### New frontier
 
