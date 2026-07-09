@@ -30,11 +30,19 @@ rather than duplicating state that would go stale.
   self-report — your own `cargo test` / `cargo clippy` run is the verification.
   Invocation: `codex exec --sandbox workspace-write -C <repo> -` (prompt on stdin;
   `codex login status` must show logged in).
+- **Every PR gets two independent reviews before merge:** an **Opus** review
+  (max-rigor prompt) **and** a **GPT-5.5 at xhigh** review
+  (`codex exec -m gpt-5.5 -c model_reasoning_effort="xhigh" --sandbox read-only`),
+  run concurrently on the checked-out branch. Relay a side-by-side comparison and
+  address real findings (fix + re-verify). **The human merges PRs; the assistant
+  does not self-merge** — this holds for every PR, doc-only ones included.
 - **One slice per PR onto `main`.** Branch, implement, verify locally, open a PR.
-  CI (build, test, `clippy -D warnings`, no-hype gate) must be green before merge.
-- **The human merges PRs; the assistant does not self-merge.** For larger or
-  trickier slices, an Opus and/or GPT-5.5 (`codex exec -m gpt-5.5 -c
-  model_reasoning_effort=high`) code review before merge has been useful.
+  For **code** PRs, CI (build, test, `clippy -D warnings`, no-hype gate) must be
+  green before merge. **Doc-only** PRs skip the CI wait — after the two reviews
+  above, do a local no-hype check over the changed docs
+  (`grep -rnE '🎉|✅|SUCCESS|BREAKTHROUGH|MAJOR|FINALLY' <changed .md files> |
+  grep -vF '🎉|✅|SUCCESS|BREAKTHROUGH|MAJOR|FINALLY'` returns nothing) — then it
+  is ready for the human to merge.
 - **Anti-overfitting (important).** The *mechanism* must be sample-agnostic:
   detect at runtime, with zero hardcoded per-sample constants. Windows/API
   behaviour is implemented as *general* semantics and added ONLY when a sample
