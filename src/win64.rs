@@ -302,10 +302,15 @@ impl Win64Env {
         self.ensure_module(emu, "kernel32.dll", KERNEL32_EXPORTS)
     }
 
-    fn stub_export_at(&self, addr: u64) -> Option<(u64, String)> {
+    /// Reverse-map a faulting address to `(export name, module RVA)` across every
+    /// registered synthetic module. The RVA is `addr - module.base`, which
+    /// `stub_name` already proved fits in a `u32`, so it is returned directly
+    /// rather than recomputed by the caller.
+    fn stub_export_at(&self, addr: u64) -> Option<(String, u32)> {
         for module in self.synthetic_modules.values() {
             if let Some(name) = module.stub_name(addr) {
-                return Some((module.base, name.to_owned()));
+                let rva = (addr - module.base) as u32;
+                return Some((name.to_owned(), rva));
             }
         }
         None
@@ -438,18 +443,7 @@ pub fn run_with_import_trap(
             StopReason::MemoryFault(fault)
                 if matches!(fault.kind, FaultKind::FetchUnmapped | FaultKind::FetchProt) =>
             {
-                if let Some((module_base, name)) = env.stub_export_at(fault.address) {
-                    let rva =
-                        u32::try_from(fault.address.checked_sub(module_base).ok_or(
-                            EmuError::AddressRangeOverflow {
-                                base: module_base,
-                                size: fault.address,
-                            },
-                        )?)
-                        .map_err(|_| EmuError::AddressRangeOverflow {
-                            base: module_base,
-                            size: fault.address,
-                        })?;
+                if let Some((name, rva)) = env.stub_export_at(fault.address) {
                     if handled.len() >= max_calls {
                         return Ok(TrapRun {
                             handled,
@@ -750,6 +744,88 @@ mod tests {
         let export_dir = module.base + u64::from(export_dir_rva);
         assert_eq!(read_u32_emu(&emu, export_dir + 20), 0);
         assert_eq!(read_u32_emu(&emu, export_dir + 24), 0);
+
+        // With zero exports there is no stub region: map_into must not map one, so
+        // the address just past the image blob is unmapped.
+        assert_eq!(module.stub_region_size, 0);
+        assert!(emu
+            .read_mem(module.base + u64::from(module.stub_region_rva), 1)
+            .is_err());
+    }
+
+    #[test]
+    fn stub_export_at_disambiguates_multiple_modules() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        // Two distinct modules that share an export name, at distinct bases.
+        let base_a = env.module_base("mod_a.dll");
+        let base_b = env.module_base("mod_b.dll");
+        assert_ne!(base_a, base_b);
+        let mod_a = SyntheticModule::build(base_a, "mod_a.dll", &["Shared", "OnlyA"]);
+        let mod_b = SyntheticModule::build(base_b, "mod_b.dll", &["Shared", "OnlyB"]);
+        mod_a.map_into(&mut emu).unwrap();
+        mod_b.map_into(&mut emu).unwrap();
+        let a_shared = base_a + u64::from(*mod_a.exports.get("Shared").unwrap());
+        let b_shared = base_b + u64::from(*mod_b.exports.get("Shared").unwrap());
+        let b_only = base_b + u64::from(*mod_b.exports.get("OnlyB").unwrap());
+        env.synthetic_modules.insert("mod_a.dll".to_owned(), mod_a);
+        env.synthetic_modules.insert("mod_b.dll".to_owned(), mod_b);
+
+        // Each shared-name stub reverse-maps to ITS OWN module (rva = addr - that base).
+        assert_eq!(
+            env.stub_export_at(a_shared),
+            Some(("Shared".to_owned(), (a_shared - base_a) as u32))
+        );
+        assert_eq!(
+            env.stub_export_at(b_shared),
+            Some(("Shared".to_owned(), (b_shared - base_b) as u32))
+        );
+        assert_eq!(
+            env.stub_export_at(b_only),
+            Some(("OnlyB".to_owned(), (b_only - base_b) as u32))
+        );
+        // An address outside every module's stub region resolves to nothing.
+        assert_eq!(env.stub_export_at(base_a - 1), None);
+    }
+
+    #[test]
+    fn loadlibrarya_mixed_case_reuses_mapped_module() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut data = vec![0u8; 0x1000];
+        data[..b"SomeLib.DLL\0".len()].copy_from_slice(b"SomeLib.DLL\0");
+        data[0x80..0x80 + b"somelib.dll\0".len()].copy_from_slice(b"somelib.dll\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let first = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        let ApiOutcome::Handled { ret: base, .. } = first else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+        assert_ne!(base, 0);
+
+        // A differently-cased spelling must reuse the cached module: a second
+        // mem_map at the same base would return Err (and panic the unwrap).
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA) + 0x80)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let second = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        assert_eq!(
+            second,
+            ApiOutcome::Handled {
+                name: "LoadLibraryA".to_owned(),
+                ret: base
+            }
+        );
+        assert_eq!(env.synthetic_modules.len(), 1);
     }
 
     #[test]
