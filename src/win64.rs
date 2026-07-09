@@ -30,14 +30,35 @@ pub fn read_import_by_name(
     }
 
     let name_address = image_base.checked_add(rva_after_hint)?;
-    let bytes = emu.read_mem(name_address, max_len).ok()?;
-    let nul_index = bytes.iter().position(|byte| *byte == 0)?;
-    let name_bytes = &bytes[..nul_index];
-    if name_bytes.is_empty() || !name_bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)) {
-        return None;
+    // Scan one byte at a time rather than reading the whole `max_len` window at
+    // once: the image address range is not fully mapped (map_image leaves gaps
+    // between sections), so a bulk read of a name that sits near a section's end
+    // would cross into unmapped memory and fail, rejecting a valid import. A
+    // byte-wise scan resolves the name as long as it and its NUL terminator lie
+    // in mapped memory.
+    let mut name_bytes = Vec::new();
+    for offset in 0..max_len {
+        let byte_address = name_address.checked_add(offset as u64)?;
+        let byte = match emu.read_mem(byte_address, 1) {
+            Ok(bytes) => bytes[0],
+            // Ran into unmapped memory before a NUL terminator: not a valid,
+            // fully-mapped import-by-name.
+            Err(_) => return None,
+        };
+        if byte == 0 {
+            if name_bytes.is_empty() {
+                return None;
+            }
+            return String::from_utf8(name_bytes).ok();
+        }
+        if !(0x21..=0x7e).contains(&byte) {
+            return None;
+        }
+        name_bytes.push(byte);
     }
 
-    String::from_utf8(name_bytes.to_vec()).ok()
+    // No NUL terminator within the cap.
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +131,13 @@ fn read_arg_ascii_z(emu: &Emu, reg: RegisterX86) -> Result<String, EmuError> {
 
     let mut value = String::new();
     for offset in 0..IMPORT_NAME_CAP {
-        let byte = emu.read_mem(address + offset as u64, 1)?[0];
+        let byte_address = address
+            .checked_add(offset as u64)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: address,
+                size: offset as u64,
+            })?;
+        let byte = emu.read_mem(byte_address, 1)?[0];
         if byte == 0 {
             break;
         }
@@ -127,8 +154,11 @@ fn api_return(emu: &mut Emu) -> Result<(), EmuError> {
     let mut ret_bytes = [0u8; 8];
     ret_bytes.copy_from_slice(&bytes);
     let ret = u64::from_le_bytes(ret_bytes);
+    let new_rsp = rsp
+        .checked_add(8)
+        .ok_or(EmuError::AddressRangeOverflow { base: rsp, size: 8 })?;
     emu.write_reg(RegisterX86::RIP, ret)?;
-    emu.write_reg(RegisterX86::RSP, rsp + 8)
+    emu.write_reg(RegisterX86::RSP, new_rsp)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +190,16 @@ pub fn run_with_import_trap(
         let report = emu.resume(rip, per_run_cap)?;
         match report.stop_reason {
             StopReason::MemoryFault(fault) if fault.kind == FaultKind::FetchUnmapped => {
+                // Classification heuristic: a fetch-fault at an in-image RVA whose
+                // target parses as a printable IMAGE_IMPORT_BY_NAME is treated as
+                // an unbound-import call. This does not yet cross-check the fault
+                // RVA against the PE import descriptors, so a wild jump to an RVA
+                // that coincidentally holds a printable string could be
+                // misclassified. The blast radius is small: an unrecognized name
+                // dispatches to Unhandled and stops cleanly, so only a coincidental
+                // exact match of an implemented API name would misdispatch.
+                // Cross-validating against the parsed import table is planned for
+                // the module-image slice.
                 let rva = fault.address;
                 if rva >= u64::from(image.size_of_image) {
                     return Ok(TrapRun {
@@ -300,6 +340,36 @@ mod tests {
         assert_eq!(
             read_import_by_name(&emu, IMAGE_BASE, IMAGE_SIZE, IMPORT_RVA + 0x80),
             None
+        );
+    }
+
+    #[test]
+    fn read_import_by_name_reads_name_near_mapping_boundary() {
+        // Map a single page at IMPORT_RVA; the page immediately after it is
+        // unmapped. Place hint + "GetModuleHandleA\0" so the name terminates
+        // inside the page but the name start + IMPORT_NAME_CAP window extends
+        // past the page into unmapped memory. A bulk `read_mem(.., 256)` would
+        // fail and reject a valid import; the byte-wise scan resolves it.
+        let mut emu = Emu::new().unwrap();
+        let mut page = vec![0u8; 0x1000];
+        let name = b"GetModuleHandleA\0";
+        let name_offset = 0x1000 - name.len() - 2; // hint (2 bytes) then name
+        page[name_offset + 2..name_offset + 2 + name.len()].copy_from_slice(name);
+        emu.map_code(IMAGE_BASE + u64::from(IMPORT_RVA), &page)
+            .unwrap();
+
+        // Confirm the window really would cross into the unmapped next page.
+        let name_address = IMAGE_BASE + u64::from(IMPORT_RVA) + name_offset as u64 + 2;
+        assert!(emu.read_mem(name_address, IMPORT_NAME_CAP).is_err());
+
+        assert_eq!(
+            read_import_by_name(
+                &emu,
+                IMAGE_BASE,
+                IMAGE_SIZE,
+                IMPORT_RVA + name_offset as u32
+            ),
+            Some("GetModuleHandleA".to_owned())
         );
     }
 
