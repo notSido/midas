@@ -39,7 +39,8 @@ to a specific null slot in a handler-pointer table embedded in the unpacked
 written by the loader's **own VM**: the unpacker fills it with non-zero bytes, then a
 VM "store" handler (`.themida+0xaccf7`, `mov [r9],rbx` with `rbx=0`) copies a `0` out
 of a VM-context slot into it. So the null originates *inside the VM's data flow* (an
-upstream context value that is `0` in our environment), not a missing native write.
+upstream context value that is `0` in our environment), not a missing native write to
+that handler slot.
 Pinning that origin needs a multi-handler VM-reversal; the fix is still unknown and
 is to be scoped with the human before building.
 `examples/trap_postmortem.rs` reproduces the wall; `docs/FINDINGS-M3-import-wall.md`

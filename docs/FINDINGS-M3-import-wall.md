@@ -381,9 +381,9 @@ r13 = [0x14005bd08]     = 0x0                    (the null handler -> ret target
 *unpacked* `.themida`; its neighbours hold valid handlers (e.g. `[0x5bd18] =
 0x1400dc1f7`), but this entry is `0`. It is **not written during the traced final
 leg** (the post-`GetProcAddress` segment) — it is already 0 when the interpreter
-reaches it; whether it is written earlier in the run is candidate cause 3 below (an
-un-run whole-run write trace). The 24 preceding VM ops read valid handlers from the
-analogous slot (e.g. `[…] = 0x140053xxx`); only this 25th op reads a null.
+reaches it; it is written (then zeroed) earlier in the run — see the whole-run write
+trace section below. The 24 preceding VM ops read valid handlers from the analogous
+slot (e.g. `[…] = 0x140053xxx`); only this 25th op reads a null.
 
 **Open question (the crux for the fix).** Why is `[0x14005bd08]` zero — i.e. what
 was supposed to populate this handler slot before the interpreter reached it. It is
@@ -400,22 +400,24 @@ before the stall. Candidate causes, to be tested in order:
 2. A prior step gated on an environment detail we don't model (e.g. `SetLastError`/
    `GetLastError` touching `TEB->LastErrorValue` at `TEB+0x68`) never runs, leaving
    the slot 0. Test: implement those APIs' side-effects and/or the missing field.
-3. The slot is populated by a self-decryption/relocation pass over `.themida` that
-   our run hasn't triggered. Test: trace writes to `0x14005bd08` across the *whole*
-   run (not just the final leg) to find its intended writer.
+3. The slot is populated/managed by a pass over `.themida` we hadn't traced. Test:
+   trace writes to `0x14005bd08` across the *whole* run. **Done** — see the next
+   section: the slot is written by the loader's own VM, which *nulls* it rather than
+   populating it, so the origin is an upstream VM value (candidates 1/2 still open).
 
 The fix direction is **ambiguous** and should be chosen with the human before
 building: it may be a small API-semantics gap (2) or a larger change to how resolved
 addresses are modelled (1). `examples/trap_postmortem.rs` reproduces the wall; the
 per-sample capture used a one-shot instruction cap at the final `0x5caf1`.
 
-## Whole-run write trace: the loader's own VM stores the 0 (candidate 3 resolved)
+## Whole-run write trace: the loader's own VM *nulls* the slot (candidate 3 writer found)
 
 Method: a temporary persistent write-watch on the 8-byte slot `0x14005bd08` that
 survives the trap's per-API `resume` legs (a `MEM_WRITE` hook filtered to the slot,
 recording writer RIP + value). Sample 1.
 
-The slot **is** written during the run — 9 writes, and the last one wins:
+The slot **is** written during the run — 9 writes (four byte-`mov [rdi],al`, four
+byte-`rep movsb`, then one 8-byte store), and the last one wins:
 
 - During initial decompression the unpacker fills the slot with **non-zero** bytes
   (`.themida+0x30b074` `mov [rdi],al` → `64 96 1e 73 …`, then `.themida+0x30b144`
@@ -437,7 +439,7 @@ i.e. the interpreter copied a `0` **out of its own context** into the handler sl
 The null therefore originates *inside the VM's data flow* — an upstream VM-context
 value that is `0` in our environment — not a missing native write and not (directly)
 the arena-address shape or a `TEB` field. Candidate causes 1 and 2 are not ruled in
-by this; the true origin is whatever produced that upstream `0`.
+or out by this; the true origin is whatever produced that upstream `0`.
 
 ### Consequence
 
