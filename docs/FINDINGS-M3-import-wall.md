@@ -451,3 +451,33 @@ with the human before building. A promising cheaper cut first: correlate the ups
 VM-context slot (`rbp + *(rbp+0x123)`) with the two values the environment most
 plausibly perturbs at this point — the `GetProcAddress` results for
 `SetLastError`/`GetLastError` — by watching writes to that slot across the run.
+
+## Candidate 1 (arena-address shape) is refuted — the proc-address value is inert
+
+Experiment (per the Opus/GPT-5.5 decision packet): temporarily change `resolve_proc`
+so a dynamically-resolved export returns a stub **inside the requesting module's image**
+(`kernel32_base + rva`, `rva < SizeOfImage`) instead of the out-of-image arena at
+`PROC_STUB_BASE = 0x7ffe_0000_0000`, then re-run all three samples.
+
+Result: `GetProcAddress(kernel32, "SetLastError"/"GetLastError")` now returns
+`0x7fff0000_1090` / `0x7fff0000_10a0` (inside the synthetic kernel32 image) instead of
+`0x7ffe0000_0000` / `_0010` — a change of ~4 GiB in the returned value. Yet the run is
+**byte-identical**: the same 8 bootstrap APIs, then the same `ReachedUntil` (`ret` to 0),
+on all three samples. So the resolved proc-address **value/shape is inert** on the VM
+data-flow path that produces the upstream `0`.
+
+**Candidate 1 is therefore refuted** — the null does not derive from the arena address
+being out-of-image. (This overturns the leading pre-experiment hypothesis.) The
+experimental change was reverted: it is not the fix, and returning in-image addresses is
+not currently justified by any observation (a later wall may still need it, per the
+"richer module provider" fallback, but nothing exercises that now).
+
+### What this leaves
+
+The upstream `0` at `rbp + *(rbp+0x123)` (see the write-trace section) is independent of
+the two `GetProcAddress` results. That points at candidate 2 (a missing environment
+side-effect/field the VM reads) or a purely-internal VM computation. The next step is the
+one both reviewers named as the fallback: trace **writes to the upstream source slot**
+`rbp + *(rbp+0x123)` across the whole run to find what produces its `0` — is it derived
+from an unmodelled read (e.g. `TEB+0x68`, another structure) or only from further VM
+context slots. That is a multi-handler VM-reversal and its fix is still unknown.
