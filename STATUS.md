@@ -16,14 +16,18 @@ here. If a capability is not listed, it is not implemented.
 | Execution-observation harness: run to an instruction cap and report the stop reason (cap / memory fault with kind+address / invalid instruction), plus final RIP, instruction count, a bounded recent-RIP ring buffer, and a register snapshot | `cargo test emu::run_observed` green: synthetic shellcode faults on a deliberately-unmapped read (reported as ReadUnmapped at the encoded address) and an infinite loop stops exactly at the cap. | M3 (groundwork) |
 | Windowed detailed trace (`run_traced`) and full-run memory-range watch (`run_watching`): interleaved instruction + memory-access events over a window, and access logging within given address ranges over a full run | `cargo test emu::run_traced`/`run_watching` green: a synthetic write/read window is captured with correct values; a watched stack range records the expected read and write with plausible RIP. | M3 (groundwork) |
 | Minimal TEB/PEB population: TEB `NtTib.Self`, `StackBase`/`StackLimit`, `TEB.ProcessEnvironmentBlock`, `PEB.BeingDebugged`, and `PEB.ImageBaseAddress` (set on image map) — justified by both samples reading `gs:[0x30]` | `cargo test emu::` green: `new()` populates the TEB self-pointer, PEB pointer, and stack bounds (GS_BASE = TEB_BASE); `map_image` sets `PEB.ImageBaseAddress`. | M3 (groundwork) |
+| Import-call trap + `GetModuleHandleA`: run the loader, and on a fetch-fault at an unbound IAT thunk (an image RVA landing on a valid `IMAGE_IMPORT_BY_NAME`), resolve the function name from the PE's import table, emulate the API, set `RAX`, return to the on-stack address, and continue (`emu::Emu::resume` enables the fault-and-resume loop) | `cargo test win64::` green: import-by-name resolution from a synthetic image; `GetModuleHandleA` returns a non-null base and performs the return; end-to-end trap handles a synthetic unbound-import call. | M3 |
 
 ## Not yet implemented
 
-The Win64 environment itself is **not** implemented: no PEB/TEB module list, no
-export/`GetProcAddress` resolution, and no API stubs. `docs/FINDINGS-M3-import-wall.md`
-records the reproducible finding (both samples reach an unresolved-kernel32 import
-wall ~26–28M instructions in) that justifies and scopes that work; building it is
-the remainder of M3.
+The Win64 environment is only **partially** implemented: the import-call trap and
+`GetModuleHandleA` exist (above), but there is no synthetic module image with an
+export directory, no `GetProcAddress`/export resolution, and no further API stubs.
+`docs/FINDINGS-M3-import-wall.md` records the reproducible chain: both samples now
+pass the first import wall via the trap (`GetModuleHandleA("kernel32.dll")`) and
+then read `kernel32_base + 0x3c` (`e_lfanew`), i.e. they parse the returned
+module's PE export table manually — so the next requirement is a synthetic
+kernel32 image with an export directory. That, and OEP/trace/VM/IR, remain.
 
 Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
 detection, and the IR lifter. None has a passing acceptance artifact yet.
