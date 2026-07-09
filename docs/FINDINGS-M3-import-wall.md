@@ -340,3 +340,70 @@ pointer read from a structure we have not populated (a PEB/TEB field, a callback
 or a value the loader expected an API such as `SetLastError`/`GetLastError` to have
 side-effected). Handle that specific gap (observation-driven), then re-validate on all
 samples.
+
+## The NULL branch is a Themida VM handler-pointer that reads back 0 (diagnosed)
+
+Reproduce with `cargo run --release --example trap_postmortem -- samples/<sample>.exe`.
+After the 8 bootstrap APIs the loader runs a small Themida **bytecode interpreter**
+(not more import calls). The post-mortem shows the last executed instruction is a
+context-restore **trampoline** `pop r8 … pop rax ; popf ; ret 0` (sample 1:
+`.themida+0x5cb64`–`0x5cb7c`) and the value the `ret` consumes is `0` — so `RIP`
+becomes 0 (`ReachedUntil`). Confirmed identical on **all three** samples (each stops
+with `ret` target `0`); the exact `.themida` RVAs below are per-instance evidence,
+traced on sample 1.
+
+**The dispatch mechanism (traced).** The interpreter keeps its state in a
+stack-resident context `rbp`; `[rbp+0xB2]` is a bytecode cursor advanced each
+iteration by a *signed* delta (`.themida+0x55344`: `[rbp+0xB2] += movsxd [cursor+2]`).
+For each op the trampoline prologue computes the **handler/return target** as a
+double-dereference through the context:
+
+```
+r13 = *( *(rbp + *(cursor+6)) )      ; .themida+0x5cae0 .. 0x5caf5
+```
+
+and writes it into the frame slot the final `ret` consumes (`mov [rsi], r13`,
+`.themida+0x5cb1a`). So the ret target is `r13`, **not** an `RVA+base` sum (an
+earlier reading of the trampoline was wrong; the `*(cursor)[u32] + *(rbp+0xBB)`
+value is a *different* saved register, `r14`, which stayed valid = `0x1401ca356`).
+
+**Where the 0 comes from (sample 1, capped-run capture at the final `0x5caf1`).**
+The chain resolves to a genuine null in a handler-pointer table:
+
+```
+rbp                     = 0x14006f9e0            (VM context, in .themida)
+r13 = rbp + *(cursor+6) = 0x14006fa68            (*(cursor+6) = 0x88)
+[r13]                   = 0x14005bd08            (pointer into a .themida table)
+[[r13]] = [0x14005bd08] = 0x0                    (the null handler -> ret target)
+```
+
+`.themida+0x5bd08` is one 8-byte slot in a handler-pointer table embedded in the
+*unpacked* `.themida`; its neighbours hold valid handlers (e.g. `[0x5bd18] =
+0x1400dc1f7`), but this entry is `0`. It is **never written during the run** — it is
+already 0 when the interpreter reaches it. The 24 preceding VM ops read valid
+handlers from the analogous slot (e.g. `[…] = 0x140053xxx`); only this 25th op reads
+a null.
+
+**Open question (the crux for the fix).** Why is `[0x14005bd08]` zero — i.e. what
+was supposed to populate this handler slot before the interpreter reached it. It is
+resolved *right after* `GetProcAddress` returned `SetLastError`/`GetLastError`
+(arena stubs `0x7ffe0000_0000`/`_0010`), and those resolved stubs are **never called**
+before the stall. Candidate causes, to be tested in order:
+
+1. The slot is filled by a VM op whose input is a value we mis-modelled — e.g. the
+   arena address our `GetProcAddress` returns is not shaped as the loader expects
+   (a real function pointer inside a DLL image), so a later `handler = f(resolved)`
+   step produces 0 or is skipped. Test: make resolved addresses point inside the
+   synthetic module image (or give the loaded DLLs real-looking export/stub layout)
+   and see whether the slot becomes non-zero.
+2. A prior step gated on an environment detail we don't model (e.g. `SetLastError`/
+   `GetLastError` touching `TEB->LastErrorValue` at `TEB+0x68`) never runs, leaving
+   the slot 0. Test: implement those APIs' side-effects and/or the missing field.
+3. The slot is populated by a self-decryption/relocation pass over `.themida` that
+   our run hasn't triggered. Test: trace writes to `0x14005bd08` across the *whole*
+   run (not just the final leg) to find its intended writer.
+
+The fix direction is **ambiguous** and should be chosen with the human before
+building: it may be a small API-semantics gap (2) or a larger change to how resolved
+addresses are modelled (1). `examples/trap_postmortem.rs` reproduces the wall; the
+per-sample capture used a one-shot instruction cap at the final `0x5caf1`.
