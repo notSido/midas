@@ -37,6 +37,7 @@ pub struct SyntheticModule {
     pub base: u64,
     pub image: Vec<u8>,
     stub_region_rva: u32,
+    stub_region_size: u32,
     exports: BTreeMap<String, u32>,
     stub_rva_to_name: BTreeMap<u32, String>,
 }
@@ -65,11 +66,9 @@ impl SyntheticModule {
 
         let export_area_size = cursor - export_dir_rva;
         let stub_region_rva = align_up_u32(cursor, PAGE_SIZE);
+        let stub_region_size = align_up_u32(export_count as u32 * SYNTHETIC_STUB_STRIDE, PAGE_SIZE);
         let image_len = stub_region_rva as usize;
-        let size_of_image = align_up_u32(
-            stub_region_rva + export_count as u32 * SYNTHETIC_STUB_STRIDE,
-            PAGE_SIZE,
-        );
+        let size_of_image = stub_region_rva + stub_region_size;
         let mut image = vec![0u8; image_len];
 
         write_bytes(&mut image, 0, b"MZ");
@@ -120,13 +119,24 @@ impl SyntheticModule {
             base,
             image,
             stub_region_rva,
+            stub_region_size,
             exports: export_map,
             stub_rva_to_name,
         }
     }
 
     fn map_into(&self, emu: &mut Emu) -> Result<(), EmuError> {
-        emu.map_code(self.base, &self.image)
+        emu.map_readonly(self.base, &self.image)?;
+
+        let stub_region_addr = self
+            .base
+            .checked_add(u64::from(self.stub_region_rva))
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: self.base,
+                size: u64::from(self.stub_region_rva),
+            })?;
+        let stub_region = vec![0u8; self.stub_region_size as usize];
+        emu.map_readonly(stub_region_addr, &stub_region)
     }
 
     fn stub_name(&self, addr: u64) -> Option<&str> {
@@ -378,7 +388,9 @@ pub fn run_with_import_trap(
     loop {
         let report = emu.resume(rip, per_run_cap)?;
         match report.stop_reason {
-            StopReason::MemoryFault(fault) if fault.kind == FaultKind::FetchUnmapped => {
+            StopReason::MemoryFault(fault)
+                if matches!(fault.kind, FaultKind::FetchUnmapped | FaultKind::FetchProt) =>
+            {
                 if let Some((name, rva)) = env.kernel32.as_ref().and_then(|kernel32| {
                     let name = kernel32.stub_name(fault.address)?.to_owned();
                     let rva = u32::try_from(fault.address.checked_sub(kernel32.base)?).ok()?;
@@ -404,6 +416,15 @@ pub fn run_with_import_trap(
                             });
                         }
                     }
+                }
+
+                if fault.kind != FaultKind::FetchUnmapped {
+                    return Ok(TrapRun {
+                        handled,
+                        stop: TrapStop::UnexpectedFault {
+                            address: fault.address,
+                        },
+                    });
                 }
 
                 // Classification heuristic: a fetch-fault at an in-image RVA whose
@@ -655,6 +676,18 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_kernel32_stub_region_is_readable() {
+        let mut emu = Emu::new().unwrap();
+        let module =
+            SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", KERNEL32_EXPORTS);
+        let stub_rva = *module.exports.get("VirtualAlloc").unwrap();
+        let stub_addr = module.base + u64::from(stub_rva);
+        module.map_into(&mut emu).unwrap();
+
+        assert_eq!(emu.read_mem(stub_addr, 16).unwrap(), vec![0u8; 16]);
+    }
+
+    #[test]
     fn getmodulehandlea_maps_kernel32_and_exposes_e_lfanew() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -859,6 +892,8 @@ mod tests {
             SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", KERNEL32_EXPORTS);
         let virtual_alloc_rva = *module.exports.get("VirtualAlloc").unwrap();
         let virtual_alloc_addr = module.base + u64::from(virtual_alloc_rva);
+        module.map_into(&mut emu).unwrap();
+        env.kernel32 = Some(module);
 
         let mut code = Vec::new();
         code.extend_from_slice(&[0x48, 0xb9]);
@@ -887,5 +922,38 @@ mod tests {
                 rva: virtual_alloc_rva
             }
         );
+    }
+
+    #[test]
+    fn trap_reports_unexpected_fault_for_non_stub_fetchprot() {
+        // A FetchProt fault that is NOT a synthetic export stub must stop as
+        // UnexpectedFault and must NOT be run through the in-image
+        // import-by-name fallback (that path is FetchUnmapped-only). Here the
+        // call target is a readable-but-non-executable page that is not part of
+        // any mapped module, so calling it faults FetchProt at a non-stub
+        // address.
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+
+        // Non-stub, non-executable target: a read-only page distinct from the
+        // entry code, with no kernel32 module mapped (env.kernel32 stays None).
+        let target = IMAGE_BASE + u64::from(DATA_RVA);
+        emu.map_readonly(target, &[0u8; 0x10]).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&target.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0]);
+        code.extend_from_slice(&[0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert!(env.kernel32.is_none());
+        assert_eq!(result.handled, Vec::<String>::new());
+        assert_eq!(result.stop, TrapStop::UnexpectedFault { address: target });
     }
 }
