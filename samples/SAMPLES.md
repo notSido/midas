@@ -15,6 +15,20 @@ Two distinct samples are required to satisfy the "sample-agnostic, zero
 hardcoded per-sample constants" acceptance criterion. **Two samples are now
 present on disk** (both gitignored).
 
+## Support assets
+
+### `kernel32.dll` (export-name source for the synthetic win64 module)
+
+| Field | Value |
+|---|---|
+| Filename | `samples/kernel32.dll` (gitignored) |
+| SHA-256 | `8fce3e55da4919423661e89d53434797b0c2f6b488a4ae0317285b57633326b0` |
+| Size | 683,288 bytes |
+| Format | **PE32 (32-bit, i386)** DLL — note the bitness |
+| Version | 10.0.26100.7920 (Windows 11 24H2), FileVersion/ProductVersion from the resource |
+| Provenance | Copied from a 64-bit Windows 11 notebook's `C:\Windows\System32\kernel32.dll`; the file is 32-bit because a 32-bit tool triggered **WOW64 file-system redirection** (System32 → SysWOW64). |
+| Use in midas | **Export *name* list only** (1664 names; bitness-independent). midas never maps or executes this binary. The names seed the synthetic PE32+ kernel32 export table so the loader's manual export walk resolves any function it looks up. A 64-bit copy is not required for this purpose. |
+
 ### 1. `test_target_protected.exe`
 
 | Field | Value |

@@ -34,7 +34,7 @@ fn run() -> Result<(), String> {
     emu.map_image(&image, &bytes, image.image_base)
         .map_err(|error| format!("failed to map image: {error}"))?;
 
-    let mut env = Win64Env::new();
+    let mut env = Win64Env::new(image.image_base);
     let result = run_with_import_trap(
         &mut env,
         &mut emu,
