@@ -324,9 +324,11 @@ return `0` for now.
   stubs (`0x7ffe00000000`, `0x7ffe00000010`). Identical on all three samples.
 - The loader then transfers control to address `0` (`ReachedUntil`, i.e. `RIP` became 0),
   WITHOUT first calling either resolved stub (a call to `0x7ffe...` would have
-  FetchProt-trapped and dispatched by name). So the NULL branch is a **new, distinct
-  wall**, not a consequence of `GetProcAddress` resolution: after saving/restoring error
-  state the loader calls or jumps through a pointer that is `0` in our environment.
+  FetchProt-trapped and dispatched by name). So the NULL transfer is distinct from a
+  call to either returned stub: after saving/restoring error state the loader calls or
+  jumps through a different pointer that is `0` in our environment. This observation
+  alone does not show whether the resolved address values influenced the VM computation
+  that produced that pointer.
 - Captured CLI artifact, not a committed test. The `GetProcAddress` resolution
   behaviour (named lookup, built-in-stub reuse, ordinal → 0, and trap dispatch of a
   resolved stub) is covered by committed `cargo test` cases.
@@ -396,8 +398,10 @@ before the stall. Candidate causes, to be tested in order:
    (a real function pointer inside a DLL image), so a later `handler = f(resolved)`
    step produces 0 or is skipped. Test: make resolved addresses point inside the
    synthetic module image (or give the loaded DLLs real-looking export/stub layout)
-   and see whether the slot becomes non-zero. **(REFUTED — see the "Candidate 1 …
-   refuted" section below: in-image addresses left the run byte-identical.)**
+   and see whether the slot becomes non-zero. **A first in-image implementation did
+   not advance the observable `run_loader` frontier, but no comparative VM/source-slot
+   trace was captured; see "In-image proc stubs do not advance the observable frontier"
+   below. Candidate 1 remains causally unproven.**
 2. A prior step gated on an environment detail we don't model (e.g. `SetLastError`/
    `GetLastError` touching `TEB->LastErrorValue` at `TEB+0x68`) never runs, leaving
    the slot 0. Test: implement those APIs' side-effects and/or the missing field.
@@ -408,7 +412,8 @@ before the stall. Candidate causes, to be tested in order:
 
 The fix direction is **ambiguous** and should be chosen with the human before
 building: it may be a small API-semantics gap (2) or a larger change to how resolved
-addresses are modelled (1). `examples/trap_postmortem.rs` reproduces the wall; the
+addresses are modelled (1), although the first in-image-stub implementation did not
+advance the observable frontier. `examples/trap_postmortem.rs` reproduces the wall; the
 per-sample capture used a one-shot instruction cap at the final `0x5caf1`.
 
 ## Whole-run write trace: the loader's own VM *nulls* the slot (candidate 3 writer found)
@@ -440,9 +445,10 @@ i.e. the interpreter copied a `0` **out of its own context** into the handler sl
 The null therefore originates *inside the VM's data flow* — an upstream VM-context
 value that is `0` in our environment — not a missing native write and not (directly)
 the arena-address shape or a `TEB` field. Candidate causes 1 and 2 are not ruled in
-or out by this; the true origin is whatever produced that upstream `0`. (Update:
-candidate 1 is subsequently **refuted** — see the "Candidate 1 … refuted" section
-below.)
+or out by this; the true origin is whatever produced that upstream `0`. A subsequent
+in-image-stub experiment did not advance the `run_loader` outcome frontier, but did not
+trace this upstream slot under both configurations, so candidate 1 remains causally
+unproven.
 
 ### Consequence
 
@@ -455,34 +461,44 @@ VM-context slot (`rbp + *(rbp+0x123)`) with the two values the environment most
 plausibly perturbs at this point — the `GetProcAddress` results for
 `SetLastError`/`GetLastError` — by watching writes to that slot across the run.
 
-## Candidate 1 (arena-address shape) is refuted — the proc-address value is inert
+## In-image proc stubs do not advance the observable frontier
 
 Experiment (reproduce by making the change and re-running `run_loader` on all three
 samples): temporarily change `resolve_proc`
 so a dynamically-resolved export returns a stub **inside the requesting module's image**
 (`kernel32_base + rva`, `rva < SizeOfImage`) instead of the out-of-image arena at
-`PROC_STUB_BASE = 0x7ffe_0000_0000`, then re-run all three samples.
+`PROC_STUB_BASE = 0x7ffe_0000_0000`, then re-run all three samples. The experimental
+implementation also reserved 4096 per-module dynamic-stub slots, enlarging the mapped
+stub region and the synthetic module's `SizeOfImage`; it therefore tested that bundled
+in-image provider change, not an isolated address-value substitution.
 
 Result: `GetProcAddress(kernel32, "SetLastError"/"GetLastError")` now returns
 `0x7fff0000_1090` / `0x7fff0000_10a0` (inside the synthetic kernel32 image) instead of
-`0x7ffe0000_0000` / `_0010` — a change of ~4 GiB in the returned value. Yet the run is
-**byte-identical**: the same 8 bootstrap APIs, then the same `ReachedUntil` (`ret` to 0),
-on all three samples. So the resolved proc-address **value/shape is inert** on the VM
-data-flow path that produces the upstream `0`.
+`0x7ffe0000_0000` / `_0010` — a change of ~4 GiB in the returned value. On all three
+samples, `run_loader` prints the same observable summary: the same 8 bootstrap APIs,
+then the same `ReachedUntil` (`ret` to 0). This implementation therefore **does not
+advance the observable `run_loader` frontier**.
 
-**Candidate 1 is therefore refuted** — the null does not derive from the arena address
-being out-of-image. (This overturns the leading pre-experiment hypothesis.) The
-experimental change was reverted: it is not the fix, and returning in-image addresses is
-not currently justified by any observation (a later wall may still need it, per the
-"richer module provider" fallback, but nothing exercises that now).
+That summary is intentionally not described as a byte-identical run: `run_loader`
+reports only handled API names and the final stop, the returned addresses necessarily
+differ, and no comparative instruction/memory trace or upstream-source-slot watch was
+captured. The observation therefore does **not** prove that the internal VM path was
+unchanged or that the proc-address value is causally independent of the upstream `0`.
+It rules out this bundled in-image implementation as a direct fix, not candidate 1 as
+a cause. The experimental source change was reverted because it did not advance the
+observable frontier.
 
 ### What this leaves
 
-The upstream `0` at `rbp + *(rbp+0x123)` (see the write-trace section) is, on the path to
-this wall, independent of the two `GetProcAddress` results (an n=2 test: arena vs in-image
-addresses both yield the identical run). That points at candidate 2 (a missing environment
-side-effect/field the VM reads) or a purely-internal VM computation. The next step is the
-fallback identified earlier: trace **writes to the upstream source slot**
-`rbp + *(rbp+0x123)` across the whole run to find what produces its `0` — is it derived
-from an unmodelled read (e.g. `TEB+0x68`, another structure) or only from further VM
-context slots. That is a multi-handler VM-reversal and its fix is still unknown.
+The next decisive test is either a truly isolated address-only A/B (holding the module
+layout and `SizeOfImage` fixed) or an operand/data-dependency trace of **writes to the
+upstream source slot** `rbp + *(rbp+0x123)` under the arena and bundled in-image
+configurations, including the writer sequence leading to the final handler-slot store.
+Reaching the same source slot through the same VM path and storing the same `0` would
+strengthen the negative evidence but would not alone prove independence: candidate 1
+can be ruled out for this wall only if the trace shows that the returned addresses do
+not feed the producer chain (or the isolated substitution preserves the relevant
+state). If the configurations diverge internally despite the same final summary, the
+trace identifies the missing causal edge. Following that producer chain far enough to
+distinguish an unmodelled read (for example `TEB+0x68` or another structure) from a
+purely internal VM computation remains a multi-handler VM-reversal; the fix is unknown.
