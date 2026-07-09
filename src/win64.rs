@@ -319,16 +319,33 @@ impl Win64Env {
             .and_then(|module| module.export_stub(name))
     }
 
+    fn is_synthetic_module_base(&self, module_base: u64) -> bool {
+        self.synthetic_modules
+            .values()
+            .any(|module| module.base == module_base)
+    }
+
     fn resolve_proc(
         &mut self,
         emu: &mut Emu,
         module_base: u64,
         name: &str,
     ) -> Result<u64, EmuError> {
+        // GetProcAddress resolves only against a loaded (registered synthetic)
+        // module. A bogus/zero handle (e.g. from a failed LoadLibraryA) fails with
+        // NULL rather than fabricating an export, matching Windows semantics.
+        if !self.is_synthetic_module_base(module_base) {
+            return Ok(0);
+        }
+
         if let Some(addr) = self.export_stub_by_base(module_base, name) {
             return Ok(addr);
         }
 
+        // The dynamic arena is keyed by name only (not by (module, name)): our trap
+        // dispatches purely by name, so two modules resolving the same name share a
+        // stub. This differs from real Windows (distinct addresses per module) but is
+        // exact for by-name API emulation.
         if let Some(addr) = self.proc_stubs.get(name) {
             return Ok(*addr);
         }
@@ -1371,6 +1388,88 @@ mod tests {
             }
         );
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn getprocaddress_invalid_module_and_empty_name_return_zero() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+
+        let mut data = vec![0u8; 0x1000];
+        data[..b"SetLastError\0".len()].copy_from_slice(b"SetLastError\0");
+        // An empty (NUL-first) name at +0x80.
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+
+        // Bogus module handle (never a registered synthetic module): NULL result,
+        // and no arena stub minted.
+        emu.write_reg(RegisterX86::RCX, 0).unwrap();
+        emu.write_reg(RegisterX86::RDX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let bogus = dispatch(&mut env, &mut emu, "GetProcAddress").unwrap();
+        assert_eq!(
+            bogus,
+            ApiOutcome::Handled {
+                name: "GetProcAddress".to_owned(),
+                ret: 0
+            }
+        );
+        assert!(env.proc_stubs.is_empty());
+
+        // Valid module but an empty name string: NULL result.
+        emu.write_reg(RegisterX86::RCX, kernel32_base).unwrap();
+        emu.write_reg(RegisterX86::RDX, IMAGE_BASE + u64::from(DATA_RVA) + 0x80)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let empty = dispatch(&mut env, &mut emu, "GetProcAddress").unwrap();
+        assert_eq!(
+            empty,
+            ApiOutcome::Handled {
+                name: "GetProcAddress".to_owned(),
+                ret: 0
+            }
+        );
+        assert!(env.proc_stubs.is_empty());
+    }
+
+    #[test]
+    fn resolve_proc_distinct_names_span_pages_and_stay_mapped() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+
+        // Resolve enough distinct names to cross the first arena page (256 slots of
+        // 16 bytes = 0x1000): each gets a distinct, mapped, readable stub.
+        let count = 260u32;
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..count {
+            let name = format!("Api{index:04}");
+            let addr = env
+                .resolve_proc(&mut emu, kernel32_base, &name)
+                .unwrap();
+            assert_ne!(addr, 0);
+            assert!((PROC_STUB_BASE..FAKE_MODULE_BASE_START).contains(&addr));
+            assert!(emu.read_mem(addr, PROC_STUB_STRIDE as usize).is_ok());
+            assert!(seen.insert(addr), "arena stub addresses must be distinct");
+            // Reverse-map resolves back to the same name.
+            assert_eq!(
+                env.proc_stub_at(addr).map(|(name, _)| name),
+                Some(name.clone())
+            );
+        }
+        assert_eq!(seen.len(), count as usize);
+        // A stub in the second arena page (index 256+) is mapped and readable.
+        let second_page = env
+            .resolve_proc(&mut emu, kernel32_base, "Api0256")
+            .unwrap();
+        assert!(second_page >= PROC_STUB_BASE + u64::from(PAGE_SIZE));
     }
 
     #[test]

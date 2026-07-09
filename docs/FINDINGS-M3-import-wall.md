@@ -296,14 +296,14 @@ export-call trap reverse-maps a faulting stub across all registered modules.
 ### What this justifies building next
 
 Implement `GetProcAddress(hModule, lpProcName)`. In this synthetic world it must return
-a **callable stub address** for the requested `(module, name)` — i.e. resolve the name
-against the given module's synthetic export table and, because the loaded DLLs currently
-have empty tables, dynamically add a stub for the requested name to that module on
-demand so the returned address later faults and dispatches by name. `lpProcName` (in
-`RDX`) may be a name pointer or an ordinal (low bits, high bits zero); handle both.
-Implementing this both unblocks the loader and reveals — via the requested names — which
-functions it resolves from user32/advapi32/ntdll/shell32/shlwapi, each then observed and
-handled one at a time, re-validated on all samples.
+a **callable stub address** for the requested name — resolving against the given
+module's synthetic export table when the name is present, and otherwise minting a stub
+on demand (implemented as a per-env by-name arena; see the next section) so the returned
+address later faults and dispatches by name. `lpProcName` (in `RDX`) may be a name
+pointer or an ordinal (low bits, high bits zero). Implementing this both unblocks the
+loader and reveals — via the requested names — which functions it resolves from
+user32/advapi32/ntdll/shell32/shlwapi, each then observed and handled one at a time,
+re-validated on all samples.
 
 ## GetProcAddress resolves SetLastError/GetLastError, then the loader branches through NULL (all three samples)
 
@@ -311,9 +311,11 @@ Reproduce with `cargo run --release --example run_loader -- samples/<sample>.exe
 `GetProcAddress(hModule, lpProcName)` reads `hModule` from `RCX` and `lpProcName` from
 `RDX`; for a name pointer it resolves a **callable** stub — reusing the module's
 built-in synthetic export stub when the name is in its table, otherwise minting a
-read-only non-executable stub from a per-`Win64Env` dynamic arena (base `0x0000_7ffe_
-0000_0000`, deduplicated by name). A call to a resolved arena stub faults and dispatches
-by name via the trap. Ordinal requests (`lpProcName < 0x10000`) return `0` for now.
+read-only non-executable stub from a per-`Win64Env` dynamic arena (base
+`0x0000_7ffe_0000_0000`, deduplicated by name). Resolution requires a valid loaded
+module handle — a bogus/zero `hModule` returns `0`. A call to a resolved arena stub
+faults and dispatches by name via the trap. Ordinal requests (`lpProcName < 0x10000`)
+return `0` for now.
 
 - The loader's first two `GetProcAddress` calls are `GetProcAddress(kernel32,
   "SetLastError")` and `GetProcAddress(kernel32, "GetLastError")` — both **name**
