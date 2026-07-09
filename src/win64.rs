@@ -128,6 +128,10 @@ impl SyntheticModule {
     fn map_into(&self, emu: &mut Emu) -> Result<(), EmuError> {
         emu.map_readonly(self.base, &self.image)?;
 
+        if self.stub_region_size == 0 {
+            return Ok(());
+        }
+
         let stub_region_addr = self
             .base
             .checked_add(u64::from(self.stub_region_rva))
@@ -247,7 +251,7 @@ pub struct Win64Env {
     image_base: u64,
     modules: BTreeMap<String, u64>,
     next_base: u64,
-    kernel32: Option<SyntheticModule>,
+    synthetic_modules: BTreeMap<String, SyntheticModule>,
 }
 
 impl Win64Env {
@@ -256,7 +260,7 @@ impl Win64Env {
             image_base,
             modules: BTreeMap::new(),
             next_base: FAKE_MODULE_BASE_START,
-            kernel32: None,
+            synthetic_modules: BTreeMap::new(),
         }
     }
 
@@ -276,16 +280,40 @@ impl Win64Env {
         self.modules.get(&name.to_ascii_lowercase()).copied()
     }
 
-    fn ensure_kernel32(&mut self, emu: &mut Emu) -> Result<u64, EmuError> {
-        if let Some(kernel32) = &self.kernel32 {
-            return Ok(kernel32.base);
+    fn ensure_module(
+        &mut self,
+        emu: &mut Emu,
+        name: &str,
+        exports: &[&str],
+    ) -> Result<u64, EmuError> {
+        let key = name.to_ascii_lowercase();
+        if let Some(module) = self.synthetic_modules.get(&key) {
+            return Ok(module.base);
         }
 
-        let base = self.module_base("kernel32.dll");
-        let kernel32 = SyntheticModule::build(base, "kernel32.dll", KERNEL32_EXPORTS);
-        kernel32.map_into(emu)?;
-        self.kernel32 = Some(kernel32);
+        let base = self.module_base(name);
+        let module = SyntheticModule::build(base, name, exports);
+        module.map_into(emu)?;
+        self.synthetic_modules.insert(key, module);
         Ok(base)
+    }
+
+    fn ensure_kernel32(&mut self, emu: &mut Emu) -> Result<u64, EmuError> {
+        self.ensure_module(emu, "kernel32.dll", KERNEL32_EXPORTS)
+    }
+
+    /// Reverse-map a faulting address to `(export name, module RVA)` across every
+    /// registered synthetic module. The RVA is `addr - module.base`, which
+    /// `stub_name` already proved fits in a `u32`, so it is returned directly
+    /// rather than recomputed by the caller.
+    fn stub_export_at(&self, addr: u64) -> Option<(String, u32)> {
+        for module in self.synthetic_modules.values() {
+            if let Some(name) = module.stub_name(addr) {
+                let rva = (addr - module.base) as u32;
+                return Some((name.to_owned(), rva));
+            }
+        }
+        None
     }
 }
 
@@ -330,7 +358,7 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             } else if module_name.eq_ignore_ascii_case("kernel32.dll") {
                 env.ensure_kernel32(emu)?
             } else {
-                env.module_base(&module_name)
+                env.ensure_module(emu, &module_name, &[])?
             };
             emu.write_reg(RegisterX86::RAX, base)?;
             api_return(emu)?;
@@ -415,11 +443,7 @@ pub fn run_with_import_trap(
             StopReason::MemoryFault(fault)
                 if matches!(fault.kind, FaultKind::FetchUnmapped | FaultKind::FetchProt) =>
             {
-                if let Some((name, rva)) = env.kernel32.as_ref().and_then(|kernel32| {
-                    let name = kernel32.stub_name(fault.address)?.to_owned();
-                    let rva = u32::try_from(fault.address.checked_sub(kernel32.base)?).ok()?;
-                    Some((name, rva))
-                }) {
+                if let Some((name, rva)) = env.stub_export_at(fault.address) {
                     if handled.len() >= max_calls {
                         return Ok(TrapRun {
                             handled,
@@ -700,6 +724,111 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_module_empty_exports_is_parseable() {
+        let mut emu = Emu::new().unwrap();
+        let module = SyntheticModule::build(FAKE_MODULE_BASE_START, "somelib.dll", &[]);
+        module.map_into(&mut emu).unwrap();
+
+        assert_eq!(emu.read_mem(module.base, 2).unwrap(), b"MZ");
+        let pe_offset = read_u32_emu(&emu, module.base + 0x3c);
+        assert_eq!(pe_offset, 0x80);
+        assert_eq!(
+            emu.read_mem(module.base + u64::from(pe_offset), 4).unwrap(),
+            b"PE\0\0"
+        );
+
+        let optional_header = module.base + u64::from(pe_offset) + 24;
+        let export_dir_rva = read_u32_emu(&emu, optional_header + 112);
+        assert_eq!(export_dir_rva, SYNTHETIC_EXPORT_DIR_RVA);
+
+        let export_dir = module.base + u64::from(export_dir_rva);
+        assert_eq!(read_u32_emu(&emu, export_dir + 20), 0);
+        assert_eq!(read_u32_emu(&emu, export_dir + 24), 0);
+
+        // With zero exports there is no stub region: map_into must not map one, so
+        // the address just past the image blob is unmapped.
+        assert_eq!(module.stub_region_size, 0);
+        assert!(emu
+            .read_mem(module.base + u64::from(module.stub_region_rva), 1)
+            .is_err());
+    }
+
+    #[test]
+    fn stub_export_at_disambiguates_multiple_modules() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        // Two distinct modules that share an export name, at distinct bases.
+        let base_a = env.module_base("mod_a.dll");
+        let base_b = env.module_base("mod_b.dll");
+        assert_ne!(base_a, base_b);
+        let mod_a = SyntheticModule::build(base_a, "mod_a.dll", &["Shared", "OnlyA"]);
+        let mod_b = SyntheticModule::build(base_b, "mod_b.dll", &["Shared", "OnlyB"]);
+        mod_a.map_into(&mut emu).unwrap();
+        mod_b.map_into(&mut emu).unwrap();
+        let a_shared = base_a + u64::from(*mod_a.exports.get("Shared").unwrap());
+        let b_shared = base_b + u64::from(*mod_b.exports.get("Shared").unwrap());
+        let b_only = base_b + u64::from(*mod_b.exports.get("OnlyB").unwrap());
+        env.synthetic_modules.insert("mod_a.dll".to_owned(), mod_a);
+        env.synthetic_modules.insert("mod_b.dll".to_owned(), mod_b);
+
+        // Each shared-name stub reverse-maps to ITS OWN module (rva = addr - that base).
+        assert_eq!(
+            env.stub_export_at(a_shared),
+            Some(("Shared".to_owned(), (a_shared - base_a) as u32))
+        );
+        assert_eq!(
+            env.stub_export_at(b_shared),
+            Some(("Shared".to_owned(), (b_shared - base_b) as u32))
+        );
+        assert_eq!(
+            env.stub_export_at(b_only),
+            Some(("OnlyB".to_owned(), (b_only - base_b) as u32))
+        );
+        // An address outside every module's stub region resolves to nothing.
+        assert_eq!(env.stub_export_at(base_a - 1), None);
+    }
+
+    #[test]
+    fn loadlibrarya_mixed_case_reuses_mapped_module() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut data = vec![0u8; 0x1000];
+        data[..b"SomeLib.DLL\0".len()].copy_from_slice(b"SomeLib.DLL\0");
+        data[0x80..0x80 + b"somelib.dll\0".len()].copy_from_slice(b"somelib.dll\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let first = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        let ApiOutcome::Handled { ret: base, .. } = first else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+        assert_ne!(base, 0);
+
+        // A differently-cased spelling must reuse the cached module: a second
+        // mem_map at the same base would return Err (and panic the unwrap).
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA) + 0x80)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+        let second = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        assert_eq!(
+            second,
+            ApiOutcome::Handled {
+                name: "LoadLibraryA".to_owned(),
+                ret: base
+            }
+        );
+        assert_eq!(env.synthetic_modules.len(), 1);
+    }
+
+    #[test]
     fn synthetic_kernel32_stub_region_is_readable() {
         let mut emu = Emu::new().unwrap();
         let module =
@@ -899,6 +1028,32 @@ mod tests {
     }
 
     #[test]
+    fn loadlibrarya_maps_parseable_module_for_new_dll() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut data = vec![0u8; 0x1000];
+        data[..b"somelib.dll\0".len()].copy_from_slice(b"somelib.dll\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+
+        let outcome = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        let ApiOutcome::Handled { ret, .. } = outcome else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+
+        assert_ne!(ret, 0);
+        assert_eq!(read_u32_emu(&emu, ret + 0x3c), 0x80);
+    }
+
+    #[test]
     fn loadlibrarya_null_returns_zero() {
         // LoadLibrary(NULL) is a failed load (returns 0), NOT the image base —
         // that is GetModuleHandle(NULL)'s semantics, not LoadLibrary's.
@@ -1045,12 +1200,11 @@ mod tests {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
-        let module =
-            SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", KERNEL32_EXPORTS);
+        env.ensure_module(&mut emu, "kernel32.dll", KERNEL32_EXPORTS)
+            .unwrap();
+        let module = env.synthetic_modules.get("kernel32.dll").unwrap();
         let virtual_alloc_rva = *module.exports.get("VirtualAlloc").unwrap();
         let virtual_alloc_addr = module.base + u64::from(virtual_alloc_rva);
-        module.map_into(&mut emu).unwrap();
-        env.kernel32 = Some(module);
 
         let mut code = Vec::new();
         code.extend_from_slice(&[0x48, 0xb9]);
@@ -1094,7 +1248,8 @@ mod tests {
         let load_library_rva = *module.exports.get("LoadLibraryA").unwrap();
         let load_library_addr = module.base + u64::from(load_library_rva);
         module.map_into(&mut emu).unwrap();
-        env.kernel32 = Some(module);
+        env.synthetic_modules
+            .insert("kernel32.dll".to_owned(), module);
 
         let mut data = vec![0u8; 0x1000];
         data[..b"user32.dll\0".len()].copy_from_slice(b"user32.dll\0");
@@ -1136,7 +1291,7 @@ mod tests {
         let mut env = Win64Env::new(IMAGE_BASE);
 
         // Non-stub, non-executable target: a read-only page distinct from the
-        // entry code, with no kernel32 module mapped (env.kernel32 stays None).
+        // entry code, with no synthetic module mapped.
         let target = IMAGE_BASE + u64::from(DATA_RVA);
         emu.map_readonly(target, &[0u8; 0x10]).unwrap();
 
@@ -1151,7 +1306,7 @@ mod tests {
             run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
                 .unwrap();
 
-        assert!(env.kernel32.is_none());
+        assert!(env.synthetic_modules.is_empty());
         assert_eq!(result.handled, Vec::<String>::new());
         assert_eq!(result.stop, TrapStop::UnexpectedFault { address: target });
     }
