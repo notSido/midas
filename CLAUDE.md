@@ -68,7 +68,8 @@ When asked to continue/resume midas, do this first — do not assume prior state
    following the working agreement above. For large or ambiguous next steps,
    confirm the plan with the human before building.
 
-**Current milestone:** M3, the `win64` layer — in progress. The exact frontier is
-always in `STATUS.md` and the last section of `docs/FINDINGS-M3-import-wall.md`.
-The layer order and later milestones (OEP, trace, VM detect, IR lifter) are in
-`docs/CHARTER.md`.
+**Current state and frontier:** do not rely on this file for the current
+milestone — read `STATUS.md` (verified capabilities) and the newest
+`docs/FINDINGS-*.md` (the active frontier and methodology); those are
+authoritative and always current. The milestone list and bottom-up layer order
+(pe → emu → win64 → oep → trace → vm/detect → ir) are in `docs/CHARTER.md`.
