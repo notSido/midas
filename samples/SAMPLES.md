@@ -61,3 +61,30 @@ present on disk** (both gitignored).
 > are direct observations of the deposited file. The Themida version/config and
 > source provenance are placeholders until the author records them; do not treat
 > them as known.
+
+### 3. `test_target3_protected.exe`
+
+| Field | Value |
+|---|---|
+| Filename | `samples/test_target3_protected.exe` |
+| SHA-256 | `6c70e14c40fde8661b0b0121161deb1afd9edffd682f1f30f2b5916895f79585` |
+| Size | 1,911,748 bytes |
+| Format | PE32+ (PE64) console executable, x86-64, 23 sections; entry RVA `0x33d058` (from midas / probe) |
+| Protector | Themida (provenance to be supplied by the sample author) |
+| Themida version | *to be supplied by author* |
+| Config | *to be supplied by author* |
+| Provenance | Third distinct sample, deposited on disk 2026-07-09. Themida version/config, source program, and pre-protection hash are **not yet recorded** — to be supplied by the author. SHA-256, size, and format were computed directly from the on-disk binary. |
+
+> Same caveat as sample 2: only the hash/size/format and midas-observed header
+> values are verified; the Themida version/config/source are placeholders.
+
+## Cross-sample generality (observed)
+
+The M3 finding chain reproduces **identically on all three samples** with no code
+changes (see `docs/FINDINGS-M3-import-wall.md`): each self-decrypts (~26–28M
+instructions), hits the same unbound-IAT wall (`GetModuleHandleA` at import RVA
+`0x4d00d`, `RCX` → `"kernel32.dll"`), and after the import-call trap + synthetic
+kernel32 proceeds through the export walk to resolve `LoadLibraryA` and read its
+bytes. This is the sample-agnostic behaviour the charter requires; per-instance
+values (entry RVA, instruction counts, string pointers) differ, the mechanism
+does not.
