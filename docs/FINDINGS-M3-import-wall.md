@@ -304,3 +304,37 @@ demand so the returned address later faults and dispatches by name. `lpProcName`
 Implementing this both unblocks the loader and reveals — via the requested names — which
 functions it resolves from user32/advapi32/ntdll/shell32/shlwapi, each then observed and
 handled one at a time, re-validated on all samples.
+
+## GetProcAddress resolves SetLastError/GetLastError, then the loader branches through NULL (all three samples)
+
+Reproduce with `cargo run --release --example run_loader -- samples/<sample>.exe`.
+`GetProcAddress(hModule, lpProcName)` reads `hModule` from `RCX` and `lpProcName` from
+`RDX`; for a name pointer it resolves a **callable** stub — reusing the module's
+built-in synthetic export stub when the name is in its table, otherwise minting a
+read-only non-executable stub from a per-`Win64Env` dynamic arena (base `0x0000_7ffe_
+0000_0000`, deduplicated by name). A call to a resolved arena stub faults and dispatches
+by name via the trap. Ordinal requests (`lpProcName < 0x10000`) return `0` for now.
+
+- The loader's first two `GetProcAddress` calls are `GetProcAddress(kernel32,
+  "SetLastError")` and `GetProcAddress(kernel32, "GetLastError")` — both **name**
+  lookups against kernel32 (`hModule` = the kernel32 synthetic base), for functions NOT
+  in the seeded export list, so both take the dynamic-arena path and return non-null
+  stubs (`0x7ffe00000000`, `0x7ffe00000010`). Identical on all three samples.
+- The loader then transfers control to address `0` (`ReachedUntil`, i.e. `RIP` became 0),
+  WITHOUT first calling either resolved stub (a call to `0x7ffe...` would have
+  FetchProt-trapped and dispatched by name). So the NULL branch is a **new, distinct
+  wall**, not a consequence of `GetProcAddress` resolution: after saving/restoring error
+  state the loader calls or jumps through a pointer that is `0` in our environment.
+- Captured CLI artifact, not a committed test. The `GetProcAddress` resolution
+  behaviour (named lookup, built-in-stub reuse, ordinal → 0, and trap dispatch of a
+  resolved stub) is covered by committed `cargo test` cases.
+
+### What this justifies building next
+
+Diagnose the NULL branch before implementing anything further: trace the last
+instructions before `RIP` reaches `0` (reuse `run_observed`/`trace_resolution`) to find
+the transfer site and which pointer the loader branches through — e.g. a function
+pointer read from a structure we have not populated (a PEB/TEB field, a callback table,
+or a value the loader expected an API such as `SetLastError`/`GetLastError` to have
+side-effected). Handle that specific gap (observation-driven), then re-validate on all
+samples.
