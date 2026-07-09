@@ -43,7 +43,8 @@ upstream context value that is `0` in our environment), not a missing native wri
 that handler slot. An experiment (return `GetProcAddress` stubs *inside* the module
 image instead of the out-of-image arena) changed the returned addresses by ~4 GiB yet
 left the run byte-identical on all three samples — so the resolved proc-address
-value/shape is **inert** and **candidate 1 (arena-address shape) is refuted**; that
+value/shape is **inert on the path to this wall** and **candidate 1 (arena-address
+shape) is refuted** for it; that
 experimental change was reverted. Pinning the upstream `0`'s origin needs a
 multi-handler VM-reversal (trace writes to `rbp + *(rbp+0x123)`); the fix is still
 unknown and is to be scoped with the human before building.

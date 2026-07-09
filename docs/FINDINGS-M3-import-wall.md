@@ -396,7 +396,8 @@ before the stall. Candidate causes, to be tested in order:
    (a real function pointer inside a DLL image), so a later `handler = f(resolved)`
    step produces 0 or is skipped. Test: make resolved addresses point inside the
    synthetic module image (or give the loaded DLLs real-looking export/stub layout)
-   and see whether the slot becomes non-zero.
+   and see whether the slot becomes non-zero. **(REFUTED — see the "Candidate 1 …
+   refuted" section below: in-image addresses left the run byte-identical.)**
 2. A prior step gated on an environment detail we don't model (e.g. `SetLastError`/
    `GetLastError` touching `TEB->LastErrorValue` at `TEB+0x68`) never runs, leaving
    the slot 0. Test: implement those APIs' side-effects and/or the missing field.
@@ -439,7 +440,9 @@ i.e. the interpreter copied a `0` **out of its own context** into the handler sl
 The null therefore originates *inside the VM's data flow* — an upstream VM-context
 value that is `0` in our environment — not a missing native write and not (directly)
 the arena-address shape or a `TEB` field. Candidate causes 1 and 2 are not ruled in
-or out by this; the true origin is whatever produced that upstream `0`.
+or out by this; the true origin is whatever produced that upstream `0`. (Update:
+candidate 1 is subsequently **refuted** — see the "Candidate 1 … refuted" section
+below.)
 
 ### Consequence
 
@@ -454,7 +457,8 @@ plausibly perturbs at this point — the `GetProcAddress` results for
 
 ## Candidate 1 (arena-address shape) is refuted — the proc-address value is inert
 
-Experiment (per the Opus/GPT-5.5 decision packet): temporarily change `resolve_proc`
+Experiment (reproduce by making the change and re-running `run_loader` on all three
+samples): temporarily change `resolve_proc`
 so a dynamically-resolved export returns a stub **inside the requesting module's image**
 (`kernel32_base + rva`, `rva < SizeOfImage`) instead of the out-of-image arena at
 `PROC_STUB_BASE = 0x7ffe_0000_0000`, then re-run all three samples.
@@ -474,10 +478,11 @@ not currently justified by any observation (a later wall may still need it, per 
 
 ### What this leaves
 
-The upstream `0` at `rbp + *(rbp+0x123)` (see the write-trace section) is independent of
-the two `GetProcAddress` results. That points at candidate 2 (a missing environment
+The upstream `0` at `rbp + *(rbp+0x123)` (see the write-trace section) is, on the path to
+this wall, independent of the two `GetProcAddress` results (an n=2 test: arena vs in-image
+addresses both yield the identical run). That points at candidate 2 (a missing environment
 side-effect/field the VM reads) or a purely-internal VM computation. The next step is the
-one both reviewers named as the fallback: trace **writes to the upstream source slot**
+fallback identified earlier: trace **writes to the upstream source slot**
 `rbp + *(rbp+0x123)` across the whole run to find what produces its `0` — is it derived
 from an unmodelled read (e.g. `TEB+0x68`, another structure) or only from further VM
 context slots. That is a multi-handler VM-reversal and its fix is still unknown.
