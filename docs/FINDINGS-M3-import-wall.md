@@ -273,3 +273,34 @@ directory — reusing the existing `SyntheticModule` builder, seeded with each D
 export **names**. Then the loader's `base+0x3c` header parse succeeds and it proceeds
 to walk that module's exports, revealing the next resolution/API step (observed, then
 implemented, one at a time, re-validated on all samples).
+
+## Parseable loaded modules move the frontier to GetProcAddress (all three samples)
+
+Reproduce with `cargo run --release --example run_loader -- samples/<sample>.exe`.
+`Win64Env` now keeps a registry of synthetic modules; `LoadLibraryA` maps a parseable
+PE for every loaded DLL — kernel32 with its seeded export names, every other DLL with
+an **empty** export table (we do not yet know which functions the loader resolves from
+those DLLs; the DLL names are read from guest memory, so nothing is hardcoded). The
+export-call trap reverse-maps a faulting stub across all registered modules.
+
+- With the five loaded DLLs now parseable, the loader gets past the `user32_base+0x3c`
+  read and the header/export-directory parse, and advances to resolving and **calling**
+  `GetProcAddress` from kernel32 (kernel32 stub `rva=0x1030` = slot 3 in the name-sorted
+  export table). Identical on all three samples. So the loader's bootstrap is the
+  classic `GetModuleHandle`/`LoadLibrary` → resolve `GetProcAddress` → resolve
+  everything else pattern.
+- Captured CLI artifact, not a committed test (long, sample-dependent). The parseable
+  empty-export module and the `LoadLibraryA`-maps-a-parseable-module capabilities are
+  covered by committed `cargo test` cases.
+
+### What this justifies building next
+
+Implement `GetProcAddress(hModule, lpProcName)`. In this synthetic world it must return
+a **callable stub address** for the requested `(module, name)` — i.e. resolve the name
+against the given module's synthetic export table and, because the loaded DLLs currently
+have empty tables, dynamically add a stub for the requested name to that module on
+demand so the returned address later faults and dispatches by name. `lpProcName` (in
+`RDX`) may be a name pointer or an ordinal (low bits, high bits zero); handle both.
+Implementing this both unblocks the loader and reveals — via the requested names — which
+functions it resolves from user32/advapi32/ntdll/shell32/shlwapi, each then observed and
+handled one at a time, re-validated on all samples.
