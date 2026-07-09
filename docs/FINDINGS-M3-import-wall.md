@@ -115,24 +115,68 @@ cargo run --release --example watch_peb_teb    -- samples/<sample>.exe <fault_co
   `[rsp+8] = 0x1ad55d + image_base` (the return address, relocated). The `ret`
   then "calls" `0x4d00d`. `RCX` holds `"kernel32.dll"`, i.e. this is the loader's
   **bootstrap `GetModuleHandle`/`LoadLibrary("kernel32.dll")`** call.
-- **Populating the TEB self-pointer does not move the wall.** After writing
-  `NtTib.Self = TEB_BASE`, `StackBase/StackLimit`, and `TEB.ProcessEnvironmentBlock
-  = PEB_BASE`, the sample still faults at `0x4d00d` at the identical instruction
-  count. So the `gs:[0x30]` reads tolerate their value (consistent with an
-  anti-debug / pointer-encode use), and the wall is specifically the unresolved
-  API bootstrap — not a missing TEB field. The TEB population is retained as
-  correct environment modeling (both samples read `gs:[0x30]`), not as a fix for
-  the wall.
+- **`gs:[0x30]` is NOT a step toward the PEB (tested).** After populating the TEB
+  (`NtTib.Self = TEB_BASE`, `StackBase/StackLimit`, `TEB.ProcessEnvironmentBlock =
+  PEB_BASE`) and re-running the watch, the loader still reads **only** `gs:[0x30]`
+  (32 reads), never `TEB+0x60` and never the PEB, and faults at the identical
+  `0x4d00d` at the identical instruction count (26,519,612 for sample 1). Had the
+  loader used the TEB self-pointer to reach the PEB (`[TEB.Self+0x60]`), a
+  now-populated `TEB+0x60` would have let it read `PEB_BASE` and diverge; the
+  byte-identical path rules that out. So `gs:[0x30]` is used for something else
+  (pointer-decode / self-reference / anti-debug), and the wall is specifically the
+  unresolved import call. The TEB population is retained as correct environment
+  modeling (both samples read `gs:[0x30]`), not as a fix for the wall.
 
-### Consequence for the design (still partly open)
+### The placeholder is an unbound IAT thunk (proven, both samples)
 
-Because resolution is not `PEB->Ldr`-based, a byte-accurate fake kernel32 export
-directory is *not* the lever. The lever is the **placeholder call itself**: the
-loader transfers control to an unresolved placeholder address with the DLL name
-in `RCX`. A candidate design is to treat a control-transfer to an unmapped
-placeholder as an **API-call trap** — identify the intended API, emulate its
-effect, set `RAX`, and resume at the on-stack return address. The **open
-sub-question** is how to identify *which* API each placeholder denotes (the DLL
-is in `RCX`, but the function selector — name string, ordinal, or hash, and where
-it lives relative to the call site/table) is **not yet determined** and must be
-traced before the trap handler is designed. This is the next investigation.
+The value the loader calls is a **standard unbound IAT thunk**, not a
+Themida-specific token. The fault address `0x4d00d`, read as an image RVA, lands
+in the `.idata` section on a normal `IMAGE_IMPORT_BY_NAME`:
+
+```
+image RVA 0x4d00d  (section .idata):  00 00 "GetModuleHandleA\0"
+                                      ^hint ^function name
+```
+
+so `0x4d00d` is the RVA of the import-by-name entry for **`GetModuleHandleA`**,
+and the IAT/INT thunk arrays in `.idata` (e.g. at RVA `0x4d080`) hold that RVA.
+On real Windows the OS loader overwrites each thunk with the resolved absolute
+function address before the entry point runs; midas maps the file as-is, so the
+thunk still holds the unbound `IMAGE_IMPORT_BY_NAME` RVA and the loader calls it
+directly. Verified identical on both samples (RVA `0x4d00d` → `"GetModuleHandleA"`
+in each); `RCX` = `"kernel32.dll"`, so the first call is
+`GetModuleHandleA("kernel32.dll")`.
+
+This **confirms** the charter appendix hypothesis ("IAT holds original
+Import-Name-Table string pointers, not resolved addresses") and resolves the
+earlier open sub-question: the API is identified by the PE's **own import table**,
+not a Themida hash/selector.
+
+### Design consequence (decided)
+
+Handle the call as an **import-call trap** driven by the standard PE import table:
+run until a fetch-unmapped fault; if the fault address read as an image RVA lands
+on a valid `IMAGE_IMPORT_BY_NAME`, resolve the function name from the PE, emulate
+that API, set `RAX`, pop the on-stack return address into RIP, and continue. This
+is sample-agnostic (it reads whatever the PE imports) and mirrors the OS loader's
+IAT binding. APIs are implemented one at a time, each as the loader is observed to
+call it, each tested and validated on both samples.
+
+## Progression past the first wall (both samples)
+
+Reproduce with `cargo run --release --example run_loader -- samples/<sample>.exe`.
+With the import-call trap and a `GetModuleHandleA` stub that returns a non-null
+module base:
+
+- Both samples handle exactly one API so far — `GetModuleHandleA("kernel32.dll")`
+  — and then advance to a **new** fault: a `ReadUnmapped` at
+  `kernel32_base + 0x3c`. `0x3c` is `e_lfanew` in the DOS header, so the loader
+  **parses the PE header of the module handle it was given** and walks its export
+  table itself (manual `GetProcAddress`).
+- Consequence: `GetModuleHandleA` must return a base at which a **parseable
+  synthetic kernel32 image** exists — a minimal PE (DOS stub + NT headers) with an
+  **export directory** enumerating the functions the loader looks up, each pointing
+  at a stub address the emulator can trap and dispatch. Building that synthetic
+  module + export resolution is the next win64 step. This mirrors the classic
+  "get `DllBase`, then parse exports" technique (cf. the PEB/Ldr write-ups),
+  reached here via `GetModuleHandleA` rather than a `PEB->Ldr` walk.

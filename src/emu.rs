@@ -225,6 +225,7 @@ struct EmuData {
 
 pub struct Emu {
     uc: Unicorn<'static, EmuData>,
+    observation_hooks_installed: bool,
 }
 
 impl Emu {
@@ -259,7 +260,12 @@ impl Emu {
         write_u64_mem(&mut uc, TEB_BASE + TEB_PEB_OFFSET, PEB_BASE)?;
         write_u8_mem(&mut uc, PEB_BASE + PEB_BEINGDEBUGGED_OFFSET, 0)?;
 
-        Ok(Self { uc })
+        let mut emu = Self {
+            uc,
+            observation_hooks_installed: false,
+        };
+        emu.ensure_observation_hooks()?;
+        Ok(emu)
     }
 
     pub fn map_code(&mut self, base: u64, bytes: &[u8]) -> Result<(), EmuError> {
@@ -430,15 +436,13 @@ impl Emu {
             })
     }
 
-    /// Run with lightweight execution observation.
+    /// Resume execution with lightweight observation.
     ///
-    /// This installs hooks and leaves them installed, so it is intended to be
-    /// called once per `Emu` instance. Use a fresh `Emu` for each observation.
-    pub fn run_observed(
-        &mut self,
-        begin: u64,
-        max_instructions: u64,
-    ) -> Result<RunReport, EmuError> {
+    /// `instructions_executed` is reset for each resume and reports only the
+    /// current run slice.
+    pub fn resume(&mut self, begin: u64, max_instructions: u64) -> Result<RunReport, EmuError> {
+        self.ensure_observation_hooks()?;
+
         let count =
             usize::try_from(max_instructions).map_err(|_| EmuError::InstructionCapTooLarge {
                 count: max_instructions,
@@ -451,34 +455,6 @@ impl Emu {
             data.recent_rips.clear();
         }
 
-        self.uc
-            .add_code_hook(0, u64::MAX, |uc, address, _size| {
-                let data = uc.get_data_mut();
-                data.instr_count += 1;
-                data.recent_rips.push_back(address);
-                if data.recent_rips.len() > RECENT_RIPS_CAP {
-                    data.recent_rips.pop_front();
-                }
-            })
-            .map(|_| ())
-            .map_err(EmuError::Hook)?;
-
-        self.uc
-            .add_mem_hook(
-                HookType::MEM_UNMAPPED | HookType::MEM_PROT,
-                0,
-                u64::MAX,
-                |uc, mem_type, address, _size, _value| {
-                    uc.get_data_mut().last_fault = Some(MemFault {
-                        kind: fault_kind_from_mem_type(mem_type),
-                        address,
-                    });
-                    false
-                },
-            )
-            .map(|_| ())
-            .map_err(EmuError::Hook)?;
-
         let run_result = if max_instructions == 0 {
             Ok(())
         } else {
@@ -486,6 +462,16 @@ impl Emu {
         };
 
         self.build_run_report(run_result, max_instructions)
+    }
+
+    /// Run with lightweight execution observation.
+    pub fn run_observed(
+        &mut self,
+        begin: u64,
+        max_instructions: u64,
+    ) -> Result<RunReport, EmuError> {
+        self.ensure_observation_hooks()?;
+        self.resume(begin, max_instructions)
     }
 
     /// Run with lightweight execution observation plus capped memory range hits.
@@ -514,34 +500,6 @@ impl Emu {
             data.watch_hits.clear();
             data.watch_hit_cap = hit_cap;
         }
-
-        self.uc
-            .add_code_hook(0, u64::MAX, |uc, address, _size| {
-                let data = uc.get_data_mut();
-                data.instr_count += 1;
-                data.recent_rips.push_back(address);
-                if data.recent_rips.len() > RECENT_RIPS_CAP {
-                    data.recent_rips.pop_front();
-                }
-            })
-            .map(|_| ())
-            .map_err(EmuError::Hook)?;
-
-        self.uc
-            .add_mem_hook(
-                HookType::MEM_UNMAPPED | HookType::MEM_PROT,
-                0,
-                u64::MAX,
-                |uc, mem_type, address, _size, _value| {
-                    uc.get_data_mut().last_fault = Some(MemFault {
-                        kind: fault_kind_from_mem_type(mem_type),
-                        address,
-                    });
-                    false
-                },
-            )
-            .map(|_| ())
-            .map_err(EmuError::Hook)?;
 
         self.uc
             .add_mem_hook(
@@ -629,33 +587,11 @@ impl Emu {
         self.uc
             .add_code_hook(0, u64::MAX, |uc, address, _size| {
                 let data = uc.get_data_mut();
-                data.instr_count += 1;
-                data.recent_rips.push_back(address);
-                if data.recent_rips.len() > RECENT_RIPS_CAP {
-                    data.recent_rips.pop_front();
-                }
-
                 if data.instr_count >= data.trace_from {
                     data.trace_active = true;
                     data.trace_events.push(TraceEvent::Insn { address });
                 }
             })
-            .map(|_| ())
-            .map_err(EmuError::Hook)?;
-
-        self.uc
-            .add_mem_hook(
-                HookType::MEM_UNMAPPED | HookType::MEM_PROT,
-                0,
-                u64::MAX,
-                |uc, mem_type, address, _size, _value| {
-                    uc.get_data_mut().last_fault = Some(MemFault {
-                        kind: fault_kind_from_mem_type(mem_type),
-                        address,
-                    });
-                    false
-                },
-            )
             .map(|_| ())
             .map_err(EmuError::Hook)?;
 
@@ -756,6 +692,43 @@ impl Emu {
             recent_rips,
             registers,
         })
+    }
+
+    fn ensure_observation_hooks(&mut self) -> Result<(), EmuError> {
+        if self.observation_hooks_installed {
+            return Ok(());
+        }
+
+        self.uc
+            .add_code_hook(0, u64::MAX, |uc, address, _size| {
+                let data = uc.get_data_mut();
+                data.instr_count += 1;
+                data.recent_rips.push_back(address);
+                if data.recent_rips.len() > RECENT_RIPS_CAP {
+                    data.recent_rips.pop_front();
+                }
+            })
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        self.uc
+            .add_mem_hook(
+                HookType::MEM_UNMAPPED | HookType::MEM_PROT,
+                0,
+                u64::MAX,
+                |uc, mem_type, address, _size, _value| {
+                    uc.get_data_mut().last_fault = Some(MemFault {
+                        kind: fault_kind_from_mem_type(mem_type),
+                        address,
+                    });
+                    false
+                },
+            )
+            .map(|_| ())
+            .map_err(EmuError::Hook)?;
+
+        self.observation_hooks_installed = true;
+        Ok(())
     }
 }
 
