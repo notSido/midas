@@ -91,7 +91,48 @@ determined by further tracing before the win64 layer is designed around it.
 ## What this justifies building next (win64 layer, M3 proper)
 
 Driven by the above and confirmed on both samples, the next work is a minimal
-Windows-64 environment: a PEB/TEB with a module list containing at least the
-modules the loader looks up, an export/`GetProcAddress` mechanism, and API stubs
-added **only** as the loader is observed to call them — each with a test
-asserting its emulated effect, and each validated against **both** samples.
+Windows-64 environment: an export/`GetProcAddress` mechanism and API stubs added
+**only** as the loader is observed to call them — each with a test asserting its
+emulated effect, and each validated against **both** samples.
+
+## Resolution-path determination (traced, both samples)
+
+Reproduce with:
+
+```
+cargo run --release --example trace_resolution -- samples/<sample>.exe <fault_count> <window>
+cargo run --release --example watch_peb_teb    -- samples/<sample>.exe <fault_count>
+```
+
+- **The loader does NOT walk `PEB->Ldr`.** Across the entire run to the wall, the
+  only PEB/TEB access observed is repeated 8-byte reads of `gs:[0x30]`
+  (`NtTib.Self`, the TEB self-pointer) — ~30 reads confined to the last
+  ~45k–140k instructions before the wall. The PEB is never read (no access to
+  `TEB+0x60` or any PEB field). This holds identically on both samples.
+- **The call target is loaded raw from an in-image table, not resolved.** The
+  traced sequence computes the trampoline frame as
+  `[rsp] = [[image+0xad8ca]] = 0x4d00d` (the "API address", used unrelocated) and
+  `[rsp+8] = 0x1ad55d + image_base` (the return address, relocated). The `ret`
+  then "calls" `0x4d00d`. `RCX` holds `"kernel32.dll"`, i.e. this is the loader's
+  **bootstrap `GetModuleHandle`/`LoadLibrary("kernel32.dll")`** call.
+- **Populating the TEB self-pointer does not move the wall.** After writing
+  `NtTib.Self = TEB_BASE`, `StackBase/StackLimit`, and `TEB.ProcessEnvironmentBlock
+  = PEB_BASE`, the sample still faults at `0x4d00d` at the identical instruction
+  count. So the `gs:[0x30]` reads tolerate their value (consistent with an
+  anti-debug / pointer-encode use), and the wall is specifically the unresolved
+  API bootstrap — not a missing TEB field. The TEB population is retained as
+  correct environment modeling (both samples read `gs:[0x30]`), not as a fix for
+  the wall.
+
+### Consequence for the design (still partly open)
+
+Because resolution is not `PEB->Ldr`-based, a byte-accurate fake kernel32 export
+directory is *not* the lever. The lever is the **placeholder call itself**: the
+loader transfers control to an unresolved placeholder address with the DLL name
+in `RCX`. A candidate design is to treat a control-transfer to an unmapped
+placeholder as an **API-call trap** — identify the intended API, emulate its
+effect, set `RAX`, and resume at the on-stack return address. The **open
+sub-question** is how to identify *which* API each placeholder denotes (the DLL
+is in `RCX`, but the function selector — name string, ordinal, or hash, and where
+it lives relative to the call site/table) is **not yet determined** and must be
+traced before the trap handler is designed. This is the next investigation.
