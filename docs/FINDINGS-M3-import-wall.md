@@ -187,20 +187,23 @@ With a synthetic kernel32 PE (DOS + NT headers + a real export directory) mapped
 at the `GetModuleHandleA` base, the loader parses the export table successfully
 and advances past the `e_lfanew` read. It then resolves an export and **reads the
 resolved function's code bytes**: sample 1 faults with `ReadUnmapped` at
-`kernel32_base + 0x2040`, which is stub slot 4 (`STUB_REGION_RVA 0x2000 + 4*16`) =
+`kernel32_base + 0x1040`, which is stub slot 4 (`stub_region_rva 0x1000 + 4*16`) =
 `LoadLibraryA` (exports are name-sorted). i.e. after obtaining kernel32's base the
 loader resolves `LoadLibraryA` and inspects its bytes before use (a common
-anti-hook / relocation check).
+anti-hook / relocation check). The absolute stub RVA is a property of the
+synthetic layout, not the sample: `stub_region_rva` is the export area rounded up
+to a page (`0x1000` for the current 9-name export set), so the stub region starts
+at `+0x1000` and slot 4 lands at `+0x1040`.
 
 Consequence for the design: the export **stub region must be readable** (mapped
 read-only) so the loader can inspect a resolved function's bytes, while remaining
 **non-executable** so that *calling* the stub still faults and is trapped/dispatched.
-The current slice leaves the stub region unmapped (calls fault as intended, but
-reads do not), so the next step is readable-but-non-executable stubs plus handling
-the execute fault (`FetchProt`/`FetchUnmapped`) in the export-call trap. Seeding
-the export **names** from the real `samples/kernel32.dll` (1664 names, see
-`samples/SAMPLES.md`) gives complete resolution regardless of which function the
-loader wants.
+The slice that first observed this left the stub region unmapped (calls fault as
+intended, but reads do not); the next section records making it
+readable-but-non-executable and handling the execute fault
+(`FetchProt`/`FetchUnmapped`) in the export-call trap. Seeding the export **names**
+from the real `samples/kernel32.dll` (1664 names, see `samples/SAMPLES.md`) would
+give complete resolution regardless of which function the loader wants.
 
 ## Readable stubs move the frontier to LoadLibraryA (all three samples)
 
@@ -224,8 +227,10 @@ export-call trap dispatching on `FetchProt` as well as `FetchUnmapped`:
 
 ### What this justifies building next
 
-Implement `LoadLibraryA` as the next win64 API stub — observed on all three samples,
-so it is Themida-loader behaviour, not overfitting. Its argument is an ASCII module
+Implement `LoadLibraryA` as the next win64 API stub. It is observed on all three
+bundled samples (evidence that this is shared Themida-loader behaviour rather than a
+single-payload quirk, not a general proof across all Themida 3.2.4.34 binaries), so
+adding it is observation-driven, not overfitting. Its argument is an ASCII module
 name in `RCX`; the natural semantics mirror `GetModuleHandleA`'s module path (map /
 return a synthetic module base for a known DLL), added with a test asserting the
 emulated effect and re-validated on all samples via `run_loader`. The precise DLL(s)

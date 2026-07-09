@@ -923,4 +923,37 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn trap_reports_unexpected_fault_for_non_stub_fetchprot() {
+        // A FetchProt fault that is NOT a synthetic export stub must stop as
+        // UnexpectedFault and must NOT be run through the in-image
+        // import-by-name fallback (that path is FetchUnmapped-only). Here the
+        // call target is a readable-but-non-executable page that is not part of
+        // any mapped module, so calling it faults FetchProt at a non-stub
+        // address.
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+
+        // Non-stub, non-executable target: a read-only page distinct from the
+        // entry code, with no kernel32 module mapped (env.kernel32 stays None).
+        let target = IMAGE_BASE + u64::from(DATA_RVA);
+        emu.map_readonly(target, &[0u8; 0x10]).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&target.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0]);
+        code.extend_from_slice(&[0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert!(env.kernel32.is_none());
+        assert_eq!(result.handled, Vec::<String>::new());
+        assert_eq!(result.stop, TrapStop::UnexpectedFault { address: target });
+    }
 }
