@@ -12,8 +12,8 @@ hypotheses to re-confirm against disassembly before midas relies on them.
 ## Sample inventory
 
 Two distinct samples are required to satisfy the "sample-agnostic, zero
-hardcoded per-sample constants" acceptance criterion. **Two samples are now
-present on disk** (both gitignored).
+hardcoded per-sample constants" acceptance criterion. **Three samples are now
+present on disk** (all gitignored).
 
 ## Support assets
 
@@ -81,10 +81,12 @@ present on disk** (both gitignored).
 ## Cross-sample generality (observed)
 
 The M3 finding chain reproduces **identically on all three samples** with no code
-changes (see `docs/FINDINGS-M3-import-wall.md`): each self-decrypts (~26–28M
-instructions), hits the same unbound-IAT wall (`GetModuleHandleA` at import RVA
-`0x4d00d`, `RCX` → `"kernel32.dll"`), and after the import-call trap + synthetic
-kernel32 proceeds through the export walk to resolve `LoadLibraryA` and read its
-bytes. This is the sample-agnostic behaviour the charter requires; per-instance
-values (entry RVA, instruction counts, string pointers) differ, the mechanism
-does not.
+changes: each self-decrypts (~26–29M instructions), hits the same unbound-IAT
+wall (`GetModuleHandleA` at import RVA `0x4d00d`, `RCX` → `"kernel32.dll"`), and
+after the import-call trap + synthetic kernel32 proceeds through the export walk
+to resolve `LoadLibraryA` and read its bytes. This is the sample-agnostic
+behaviour the charter requires; per-instance values (entry RVA, instruction
+counts, string pointers) differ, the mechanism does not.
+`docs/FINDINGS-M3-import-wall.md` documents the mechanism in detail on the first
+two samples; the third's reproduction is confirmed here (instruction count to the
+wall: sample 1 ≈ 26.5M, sample 2 ≈ 28.2M, sample 3 ≈ 28.3M).
