@@ -15,9 +15,6 @@ const PAGE_SIZE: u32 = 0x1000;
 /// RVA of the synthetic module's IMAGE_EXPORT_DIRECTORY.
 pub const SYNTHETIC_EXPORT_DIR_RVA: u32 = 0x200;
 
-/// RVA where synthetic export call targets begin; this page is intentionally unmapped.
-pub const SYNTHETIC_STUB_REGION_RVA: u32 = 0x2000;
-
 /// Byte spacing between synthetic export call targets.
 pub const SYNTHETIC_STUB_STRIDE: u32 = 16;
 
@@ -39,6 +36,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
 pub struct SyntheticModule {
     pub base: u64,
     pub image: Vec<u8>,
+    stub_region_rva: u32,
     exports: BTreeMap<String, u32>,
     stub_rva_to_name: BTreeMap<u32, String>,
 }
@@ -66,9 +64,10 @@ impl SyntheticModule {
         }
 
         let export_area_size = cursor - export_dir_rva;
-        let image_len = align_up_u32(cursor, PAGE_SIZE) as usize;
+        let stub_region_rva = align_up_u32(cursor, PAGE_SIZE);
+        let image_len = stub_region_rva as usize;
         let size_of_image = align_up_u32(
-            SYNTHETIC_STUB_REGION_RVA + export_count as u32 * SYNTHETIC_STUB_STRIDE,
+            stub_region_rva + export_count as u32 * SYNTHETIC_STUB_STRIDE,
             PAGE_SIZE,
         );
         let mut image = vec![0u8; image_len];
@@ -104,7 +103,7 @@ impl SyntheticModule {
         let mut export_map = BTreeMap::new();
         let mut stub_rva_to_name = BTreeMap::new();
         for ((index, export), name_rva) in sorted_exports.iter().enumerate().zip(name_rvas.iter()) {
-            let stub_rva = SYNTHETIC_STUB_REGION_RVA + index as u32 * SYNTHETIC_STUB_STRIDE;
+            let stub_rva = stub_region_rva + index as u32 * SYNTHETIC_STUB_STRIDE;
             write_u32(&mut image, eat_rva as usize + index * 4, stub_rva);
             write_u32(&mut image, names_rva as usize + index * 4, *name_rva);
             write_u16(&mut image, ords_rva as usize + index * 2, index as u16);
@@ -120,6 +119,7 @@ impl SyntheticModule {
         Self {
             base,
             image,
+            stub_region_rva,
             exports: export_map,
             stub_rva_to_name,
         }
@@ -132,12 +132,13 @@ impl SyntheticModule {
     fn stub_name(&self, addr: u64) -> Option<&str> {
         let rva = addr.checked_sub(self.base)?;
         let rva = u32::try_from(rva).ok()?;
-        let end = SYNTHETIC_STUB_REGION_RVA
+        let end = self
+            .stub_region_rva
             .checked_add(self.exports.len() as u32 * SYNTHETIC_STUB_STRIDE)?;
-        if !(SYNTHETIC_STUB_REGION_RVA..end).contains(&rva) {
+        if !(self.stub_region_rva..end).contains(&rva) {
             return None;
         }
-        if !(rva - SYNTHETIC_STUB_REGION_RVA).is_multiple_of(SYNTHETIC_STUB_STRIDE) {
+        if !(rva - self.stub_region_rva).is_multiple_of(SYNTHETIC_STUB_STRIDE) {
             return None;
         }
         self.stub_rva_to_name.get(&rva).map(String::as_str)
@@ -295,7 +296,7 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             } else if module_name.eq_ignore_ascii_case("kernel32.dll") {
                 env.ensure_kernel32(emu)?
             } else {
-                env.module_base(&module_name)
+                0
             };
             emu.write_reg(RegisterX86::RAX, base)?;
             api_return(emu)?;
@@ -713,6 +714,54 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_kernel32_stub_region_clears_large_export_table() {
+        let names = (0..2000)
+            .map(|index| format!("Func{index:04}"))
+            .collect::<Vec<_>>();
+        let exports = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let module = SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", &exports);
+
+        let pe_offset = u32::from_le_bytes([
+            module.image[0x3c],
+            module.image[0x3d],
+            module.image[0x3e],
+            module.image[0x3f],
+        ]) as usize;
+        let optional_header = pe_offset + 24;
+        let export_dir_rva = u32::from_le_bytes([
+            module.image[optional_header + 112],
+            module.image[optional_header + 113],
+            module.image[optional_header + 114],
+            module.image[optional_header + 115],
+        ]);
+        let export_area_size = u32::from_le_bytes([
+            module.image[optional_header + 116],
+            module.image[optional_header + 117],
+            module.image[optional_header + 118],
+            module.image[optional_header + 119],
+        ]);
+        let export_data_end = export_dir_rva + export_area_size;
+
+        assert!(module.stub_region_rva >= export_data_end);
+        assert!(module.image.len() <= module.stub_region_rva as usize);
+
+        let first_rva = *module.exports.get("Func0000").unwrap();
+        let last_rva = *module.exports.get("Func1999").unwrap();
+        assert_eq!(
+            module.stub_name(module.base + u64::from(first_rva)),
+            Some("Func0000")
+        );
+        assert_eq!(
+            module.stub_name(module.base + u64::from(last_rva)),
+            Some("Func1999")
+        );
+        assert_eq!(
+            module.stub_name(module.base + u64::from(module.stub_region_rva - 1)),
+            None
+        );
+    }
+
+    #[test]
     fn getmodulehandlea_returns_nonnull_and_returns() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -733,6 +782,36 @@ mod tests {
 
         assert_ne!(ret, 0);
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), stack_address + 8);
+    }
+
+    #[test]
+    fn getmodulehandlea_unknown_module_returns_null_and_returns() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut data = vec![0u8; 0x1000];
+        data[..b"user32.dll\0".len()].copy_from_slice(b"user32.dll\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+
+        let outcome = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
+        assert_eq!(
+            outcome,
+            ApiOutcome::Handled {
+                name: "GetModuleHandleA".to_owned(),
+                ret: 0
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), stack_address + 8);
     }

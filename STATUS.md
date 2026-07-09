@@ -21,14 +21,16 @@ here. If a capability is not listed, it is not implemented.
 
 ## Not yet implemented
 
-The Win64 environment is only **partially** implemented: the import-call trap and
-`GetModuleHandleA` exist (above), but there is no synthetic module image with an
-export directory, no `GetProcAddress`/export resolution, and no further API stubs.
-`docs/FINDINGS-M3-import-wall.md` records the reproducible chain: both samples now
-pass the first import wall via the trap (`GetModuleHandleA("kernel32.dll")`) and
-then read `kernel32_base + 0x3c` (`e_lfanew`), i.e. they parse the returned
-module's PE export table manually — so the next requirement is a synthetic
-kernel32 image with an export directory. That, and OEP/trace/VM/IR, remain.
+The Win64 environment is only **partially** implemented: the import-call trap,
+`GetModuleHandleA`, and the synthetic kernel32 module + export-call trap exist
+(above). What remains for the win64 layer: readable-but-non-executable export
+stubs (so the loader's inspection of a resolved function's bytes succeeds while a
+call still traps), seeding the export names from the real `samples/kernel32.dll`
+for complete resolution, and the actual API stubs the loader calls next
+(`LoadLibraryA`, `GetProcAddress`, `VirtualAlloc`, …), each added when observed.
+`docs/FINDINGS-M3-import-wall.md` records the reproducible chain and the current
+frontier (after `GetModuleHandleA` the loader parses the synthetic export table
+and reads a resolved function's bytes).
 
 Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
 detection, and the IR lifter. None has a passing acceptance artifact yet.
