@@ -40,11 +40,19 @@ written by the loader's **own VM**: the unpacker fills it with non-zero bytes, t
 VM "store" handler (`.themida+0xaccf7`, `mov [r9],rbx` with `rbx=0`) copies a `0` out
 of a VM-context slot into it. So the null originates *inside the VM's data flow* (an
 upstream context value that is `0` in our environment), not a missing native write to
-that handler slot.
-Pinning that origin needs a multi-handler VM-reversal; the fix is still unknown and
-is to be scoped with the human before building.
+that handler slot. An experiment (return `GetProcAddress` stubs *inside* the module
+image instead of the out-of-image arena) changed the returned addresses by ~4 GiB yet
+left the same observable `run_loader` summary on all three samples (the same 8 APIs and
+`ReachedUntil`). That bundled in-image implementation did not advance the observable
+`run_loader` frontier, but this coarse result does not prove that the internal VM path
+or upstream source slot was unchanged; candidate 1 (arena-address shape) remains
+causally unproven. The experimental
+change was reverted. Pinning the upstream `0`'s origin needs either an isolated
+address-only A/B or an operand/data-dependency trace of writes to
+`rbp + *(rbp+0x123)`, followed as needed by a multi-handler VM-reversal; the fix is
+still unknown and is to be scoped with the human before building.
 `examples/trap_postmortem.rs` reproduces the wall; `docs/FINDINGS-M3-import-wall.md`
-records the full chain and candidate causes.
+records the full chain, candidate causes, and the in-image-stub experiment.
 
 Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
 detection, and the IR lifter. None has a passing acceptance artifact yet.
