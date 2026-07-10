@@ -30,6 +30,14 @@ const EMULATED_CURRENT_THREAD_ID: u32 = 1;
 /// The handle remains unmapped and distinct from the allocator backing.
 const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
 
+/// Start of the registry-backed opaque kernel-handle namespace. These values
+/// remain unmapped; `HEAP_ARENA_BASE` is the exclusive upper bound.
+const KERNEL_HANDLE_BASE: u64 = 0x0000_000f_3000_1000;
+const KERNEL_HANDLE_STRIDE: u64 = 0x10;
+
+/// Pre-Vista THREAD_ALL_ACCESS, including the legacy unnamed 0x4 access bit.
+const LEGACY_THREAD_ALL_ACCESS: u32 = 0x001f_03ff;
+
 /// RVA of the synthetic module's IMAGE_EXPORT_DIRECTORY.
 pub const SYNTHETIC_EXPORT_DIR_RVA: u32 = 0x200;
 
@@ -51,6 +59,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "ExitProcess",
     "GetUserDefaultUILanguage",
     "GetCurrentThreadId",
+    "OpenThread",
 ];
 
 /// Seed ntdll export names observed during the bootstrap export walk; this is
@@ -290,11 +299,25 @@ struct HeapAllocation {
     mapped_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelObject {
+    Thread { thread_id: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KernelHandle {
+    object: KernelObject,
+    desired_access: u32,
+    inheritable: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Win64Env {
     image_base: u64,
     process_heap: u64,
     current_thread_id: u32,
+    next_kernel_handle: u64,
+    kernel_handles: BTreeMap<u64, KernelHandle>,
     heap_cursor: u64,
     heap_allocations: BTreeMap<u64, HeapAllocation>,
     modules: BTreeMap<String, u64>,
@@ -310,6 +333,8 @@ impl Win64Env {
             image_base,
             process_heap: EMULATED_PROCESS_HEAP_HANDLE,
             current_thread_id: EMULATED_CURRENT_THREAD_ID,
+            next_kernel_handle: KERNEL_HANDLE_BASE,
+            kernel_handles: BTreeMap::new(),
             heap_cursor: HEAP_ARENA_BASE,
             heap_allocations: BTreeMap::new(),
             modules: BTreeMap::new(),
@@ -318,6 +343,38 @@ impl Win64Env {
             proc_stubs: BTreeMap::new(),
             proc_stub_mapped_end: PROC_STUB_BASE,
         }
+    }
+
+    fn open_thread(&mut self, desired_access: u32, inheritable: bool, thread_id: u32) -> u64 {
+        // Bounded support policy: accept any subset of the legacy all-access
+        // mask. This is not complete ACL, token, or security semantics.
+        if desired_access & !LEGACY_THREAD_ALL_ACCESS != 0 || thread_id != self.current_thread_id {
+            return 0;
+        }
+
+        let handle = self.next_kernel_handle;
+        let Some(next_handle) = handle.checked_add(KERNEL_HANDLE_STRIDE) else {
+            return 0;
+        };
+        if !(KERNEL_HANDLE_BASE..HEAP_ARENA_BASE).contains(&handle)
+            || next_handle > HEAP_ARENA_BASE
+            || !handle.is_multiple_of(KERNEL_HANDLE_STRIDE)
+            || self.kernel_handles.contains_key(&handle)
+        {
+            return 0;
+        }
+
+        let previous = self.kernel_handles.insert(
+            handle,
+            KernelHandle {
+                object: KernelObject::Thread { thread_id },
+                desired_access,
+                inheritable,
+            },
+        );
+        debug_assert!(previous.is_none());
+        self.next_kernel_handle = next_handle;
+        handle
     }
 
     fn allocate_heap(
@@ -603,6 +660,19 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
         }
         "GetCurrentThreadId" => {
             let ret = u64::from(env.current_thread_id);
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "OpenThread" => {
+            // DWORD/BOOL arguments consume only the low 32 bits on Win64.
+            let desired_access = emu.read_reg(RegisterX86::RCX)? as u32;
+            let inheritable = (emu.read_reg(RegisterX86::RDX)? as u32) != 0;
+            let thread_id = emu.read_reg(RegisterX86::R8)? as u32;
+            let ret = env.open_thread(desired_access, inheritable, thread_id);
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
             Ok(ApiOutcome::Handled {
@@ -946,6 +1016,32 @@ mod tests {
             panic!("expected RtlAllocateHeap to be handled");
         };
         assert_eq!(name, "RtlAllocateHeap");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn call_open_thread(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        desired_access: u64,
+        inheritable: u64,
+        thread_id: u64,
+    ) -> u64 {
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, desired_access).unwrap();
+        emu.write_reg(RegisterX86::RDX, inheritable).unwrap();
+        emu.write_reg(RegisterX86::R8, thread_id).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "OpenThread").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected OpenThread to be handled");
+        };
+        assert_eq!(name, "OpenThread");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
@@ -1421,6 +1517,180 @@ mod tests {
     }
 
     #[test]
+    fn open_thread_handles_observed_call_with_dirty_upper_halves() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+
+        let handle = call_open_thread(
+            &mut env,
+            &mut emu,
+            0xa5a5_5a5a_001f_03ff,
+            0xffff_ffff_0000_0000,
+            0xdead_beef_0000_0001,
+        );
+
+        assert_eq!(handle, KERNEL_HANDLE_BASE);
+        assert_ne!(handle, 0);
+        assert_ne!(handle, env.process_heap);
+        assert_ne!(handle, env.image_base);
+        assert!(handle < HEAP_ARENA_BASE);
+        assert!(handle < crate::emu::STACK_BASE);
+        assert!(handle < PROC_STUB_BASE);
+        assert!(handle < FAKE_MODULE_BASE_START);
+        assert!(emu.read_mem(handle, 1).is_err());
+        assert_eq!(
+            env.kernel_handles.get(&handle),
+            Some(&KernelHandle {
+                object: KernelObject::Thread { thread_id: 1 },
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: false,
+            })
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), handle);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RSP).unwrap(),
+            crate::emu::STACK_BASE + 0x408
+        );
+    }
+
+    #[test]
+    fn open_thread_uses_current_id_and_allocates_fresh_handles() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let id_rsp = crate::emu::STACK_BASE + 0x500;
+        let id_return_address = 0x0fed_cba9_8765_4321u64;
+        emu.write_mem(id_rsp, &id_return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, id_rsp).unwrap();
+
+        let id_outcome = dispatch(&mut env, &mut emu, "GetCurrentThreadId").unwrap();
+        let ApiOutcome::Handled { ret: thread_id, .. } = id_outcome else {
+            panic!("expected GetCurrentThreadId to be handled");
+        };
+        assert_eq!(thread_id, 1);
+
+        // The legacy unnamed 0x4 bit is deliberately supported, not rejected
+        // as an unknown access right.
+        let first = call_open_thread(&mut env, &mut emu, 0x4, 0, thread_id);
+        let second = call_open_thread(
+            &mut env,
+            &mut emu,
+            u64::from(LEGACY_THREAD_ALL_ACCESS),
+            0xfeed_face_0000_0100,
+            thread_id,
+        );
+
+        assert_eq!(first, KERNEL_HANDLE_BASE);
+        assert_eq!(second, KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE);
+        assert_ne!(first, second);
+        assert_eq!(
+            env.kernel_handles.get(&first),
+            Some(&KernelHandle {
+                object: KernelObject::Thread { thread_id: 1 },
+                desired_access: 0x4,
+                inheritable: false,
+            })
+        );
+        assert_eq!(
+            env.kernel_handles.get(&second),
+            Some(&KernelHandle {
+                object: KernelObject::Thread { thread_id: 1 },
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: true,
+            })
+        );
+        assert_eq!(
+            env.next_kernel_handle,
+            KERNEL_HANDLE_BASE + 2 * KERNEL_HANDLE_STRIDE
+        );
+    }
+
+    #[test]
+    fn open_thread_rejects_invalid_requests_and_exhaustion_atomically() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let initial_cursor = env.next_kernel_handle;
+        let initial_handles = env.kernel_handles.clone();
+
+        for (desired_access, thread_id) in [
+            (u64::from(LEGACY_THREAD_ALL_ACCESS), 0),
+            (u64::from(LEGACY_THREAD_ALL_ACCESS), 2),
+            (u64::from(LEGACY_THREAD_ALL_ACCESS | 0x0020_0000), 1),
+        ] {
+            assert_eq!(
+                call_open_thread(&mut env, &mut emu, desired_access, 0, thread_id),
+                0
+            );
+            assert_eq!(env.next_kernel_handle, initial_cursor);
+            assert_eq!(env.kernel_handles, initial_handles);
+        }
+
+        for rejected_cursor in [KERNEL_HANDLE_BASE + 1, HEAP_ARENA_BASE, u64::MAX] {
+            env.next_kernel_handle = rejected_cursor;
+            let rejected_handles = env.kernel_handles.clone();
+            assert_eq!(
+                call_open_thread(
+                    &mut env,
+                    &mut emu,
+                    u64::from(LEGACY_THREAD_ALL_ACCESS),
+                    0,
+                    1,
+                ),
+                0
+            );
+            assert_eq!(env.next_kernel_handle, rejected_cursor);
+            assert_eq!(env.kernel_handles, rejected_handles);
+        }
+
+        let last_handle = HEAP_ARENA_BASE - KERNEL_HANDLE_STRIDE;
+        env.next_kernel_handle = last_handle;
+        assert_eq!(
+            call_open_thread(
+                &mut env,
+                &mut emu,
+                u64::from(LEGACY_THREAD_ALL_ACCESS),
+                0,
+                1,
+            ),
+            last_handle
+        );
+        assert_eq!(env.next_kernel_handle, HEAP_ARENA_BASE);
+
+        let handles_at_limit = env.kernel_handles.clone();
+        assert_eq!(
+            call_open_thread(
+                &mut env,
+                &mut emu,
+                u64::from(LEGACY_THREAD_ALL_ACCESS),
+                0,
+                1,
+            ),
+            0
+        );
+        assert_eq!(env.next_kernel_handle, HEAP_ARENA_BASE);
+        assert_eq!(env.kernel_handles, handles_at_limit);
+
+        env.next_kernel_handle = last_handle;
+        let handles_before_collision = env.kernel_handles.clone();
+        assert_eq!(
+            call_open_thread(
+                &mut env,
+                &mut emu,
+                u64::from(LEGACY_THREAD_ALL_ACCESS),
+                0,
+                1,
+            ),
+            0
+        );
+        assert_eq!(env.next_kernel_handle, last_handle);
+        assert_eq!(env.kernel_handles, handles_before_collision);
+    }
+
+    #[test]
     fn rtl_allocate_heap_handles_observed_zeroed_page_request() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -1651,6 +1921,57 @@ mod tests {
             emu.read_reg(RegisterX86::RIP).unwrap(),
             image.entry_point_va() + 12
         );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_name_resolved_kernel32_open_thread_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("OpenThread")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, kernel32_base, "OpenThread")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&u64::from(LEGACY_THREAD_ALL_ACCESS).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xba]);
+        code.extend_from_slice(&0u64.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xb8]);
+        code.extend_from_slice(&1u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["OpenThread".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        let handle = emu.read_reg(RegisterX86::RAX).unwrap();
+        assert_eq!(handle, KERNEL_HANDLE_BASE);
+        assert_eq!(
+            env.kernel_handles.get(&handle),
+            Some(&KernelHandle {
+                object: KernelObject::Thread { thread_id: 1 },
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: false,
+            })
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
     }
 

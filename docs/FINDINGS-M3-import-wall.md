@@ -692,9 +692,11 @@ allocation semantics yet, so the trap stops before executing it.
 
 Historical capture note: the outputs in this section were recorded at the
 merged heap-only baseline `3763982`, before `GetCurrentThreadId` was seeded.
-For samples 1 and 2, the same commands on the current branch include the
-additional call documented in the next section; sample 3 retains its separate
-28-call path. The allocation arguments and sequences remain unchanged.
+For samples 1 and 2, the same commands at the merged thread-ID baseline
+`98969a2` include the additional call documented in the next section; the later
+`OpenThread` progression is recorded after that. Sample 3 retains its separate
+28-call path at these baselines. The allocation arguments captured here remain
+unchanged.
 
 The fault-time capture at the previous wall was identical on all three samples:
 `RCX = 0x0000000f30000000` (the stable `GetProcessHeap` result), `RDX = 0x8`
@@ -842,6 +844,11 @@ missing export.
 
 ## GetCurrentThreadId is the causal post-allocation gap on samples 1 and 2
 
+Historical capture note: the production output in this section was recorded at
+exact implementation commit `8041751`; merged commit `98969a2` has the same
+tree. Both precede the `OpenThread` slice. The current progression is recorded
+in the next section.
+
 A temporary broad-name diagnostic using the 1,664 export names parsed from the
 authorized `samples/kernel32.dll` first changed formal sample 1's
 post-allocation ret-to-zero into an unhandled `GetCurrentThreadId` call. Sample
@@ -886,8 +893,9 @@ Focused tests call the API twice with different garbage values in the volatile
 argument registers and assert the stable 32-bit result plus exact
 `RAX`/`RIP`/`RSP` effects. An end-to-end test resolves the synthetic kernel32
 stub by name, calls it through the normal export trap, and asserts the same
-result without relying on a fixed RVA. Reproduce the sample-dependent result
-with:
+result without relying on a fixed RVA. To reproduce the historical
+sample-dependent result, check out `98969a2` in a throwaway worktree, make the
+local gitignored sample binaries available there, and run:
 
 ```
 cargo build --locked --release --example run_loader --example trap_postmortem
@@ -903,12 +911,12 @@ target/release/examples/run_loader samples/test_target3_protected.exe 60000000 2
 
 Setting `max_calls = 20` stops before dispatching call 21. The two first samples
 both show `RIP = 0x00007fff00001010`, while the consumed trampoline slot at
-`[RSP-8]` contains the same value. The address is the current name-sorted
+`[RSP-8]` contains the same value. The address is the `98969a2` name-sorted
 synthetic layout's `GetCurrentThreadId` stub, not a stable RVA. The preserved
 `RCX = 1`, `RDX = 2`, `R8 = 0x10`, and `R9 = 0` values are incidental guest
 state because this API has no parameters.
 
-Exact formal sample-1 production output:
+Exact formal sample-1 production output at `98969a2`:
 
 ```
 handled APIs:
@@ -936,16 +944,145 @@ handled APIs:
 stop: ReachedUntil
 ```
 
-Sample 2 has the same 21-call sequence as engineering corroboration. Both then
-return through zero; full `trap_postmortem` captures show `RAX = 1`, `RIP = 0`,
-and `[RSP-8] = 0`. Sample 3 retains its six-allocation, 28-call sequence and
-ret-to-zero, with no `GetCurrentThreadId` call. Its provenance remains
-incomplete, and its separately diagnosed `GetCurrentDirectoryW` selection is a
-different slice rather than part of the formal sample-1 mechanism.
+At `98969a2`, sample 2 has the same 21-call sequence as engineering
+corroboration. Both then return through zero; full `trap_postmortem` captures
+show `RAX = 1`, `RIP = 0`, and `[RSP-8] = 0`. Sample 3 retains its
+six-allocation, 28-call sequence and ret-to-zero, with no
+`GetCurrentThreadId` call. Its provenance remains incomplete, and its
+separately diagnosed `GetCurrentDirectoryW` selection is a different slice
+rather than part of the formal sample-1 mechanism.
 
 ### New frontier
 
-The cause of the later null handler after sample-1/sample-2 call 21 has not yet
-been diagnosed. No additional Win64 behavior is justified until that new value
-is traced. `GetCurrentDirectoryW` remains a separate sample-3 observation and is
-not implemented here.
+At `98969a2`, the cause of the later null handler after
+sample-1/sample-2 call 21 had not yet been diagnosed. The next section records
+the isolated trace that identifies `OpenThread`. `GetCurrentDirectoryW`
+remains a separate sample-3 observation and is not implemented here.
+
+## OpenThread is the causal post-thread-ID gap on samples 1 and 2
+
+The diagnostic started at exact implementation commit `8041751`; merged commit
+`98969a2` is tree-identical. A temporary broad-name run using the 1,664 exports
+parsed from the authorized `samples/kernel32.dll` changed the later formal
+sample-1 null handler into an unhandled `OpenThread` call 22. Sample 2 selected
+the same name. Sample 3 instead retained its separate six-allocation path and
+selected `GetCurrentDirectoryW` after call 28. The broad table was discovery
+evidence only because it changes the synthetic export layout and export-walk
+cost; its throwaway source and raw log were not committed.
+
+The decisive sample-1 A/B added only `OpenThread` to the `98969a2` kernel32
+seed. The baseline final dispatcher at `0x14005caf5` reads a per-instance handler
+slot at `0x1400eb3c6`, reached through context cell `0x14006fa68`. The slot's
+last writer remains `0x1400accf7` (`mov [r9],rbx`) in both runs. At baseline the
+writer stores zero. With only `OpenThread` added, the writer, destination, and
+selectors remain unchanged, while the source and stored value become the
+name-resolved stub `0x00007fff00001090`; the dispatcher reads that value and the
+export trap reports `OpenThread` as call 22. These addresses are sample-1 and
+synthetic-layout evidence, not production constants. The diagnostic tracer and
+raw log were temporary and uncommitted; the production replay below
+independently reproduces the call and subsequent progress.
+
+The production pre-call capture uses `max_calls = 21`, which stops before
+dispatching call 22 and preserves its Win64 arguments:
+
+```text
+RCX = 0x00000000001f03ff
+RDX = 0x0000000000000000
+R8  = 0x0000000000000001
+RIP = 0x00007fff00001090
+[RSP-8] = 0x00007fff00001090
+```
+
+Thus the observed call is `OpenThread(0x001f03ff, FALSE, 1)`. The access value
+matches the legacy pre-Vista `THREAD_ALL_ACCESS` mask, including its unnamed
+`0x4` bit; that header-era match does not establish the runtime Windows
+version. Dispatch consumes only the low 32 bits of the `DWORD`, `BOOL`, and
+thread-ID arguments, and treats any nonzero low-32-bit `BOOL` as true.
+
+The bounded environment policy recognizes only the sole modeled current thread
+ID `1` and access masks that are subsets of `0x001f03ff`. Every successful open
+creates a fresh handle in an unmapped registry namespace starting at
+`0x0000000f30001000`, records the target thread, requested access, and
+inheritability, and advances the checked cursor. Unknown IDs, unsupported bits,
+collisions, arithmetic overflow, and namespace exhaustion return `NULL` without
+changing the registry. This is not a Windows security model: ACL and token
+checks, privileges, protected processes, last-error values, actual child-process
+inheritance, `CloseHandle`, `GetThreadId`, `GetCurrentThread`, waits, and thread
+lifecycle are not implemented.
+
+Direct tests dirty the upper halves of all three argument registers, assert the
+first policy handle `0x0000000f30001000`, and inspect its exact metadata and
+normal `RAX`/`RIP`/`RSP` return effects. Further tests cover coherence with
+`GetCurrentThreadId`, fresh handles on repeated opens, nonzero inheritability,
+the legacy `0x4` bit, invalid IDs and access bits, the last valid handle,
+collision/overflow/exhaustion failure atomicity, unmapped handle values, and a
+call through the name-resolved synthetic kernel32 export stub. The handle value
+is attributed to those direct and synthetic-trap artifacts: by the next bounded
+production stop, guest code has already overwritten `RAX`, so the sample replay
+is not claimed as a post-`OpenThread` return-value capture.
+
+Reproduce the committed production path with:
+
+```text
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 21
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 21
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 23
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 25
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 27
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 29
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+The exact formal sample-1 production suffix is:
+
+```text
+  021: GetCurrentThreadId
+  022: OpenThread
+  023: GetProcessHeap
+  024: RtlAllocateHeap
+  025: GetProcessHeap
+  026: RtlAllocateHeap
+  027: GetProcessHeap
+  028: RtlAllocateHeap
+  029: GetProcessHeap
+  030: RtlAllocateHeap
+stop: ReachedUntil
+```
+
+The bounded pre-call captures identify the four additional allocation requests:
+
+| Target call | `max_calls` | `RDX` flags | `R8` size |
+|---:|---:|---:|---:|
+| 24 | 23 | `0x8` | `0x410` |
+| 26 | 25 | `0x8` | `0x10` |
+| 28 | 27 | `0x8` | `0x410` |
+| 30 | 29 | `0x8` | `0x10` |
+
+Together with the two earlier requests, formal sample 1 now exercises the same
+six sizes previously seen only on sample 3: `0x1000`, `0x10`, `0x410`, `0x10`,
+`0x410`, `0x10`, all with flag `0x8`. Sample 2 has the same 30-call production
+sequence as engineering corroboration. Sample 3 retains its separate 28-call
+sequence with the same six allocation sizes and does not call
+`GetCurrentThreadId` or `OpenThread`; its incomplete provenance prevents its use
+as formal milestone evidence.
+
+Full `trap_postmortem` captures reach a later trampoline return through zero:
+
+| Sample | Calls | Stop | `RAX` | `RIP` | `[RSP-8]` |
+|---|---:|---|---:|---:|---:|
+| 1 | 30 | `Other("ReachedUntil")` | `0x0000000f40005000` | `0x0` | `0x0` |
+| 2 | 30 | `Other("ReachedUntil")` | `0x0000000f40005000` | `0x0` | `0x0` |
+| 3 | 28 | `Other("ReachedUntil")` | `0x0000000f40005000` | `0x0` | `0x0` |
+
+### New frontier
+
+The null VM-handler value after formal sample-1 call 30 has not yet been
+diagnosed. No next API name is claimed. Sample 3's separately observed
+`GetCurrentDirectoryW` selection remains unimplemented and is not evidence for
+the formal sample-1 mechanism.
