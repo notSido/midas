@@ -23,6 +23,9 @@ const HEAP_ZERO_MEMORY: u32 = 0x8;
 /// Emulated-environment policy for the default user UI language: en-US.
 const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 
+/// Deterministic ID for the current thread exposed by the emulated environment.
+const EMULATED_CURRENT_THREAD_ID: u32 = 1;
+
 /// Opaque process-heap handle in the gap between the fixed PEB and heap arena.
 /// The handle remains unmapped and distinct from the allocator backing.
 const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
@@ -47,6 +50,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "VirtualFree",
     "ExitProcess",
     "GetUserDefaultUILanguage",
+    "GetCurrentThreadId",
 ];
 
 /// Seed ntdll export names observed during the bootstrap export walk; this is
@@ -290,6 +294,7 @@ struct HeapAllocation {
 pub struct Win64Env {
     image_base: u64,
     process_heap: u64,
+    current_thread_id: u32,
     heap_cursor: u64,
     heap_allocations: BTreeMap<u64, HeapAllocation>,
     modules: BTreeMap<String, u64>,
@@ -304,6 +309,7 @@ impl Win64Env {
         Self {
             image_base,
             process_heap: EMULATED_PROCESS_HEAP_HANDLE,
+            current_thread_id: EMULATED_CURRENT_THREAD_ID,
             heap_cursor: HEAP_ARENA_BASE,
             heap_allocations: BTreeMap::new(),
             modules: BTreeMap::new(),
@@ -588,6 +594,15 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
         }
         "GetProcessHeap" => {
             let ret = env.process_heap;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "GetCurrentThreadId" => {
+            let ret = u64::from(env.current_thread_id);
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
             Ok(ApiOutcome::Handled {
@@ -1332,6 +1347,80 @@ mod tests {
     }
 
     #[test]
+    fn get_current_thread_id_returns_stable_environment_policy_without_arguments() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first_rsp = crate::emu::STACK_BASE + 0x400;
+        let second_rsp = crate::emu::STACK_BASE + 0x500;
+        let first_return_address: u64 = 0x1234_5678_9abc_def0;
+        let second_return_address: u64 = 0x0fed_cba9_8765_4321;
+        emu.write_mem(first_rsp, &first_return_address.to_le_bytes())
+            .unwrap();
+        emu.write_mem(second_rsp, &second_return_address.to_le_bytes())
+            .unwrap();
+
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RCX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RDX, 0xaaaa_5555_ffff_0000)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, 0x0123_4567_89ab_cdef)
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, 0xfedc_ba98_7654_3210)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, first_rsp).unwrap();
+
+        let first = dispatch(&mut env, &mut emu, "GetCurrentThreadId").unwrap();
+        let ApiOutcome::Handled {
+            name: first_name,
+            ret: first_id,
+        } = first
+        else {
+            panic!("expected GetCurrentThreadId to be handled");
+        };
+        assert_eq!(first_name, "GetCurrentThreadId");
+        assert_eq!(first_id, u64::from(env.current_thread_id));
+        assert_eq!(first_id, 1);
+        assert_ne!(first_id, 0);
+        assert!(u32::try_from(first_id).is_ok());
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), first_id);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            first_return_address
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), first_rsp + 8);
+
+        emu.write_reg(RegisterX86::RAX, 0xffff_ffff_0000_0000)
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, 0x1111_2222_3333_4444)
+            .unwrap();
+        emu.write_reg(RegisterX86::RDX, 0x5555_6666_7777_8888)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, 0x9999_aaaa_bbbb_cccc)
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, 0xdddd_eeee_ffff_0000)
+            .unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, second_rsp).unwrap();
+
+        let second = dispatch(&mut env, &mut emu, "GetCurrentThreadId").unwrap();
+        assert_eq!(
+            second,
+            ApiOutcome::Handled {
+                name: "GetCurrentThreadId".to_owned(),
+                ret: first_id,
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), first_id);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            second_return_address
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), second_rsp + 8);
+    }
+
+    #[test]
     fn rtl_allocate_heap_handles_observed_zeroed_page_request() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -1526,6 +1615,38 @@ mod tests {
         assert_eq!(result.stop, TrapStop::InstructionCap);
         assert_ne!(expected_handle, 0);
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected_handle);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            image.entry_point_va() + 12
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_get_current_thread_id_via_name_resolved_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.ensure_kernel32(&mut emu).unwrap();
+        let module = env.synthetic_modules.get("kernel32.dll").unwrap();
+        let stub = module.export_stub("GetCurrentThreadId").unwrap();
+        let expected_id = u64::from(env.current_thread_id);
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["GetCurrentThreadId".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(expected_id, 1);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected_id);
         assert_eq!(
             emu.read_reg(RegisterX86::RIP).unwrap(),
             image.entry_point_va() + 12

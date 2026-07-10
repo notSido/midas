@@ -690,6 +690,12 @@ allocation semantics yet, so the trap stops before executing it.
 
 ## RtlAllocateHeap advances the loader through repeated process-heap requests
 
+Historical capture note: the outputs in this section were recorded at the
+merged heap-only baseline `3763982`, before `GetCurrentThreadId` was seeded.
+For samples 1 and 2, the same commands on the current branch include the
+additional call documented in the next section; sample 3 retains its separate
+28-call path. The allocation arguments and sequences remain unchanged.
+
 The fault-time capture at the previous wall was identical on all three samples:
 `RCX = 0x0000000f30000000` (the stable `GetProcessHeap` result), `RDX = 0x8`
 (`HEAP_ZERO_MEMORY`), `R8 = 0x1000`, and `R9 = 0`. The production replay below
@@ -714,7 +720,7 @@ Focused tests cover the RW/NX mapping primitive, the exact observed call,
 alignment and writeability, distinct non-overlapping blocks, metadata, the
 low-32-bit `ULONG` flag ABI, failure atomicity, bounded exhaustion, zero-size
 uniqueness, and an end-to-end call through the name-resolved synthetic ntdll
-stub. Reproduce the sample-dependent result with:
+stub. The heap-only capture used:
 
 ```
 cargo build --locked --release --example run_loader --example trap_postmortem
@@ -807,10 +813,10 @@ The corresponding flag (`RDX`) and requested-size (`R8`) captures were:
 | 3 | 26 | 25 | `0x8` | `0x410` |
 | 3 | 28 | 27 | `0x8` | `0x10` |
 
-The final `ReachedUntil` is again a trampoline `ret` whose consumed target is
-zero. On sample 1 it occurs after call 20 with `RIP = 0`, `RAX = 0`, and
-`[RSP-8] = 0`; samples 2 and 3 reach the same class of stop after calls 20 and 28
-respectively.
+At the heap-only baseline, the final `ReachedUntil` is again a trampoline `ret`
+whose consumed target is zero. On sample 1 it occurs after call 20 with
+`RIP = 0`, `RAX = 0`, and `[RSP-8] = 0`; samples 2 and 3 reach the same class of
+stop after calls 20 and 28 respectively.
 
 Those final stops were reproduced with `max_calls = 200`:
 
@@ -830,7 +836,116 @@ Relevant clipped stdout:
 
 ### New frontier
 
-The cause of this later null VM-handler value has not yet been diagnosed. In
-particular, the current artifact does not establish whether another missing
-synthetic export, an API side effect, or an internal VM value is responsible.
-That dependency must be traced before another Win64 behavior is added.
+At that baseline, the cause of this later null VM-handler value had not yet been
+diagnosed. The next section records the isolated trace that identified the
+missing export.
+
+## GetCurrentThreadId is the causal post-allocation gap on samples 1 and 2
+
+A temporary broad-name diagnostic using the 1,664 export names parsed from the
+authorized `samples/kernel32.dll` first changed formal sample 1's
+post-allocation ret-to-zero into an unhandled `GetCurrentThreadId` call. Sample
+2 selected the same name; sample 3 instead selected `GetCurrentDirectoryW`
+after its longer, payload-dependent allocation sequence. Because the broad
+table changes the synthetic export layout and the loader's export-walk cost, it
+was discovery evidence only, not the production justification. The throwaway
+broad-name source and raw log were not committed.
+
+The decisive temporary sample-1 A/B added exactly one line to the baseline
+kernel32 seed:
+
+```diff
++    "GetCurrentThreadId",
+```
+
+The runtime trace localized the baseline null to a new, per-instance handler
+slot at `0x1400ad4aa`. Its last writer is the same VM store used at earlier
+frontiers, `0x1400accf7` (`mov [r9],rbx`), and the final dispatcher reads it at
+`0x14005caf5`. With the baseline seed, that writer copies `0` from the VM
+context into the slot. With only `GetCurrentThreadId` added, the writer and
+destination are unchanged, but the source and stored value become the
+name-resolved stub `0x00007fff00001010`; the final dispatcher reads that exact
+value and the export trap reports `GetCurrentThreadId` as call 21. These
+addresses are sample-1 and synthetic-layout evidence, not production constants.
+The diagnostic tracer and raw log were not committed, so this is a captured
+investigation result rather than a command-reproducible repository artifact.
+The production code looks the export up and dispatches it by name; the committed
+production replay below independently reproduces the resulting call sequence.
+
+`GetCurrentThreadId` takes no arguments and returns a `DWORD`. The modeled
+single-thread environment owns deterministic nonzero ID `1`, stable for the
+lifetime of a `Win64Env`; dispatch converts the stored `u32` to `u64`, giving a
+deterministic zero-extended `RAX`, then performs the normal x64 return. This
+policy does not model scheduling, thread creation/termination, or system-wide
+uniqueness across separate environments. It also leaves the TEB `ClientId`
+region zero: this slice has no observed requirement that justifies introducing
+the associated process/thread-ID state. A direct TEB read could therefore
+disagree with this API until such a read is observed and modeled.
+
+Focused tests call the API twice with different garbage values in the volatile
+argument registers and assert the stable 32-bit result plus exact
+`RAX`/`RIP`/`RSP` effects. An end-to-end test resolves the synthetic kernel32
+stub by name, calls it through the normal export trap, and asserts the same
+result without relying on a fixed RVA. Reproduce the sample-dependent result
+with:
+
+```
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 20
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 20
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+```
+
+Setting `max_calls = 20` stops before dispatching call 21. The two first samples
+both show `RIP = 0x00007fff00001010`, while the consumed trampoline slot at
+`[RSP-8]` contains the same value. The address is the current name-sorted
+synthetic layout's `GetCurrentThreadId` stub, not a stable RVA. The preserved
+`RCX = 1`, `RDX = 2`, `R8 = 0x10`, and `R9 = 0` values are incidental guest
+state because this API has no parameters.
+
+Exact formal sample-1 production output:
+
+```
+handled APIs:
+  001: GetModuleHandleA
+  002: LoadLibraryA
+  003: LoadLibraryA
+  004: LoadLibraryA
+  005: LoadLibraryA
+  006: LoadLibraryA
+  007: GetProcAddress
+  008: GetProcAddress
+  009: RtlInitializeCriticalSection
+  010: GetModuleHandleA
+  011: LoadLibraryA
+  012: GetModuleHandleA
+  013: LoadLibraryA
+  014: GetModuleHandleA
+  015: LoadLibraryA
+  016: GetUserDefaultUILanguage
+  017: GetProcessHeap
+  018: RtlAllocateHeap
+  019: GetProcessHeap
+  020: RtlAllocateHeap
+  021: GetCurrentThreadId
+stop: ReachedUntil
+```
+
+Sample 2 has the same 21-call sequence as engineering corroboration. Both then
+return through zero; full `trap_postmortem` captures show `RAX = 1`, `RIP = 0`,
+and `[RSP-8] = 0`. Sample 3 retains its six-allocation, 28-call sequence and
+ret-to-zero, with no `GetCurrentThreadId` call. Its provenance remains
+incomplete, and its separately diagnosed `GetCurrentDirectoryW` selection is a
+different slice rather than part of the formal sample-1 mechanism.
+
+### New frontier
+
+The cause of the later null handler after sample-1/sample-2 call 21 has not yet
+been diagnosed. No additional Win64 behavior is justified until that new value
+is traced. `GetCurrentDirectoryW` remains a separate sample-3 observation and is
+not implemented here.
