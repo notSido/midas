@@ -2042,14 +2042,178 @@ handle and exact return-control effects.
 
 ### New frontier
 
-`CreateThread` advances formal sample 1 through call 36. Production then uses
-the existing `GetProcessHeap` and `RtlAllocateHeap` handlers as calls 37 and 38
-before returning through zero. A disposable broad export-name control on formal
-sample 1, corroborated by a narrow `CreateThread`-plus-`Sleep` seed, continues
-to `Sleep` as call 39 with `RCX = 1`; both the disposable NULL and non-NULL
-`CreateThread` return variants reach the same call. The production export seed
-does not contain `Sleep`, so its captured path stops after call 38 at the
-ret-to-zero and `Sleep` is not implemented in this slice. Sample 2 does not call
-`CreateThread`; sample 3 corroborates it at its separate call 35 and reaches 37
-calls before ret-to-zero, subject to its provenance limitation. Scheduling the
-recorded thread-entry candidate also remains outside this slice.
+At the CreateThread-only checkpoint, formal sample 1 advances through call 36.
+That production tree then uses the existing `GetProcessHeap` and
+`RtlAllocateHeap` handlers as calls 37 and 38 before returning through zero. A
+disposable broad export-name control on formal sample 1, corroborated by a
+narrow `CreateThread`-plus-`Sleep` seed, continues to `Sleep` as call 39 with
+`RCX = 1`; both the disposable NULL and non-NULL `CreateThread` return variants
+reach the same call. The checkpoint export seed did not contain `Sleep`, so
+that slice captured a stop after call 38 at the ret-to-zero. The subsequent
+Sleep slice below changes that frontier. Sample 2 does not call `CreateThread`;
+sample 3 corroborates it at its separate call 35 and reaches 37 calls before
+ret-to-zero, subject to its provenance limitation. Scheduling the recorded
+thread-entry candidate also remains outside the CreateThread slice.
+
+## Sleep exposes a stable polling loop after call 39
+
+The isolated diagnosis for this slice began from exact merged `CreateThread`
+commit `ca0daf054ec8bacd2f8d246387ed708d60b3d374`. Formal sample 1 is the
+milestone artifact. Samples 2 and 3 retain the incomplete
+version/configuration/source provenance recorded in `samples/SAMPLES.md` and
+are cited only as engineering corroboration.
+
+A disposable narrow export seed added only `Sleep` to the reviewed baseline.
+The formal 38-call prefix remained behaviorally stable, then the loader reached
+`Sleep` as call 39 at seed-layout stub `0x00007fff000010f0`. That address is
+derived from the temporary sorted export layout and is not a sample or
+production constant. Immediately before dispatch:
+
+```text
+RAX    = 0x0000000000000000
+RBX    = 0x0000000140060000
+RCX    = 0x0000000000000001
+RDX    = 0x0000000000000008
+RSI    = 0x0000000f40002004
+RDI    = 0x0000000140111133
+RBP    = 0x000000014004f000
+RSP    = 0x0000000fffffefc8
+R8     = 0x0000000000000010
+R9-R15 = 0x0000000000000000
+RIP    = 0x00007fff000010f0
+[RSP]  = 0x00000001401867d6
+```
+
+This establishes the observed argument as `Sleep(1)`. Microsoft documents
+`Sleep(DWORD dwMilliseconds)` as a `VOID` function that suspends the current
+thread until the interval elapses; zero yields its remaining time slice and
+`INFINITE` does not time out. The elapsed interval makes the thread ready, not
+necessarily running immediately, and timing depends on system clock resolution:
+<https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleep>.
+
+Returning immediately from call 39 reaches the same `Sleep(1)` stub again as
+call 40. The steady leg contains exactly 3,527 executed RIPs, beginning at the
+on-stack return address `0x00000001401867d6` and ending at
+`0x000000014005cb7c`; its FNV-1a digest over little-endian 64-bit addresses is
+`0x7fce9fdb31fbfd70`. Repeating to a 10,000-call bound handles 9,962 `Sleep`
+calls after the original 38-call prefix and stops only at `max_calls`; it does
+not reach another named export. Because `run_with_import_trap` applies its
+instruction cap separately to each resume leg, this 3,527-instruction loop also
+shows that `max_calls` is currently the effective whole-run bound for this path.
+
+An isolated return-sensitivity experiment preserved all other state and tried
+the incoming formal zero, a forced zero, and marker
+`0x0000000f30001aa0` in `RAX`. Every variant produced the identical 3,527-RIP
+leg and digest; the marker remained present at call 40. This proves that the
+captured leg does not consume `RAX`. It does not turn `RAX` into a return value:
+the Windows function is `VOID`, and preserving it is an explicit deterministic
+Midas policy rather than an ABI guarantee.
+
+### Bounded Sleep policy
+
+Production adds only `Sleep` to the synthetic kernel32 seed and consumes the
+low 32 bits of `RCX` as the `DWORD` interval. Every finite positive interval
+from `1` through `0xfffffffe` uses deterministic immediate wait elision and the
+scalar-free `ApiOutcome::HandledVoid` path. The shared API return consumes the
+on-stack return address and advances `RSP` by eight. `RAX`, all incidental
+general registers, and flags remain unchanged by policy. There is no host
+sleep, elapsed or virtual time, timer-resolution model, scheduler, yield,
+interleaving, or execution of a recorded created thread.
+
+Intervals zero and `0xffffffff` (`INFINITE`) are unsupported because their
+yield/nontermination semantics cannot be represented by immediate completion.
+They return `Unhandled` before the dispatcher reads the return stack or mutates
+machine or environment state. A finite-positive call with an invalid return
+frame retains the shared dispatcher error ordering and is failure-atomic for
+the state modeled by this handler.
+
+The five focused tests cover the observed interval one with dirty upper `RCX`
+bits; representative and finite-boundary generalization cases; zero and
+`INFINITE` rejection without stack access; invalid return-frame pointers with
+the 18-register observation snapshot and unchanged `Win64Env` state; and
+name-resolved export dispatch with genuine Win64 shadow space, balanced caller
+`RSP`, and no fixed stub RVA. The verification matrix is:
+
+```text
+cargo fmt --check
+cargo build --all-targets
+cargo test --all-targets              # 115 passed
+cargo clippy --all-targets -- -D warnings
+git diff --check
+cargo build --locked --release --example run_loader --example trap_postmortem
+```
+
+Release `run_loader` and `trap_postmortem` agree on the production paths:
+
+| Sample | Evidence role | Preserved prefix | First `Sleep` | Result at `max_calls = 200` |
+|---|---|---:|---:|---|
+| 1 | formal | 38 calls | 39 | 162 `Sleep(1)` calls; stops at `max_calls` |
+| 2 | engineering corroboration | 33 calls | not reached | unchanged `ReachedUntil` |
+| 3 | engineering corroboration | 37 calls | 38 | 163 `Sleep(1)` calls; stops at `max_calls` |
+
+At both the 40- and 200-call bounds, formal sample 1 is poised at the same
+derived Sleep stub with `RCX = 1`, `RSP = 0x0000000fffffefc8`, and the same
+`[RSP] = 0x00000001401867d6`. Sample 3 has the analogous stable loop with
+return address `0x0000000140255091`. The final `RAX = 0` in these captures is
+guest state and must not be read as a `Sleep` return value.
+
+### New frontier
+
+The production artifact exposes a stable main-thread polling loop rather than
+another missing export. A separate disposable trace on the exact baseline
+identified its semantic condition. At `0x000000014005ffeb`, the guest executes
+`cmp byte [r12],dil` with `R12 = 0x000000014005aae0`, `DIL = 0`, and the byte
+equal to zero. The resulting `ZF = 1` flows through VM selector `0x9b` at cursor
+`0x000000014029563f`, decoded as JNE; because the comparison is equal, the
+branch is not taken and the path reaches another `Sleep(1)`.
+
+The cell is rawless RWX `.themida` RVA `0x5aae0` and begins as mapped zero. A
+whole-prefix overlap-aware watch found exactly one guest write before the first
+Sleep: initial-run instruction 425,458 at `0x000000014030b1c5` executes
+`rep movsb`, copying zero from `0x000000014005aad8` into the cell. No later
+main-thread writer was observed. Changing only the cell from zero to one
+immediately before the compare clears `ZF`, avoids the next Sleep, and reaches
+`RIP = 0` after 66,588 executed instructions from the prior Sleep return; that
+intervened suffix has FNV-1a RIP digest `0x7ce3875e603e7b59`. This establishes
+the byte comparison as causal for repetition of the captured loop. It does not
+identify the Windows event or loader state the byte represents.
+
+### Isolated execution of the recorded child does not release the poll
+
+A second disposable control ran formal sample 1's created ID 2 directly from
+recorded start `0x0000000140058fa0`, parameter zero, in the already transformed
+shared guest image. The control used a disjoint 1 MiB RW/NX stack, an aligned
+Win64 entry frame with 32-byte shadow space and an unmapped return sentinel, a
+separate minimal TEB selected through `GS_BASE`, deterministic register state,
+and exact save/restore of the tracked 20-register main-thread set. These are
+diagnostic conditions, not a production scheduler or a claim of
+Windows-faithful thread startup.
+
+The child handles `LoadLibraryA` and `GetProcAddress`, then reaches unhandled
+`timeGetTime` after 14,086 guest instructions at dynamic proc stub
+`0x00007ffe00000020`; its on-stack return address is
+`0x000000014021a15d`. It reads the separate TEB Self qword three times at
+`0x00000001400ef7b5`, confirming that per-thread `GS`/TEB identity is consumed
+on this path. Diagnostic-only `timeGetTime` returns of zero, one, and
+`0x89abcdef` all produce the same 18,188-instruction terminal path at
+`RIP = 0`. The supplied low `DWORD` is stored at `0x000000014009af1d`, but the
+tail consumes an internal zero instead of reaching the installed return
+sentinel. The capture therefore does not establish a clean start-routine
+return; missing thread-start/VM context and an intentional zero terminal edge
+remain unresolved alternatives.
+
+An overlap-aware watch recorded no child read or write of poll cell
+`0x000000014005aae0`, which remained zero. The original main stack and main TEB
+were byte-identical before and after the child control. Restoring 20 main CPU
+registers, including flags and `FS_BASE`/`GS_BASE`, then applying the bounded
+immediate Sleep return reproduces the next Sleep in exactly 3,527 RIPs with
+baseline digest `0x7fce9fdb31fbfd70` for all three diagnostic clock results.
+
+This falsifies the narrow hypothesis that scheduling the recorded child once,
+under the tested direct-entry conditions, releases this particular Sleep loop.
+It does not falsify all scheduling models: a Windows startup thunk, fuller
+per-thread/TLS initialization, callbacks, interleaving, or time evolution were
+not modeled. The child supplies observation-driven evidence for a future
+bounded `timeGetTime` policy and for context/stack/TEB isolation, while its zero
+edge requires diagnosis before a scheduler can claim faithful thread lifecycle.
+No result in this section identifies an OEP.
