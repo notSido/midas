@@ -27,6 +27,9 @@ const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 /// Deterministic ID for the current thread exposed by the emulated environment.
 const EMULATED_CURRENT_THREAD_ID: u32 = 1;
 
+/// Deterministic uptime in milliseconds exposed by `timeGetTime`.
+const EMULATED_UPTIME_MS: u32 = 0;
+
 /// First ID in the finite created-thread namespace. The `u64` cursor can also
 /// represent one past `u32::MAX`, leaving `u32::MAX` available as a valid ID.
 const CREATED_THREAD_ID_BASE: u64 = 2;
@@ -864,6 +867,17 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             let ret = u64::from(EMULATED_WINDOWS_VERSION);
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "timeGetTime" => {
+            // Validate and consume the return frame before changing RAX so a
+            // bad frame leaves every register and the environment untouched.
+            api_return(emu)?;
+            let ret = u64::from(EMULATED_UPTIME_MS);
+            emu.write_reg(RegisterX86::RAX, ret)?;
             Ok(ApiOutcome::Handled {
                 name: name.to_owned(),
                 ret,
@@ -2290,6 +2304,99 @@ mod tests {
             second_return_address
         );
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), second_rsp + 8);
+    }
+
+    #[test]
+    fn time_get_time_returns_stable_zero_without_arguments() {
+        let call_and_assert =
+            |env: &mut Win64Env, emu: &mut Emu, rsp: u64, return_address: u64, rcx: u64| {
+                emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+                seed_sleep_machine_state(emu, rcx, rsp, 0x1111_2222_3333_4444);
+                let machine_before = sleep_machine_state(emu);
+                let environment_before = sleep_environment_state(env);
+                let return_frame_before = emu.read_mem(rsp, 8).unwrap();
+
+                let outcome = dispatch(env, emu, "timeGetTime").unwrap();
+
+                let expected = u64::from(EMULATED_UPTIME_MS);
+                assert_eq!(
+                    outcome,
+                    ApiOutcome::Handled {
+                        name: "timeGetTime".to_owned(),
+                        ret: expected,
+                    }
+                );
+                assert_eq!(expected, 0);
+                assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected);
+                assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+                for (register, value) in machine_before {
+                    let expected_register_value = match register {
+                        RegisterX86::RAX => expected,
+                        RegisterX86::RIP => return_address,
+                        RegisterX86::RSP => value + 8,
+                        _ => value,
+                    };
+                    assert_eq!(
+                        emu.read_reg(register).unwrap(),
+                        expected_register_value,
+                        "unexpected {register:?} change"
+                    );
+                }
+                assert_eq!(emu.read_mem(rsp, 8).unwrap(), return_frame_before);
+                assert_eq!(sleep_environment_state(env), environment_before);
+                expected
+            };
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first = call_and_assert(
+            &mut env,
+            &mut emu,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+            u64::MAX,
+        );
+        let second = call_and_assert(
+            &mut env,
+            &mut emu,
+            crate::emu::STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+            0xaaaa_5555_ffff_0000,
+        );
+
+        let mut fresh_emu = Emu::new().unwrap();
+        let mut fresh_env = Win64Env::new(IMAGE_BASE);
+        let fresh = call_and_assert(
+            &mut fresh_env,
+            &mut fresh_emu,
+            crate::emu::STACK_BASE + 0x600,
+            0x1357_2468_ace0_bdf1,
+            0x0123_4567_89ab_cdef,
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(second, fresh);
+    }
+
+    #[test]
+    fn time_get_time_invalid_return_frame_is_failure_atomic() {
+        for rsp in [0x0000_0000_dead_0000, u64::MAX] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            assert!(emu.read_mem(rsp, 8).is_err());
+            seed_sleep_machine_state(&mut emu, 0xaaaa_5555_ffff_0000, rsp, 0x1111_2222_3333_4444);
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let error = dispatch(&mut env, &mut emu, "timeGetTime").unwrap_err();
+
+            assert!(
+                matches!(error, EmuError::ReadMem { addr, size, .. } if addr == rsp && size == 8),
+                "return-frame read must precede RSP arithmetic: {error:?}"
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
     }
 
     #[test]
@@ -5477,6 +5584,99 @@ mod tests {
         let user32_base = emu.read_reg(RegisterX86::RAX).unwrap();
         assert_ne!(user32_base, 0);
         assert_ne!(user32_base, kernel32_base);
+    }
+
+    #[test]
+    fn trap_dispatches_dynamic_winmm_time_get_time_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut data = vec![0u8; 0x1000];
+        data[..b"winmm.dll\0".len()].copy_from_slice(b"winmm.dll\0");
+        data[0x40..0x40 + b"timeGetTime\0".len()].copy_from_slice(b"timeGetTime\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let direct_rsp = crate::emu::STACK_BASE + 0x400;
+        let load_return_address = 0x1234_5678_9abc_def0_u64;
+        emu.write_mem(direct_rsp, &load_return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, direct_rsp).unwrap();
+        let load = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        let ApiOutcome::Handled {
+            ret: winmm_handle, ..
+        } = load
+        else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+        assert_ne!(winmm_handle, 0);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), winmm_handle);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), load_return_address);
+        let winmm = env.synthetic_modules.get("winmm.dll").unwrap();
+        assert_eq!(winmm.base, winmm_handle);
+        assert!(winmm.exports.is_empty());
+        assert!(winmm.stub_rva_to_name.is_empty());
+        assert!(env.proc_stubs.is_empty());
+
+        let get_proc_rsp = crate::emu::STACK_BASE + 0x500;
+        let get_proc_return_address = 0x0fed_cba9_8765_4321_u64;
+        emu.write_mem(get_proc_rsp, &get_proc_return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, winmm_handle).unwrap();
+        emu.write_reg(RegisterX86::RDX, IMAGE_BASE + u64::from(DATA_RVA) + 0x40)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, get_proc_rsp).unwrap();
+        let get_proc = dispatch(&mut env, &mut emu, "GetProcAddress").unwrap();
+        let ApiOutcome::Handled {
+            ret: time_get_time_stub,
+            ..
+        } = get_proc
+        else {
+            panic!("expected GetProcAddress to be handled");
+        };
+        assert_ne!(time_get_time_stub, 0);
+        assert_eq!(env.proc_stubs.get("timeGetTime"), Some(&time_get_time_stub));
+        assert!(env.stub_export_at(time_get_time_stub).is_none());
+        assert_eq!(
+            env.proc_stub_at(time_get_time_stub).map(|(name, _)| name),
+            Some("timeGetTime".to_owned())
+        );
+
+        let marker = 0xfeed_face_cafe_beef_u64;
+        let mut code = Vec::new();
+        // Enter with the Win64 function-entry alignment, reserve 32 bytes of
+        // shadow space plus 8 bytes of alignment, call, then balance RSP.
+        code.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]);
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&time_get_time_stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0]);
+        code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28]);
+        code.extend_from_slice(&[0x49, 0xba]);
+        code.extend_from_slice(&marker.to_le_bytes());
+        code.extend_from_slice(&[0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let run_rsp = crate::emu::STACK_BASE + 0x808;
+        assert_eq!(run_rsp & 0xf, 8);
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::R10, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, run_rsp).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["timeGetTime".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::R10).unwrap(), marker);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), run_rsp);
+        assert_eq!(
+            read_u64_le(&emu.read_mem(run_rsp - 0x30, 8).unwrap()),
+            image.entry_point_va() + 16
+        );
     }
 
     #[test]

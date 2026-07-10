@@ -2268,3 +2268,94 @@ to read the restored `RIP` and pass it to resume. Context switches are intended
 at stopped or trapped boundaries, not from inside a running Unicorn hook. The
 child's unresolved zero-target edge still cannot be labeled a normal thread
 exit, and no result in this slice identifies an OEP.
+
+## Dynamic Winmm `timeGetTime` keeps the child zero edge unresolved
+
+This bounded Win64 slice began from exact merged CPU-context commit
+`77e17cd20c0fc008b6ee0a760058f0966866cf31`. Formal sample 1 is the sole
+milestone artifact for this replay; its SHA-256 was rechecked as
+`8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf`,
+matching `samples/SAMPLES.md`. Samples 2 and 3 retain incomplete provenance and
+were not used as formal evidence for this slice.
+
+Before implementation, an isolated pairing probe was repeated twice after the
+preserved 38-call main prefix. Both runs observed the recorded child at
+`0x0000000140058fa0` call `LoadLibraryA("winmm.dll")`, receive module handle
+`0x00007fff00900000`, and pass that exact handle plus the name `timeGetTime` to
+`GetProcAddress`. The existing dynamic procedure arena returned
+`0x00007ffe00000020`, where dispatch stopped as unhandled. This closes the DLL
+provenance gap that the earlier child finding left open.
+
+### Bounded policy
+
+Production deliberately leaves Winmm's synthetic export table empty and does
+not seed `timeGetTime` into kernel32, ntdll, or Winmm. The observed name is
+resolved through the existing dynamic `GetProcAddress` arena. The handler takes
+no arguments and returns the fixed host-independent `DWORD` value zero,
+explicitly zero-extended into `RAX`. It consumes a valid return frame before
+changing `RAX`, so an invalid frame leaves all tested CPU and environment state
+unchanged.
+
+Zero is a deterministic uptime snapshot, not an advancing clock. The handler
+does not consult host time, add mutable time state, advance on `Sleep`, schedule
+or yield threads, or attach lifecycle meaning to the child's terminal edge.
+Earlier diagnostic values zero, one, and `0x89abcdef` already produced the same
+child path, so the fixed result is sufficient for the observed call but is not
+a general timing model. The dynamic arena remains keyed only by function name;
+the exact Winmm handle pairing is verified here, but general DLL export
+membership is not claimed.
+
+Three focused tests cover repeated calls in one environment and a fresh
+environment with dirty register state; invalid return stacks with complete
+tracked-state preservation; and the actual `LoadLibraryA("winmm.dll")` then
+`GetProcAddress(handle, "timeGetTime")` route. The integration case proves the
+Winmm export table remains empty, the result reverse-maps through the dynamic
+arena rather than a seeded export, and a machine-code call with real Win64
+shadow space returns zero with a balanced stack.
+
+The verification matrix is:
+
+```text
+cargo fmt --check
+cargo build --all-targets
+cargo test --all-targets              # 121 passed
+cargo clippy --all-targets -- -D warnings
+git diff --check
+cargo build --locked --release --example run_loader --example trap_postmortem
+```
+
+### Formal production replay
+
+Release `run_loader` and `trap_postmortem` preserve formal sample 1's calls
+1–38, then handle `Sleep(1)` from call 39 through the 200-call bound. The result
+is unchanged from the Sleep slice: 162 Sleep calls after the prefix, poised at
+the same derived Sleep stub with the same registers and stack frame. Adding the
+child-only time API therefore does not change the normal unscheduled main path.
+
+A disposable production diagnostic then captured the main CPU context at that
+frontier and ran the recorded child directly with the previously documented
+disjoint stack and minimal TEB conditions. It produced:
+
+```text
+main_prefix=38
+LoadLibraryA("winmm.dll") -> 0x00007fff00900000
+GetProcAddress(0x00007fff00900000, "timeGetTime") -> 0x00007ffe00000020
+[timeGetTime RSP] -> 0x000000014021a15d
+stored DWORD at 0x000000014009af1d = 0
+post-time suffix = 4,102 RIPs, FNV-1a 0xf71d13ef9b4673bc
+stop = RIP 0
+```
+
+The 4,102-RIP suffix follows the previously measured 14,086-instruction
+entry-to-API prefix, preserving the 18,188-instruction total child run. The
+unmapped return sentinel was still not reached. The original main stack and TEB
+were byte-identical after the child. Restoring the new owner-checked CPU context
+and handling one `Sleep(1)` reproduced exactly 3,527 RIPs with digest
+`0x7fce9fdb31fbfd70` before the next Sleep stub.
+
+This establishes that the production time handler matches the observed dynamic
+Winmm call and that fixed zero does not resolve the captured child edge or main
+poll. It does not establish a Windows startup thunk, TLS initialization,
+scheduling, clean thread return, termination, or an OEP. The terminal zero
+remains diagnostic state whose source must be traced before scheduler lifecycle
+work can classify it.
