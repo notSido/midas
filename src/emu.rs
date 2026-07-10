@@ -1,6 +1,7 @@
 //! Minimal Unicorn-backed x86-64 emulation harness.
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use crate::pe;
 
@@ -9,8 +10,8 @@ pub use unicorn_engine::RegisterX86;
 use thiserror::Error;
 use unicorn_engine::{
     uc_error,
-    unicorn_const::{Arch, HookType, MemType, Mode, Prot},
-    Unicorn,
+    unicorn_const::{Arch, ContextMode, HookType, MemType, Mode, Prot},
+    Context, Unicorn,
 };
 
 const PAGE_SIZE: u64 = 0x1000;
@@ -76,6 +77,21 @@ pub const PEB_IMAGEBASE_OFFSET: u64 = 0x10;
 pub enum EmuError {
     #[error("failed to initialize Unicorn: {0}")]
     Init(#[source] uc_error),
+
+    #[error("failed to configure Unicorn for CPU-only contexts: {0}")]
+    ConfigureCpuContext(#[source] uc_error),
+
+    #[error("failed to capture Unicorn CPU context: {0}")]
+    CaptureCpuContext(#[source] uc_error),
+
+    #[error("failed to save Unicorn CPU context: {0}")]
+    SaveCpuContext(#[source] uc_error),
+
+    #[error("failed to restore Unicorn CPU context: {0}")]
+    RestoreCpuContext(#[source] uc_error),
+
+    #[error("CPU context belongs to another Emu")]
+    ForeignCpuContext,
 
     #[error("failed to map memory at 0x{addr:016x} ({size:#x} bytes): {source}")]
     Map {
@@ -232,15 +248,28 @@ struct EmuData {
     watch_hit_cap: usize,
 }
 
+/// An opaque, reusable snapshot of Unicorn CPU state owned by one [`Emu`].
+///
+/// This snapshots Unicorn CPU state only. Guest memory, memory mappings, hooks,
+/// `EmuData` observation buffers and counters, `Win64Env`, and scheduler or time
+/// state remain live and are not snapshotted.
+pub struct CpuContext {
+    context: Context,
+    owner: Rc<()>,
+}
+
 pub struct Emu {
     uc: Unicorn<'static, EmuData>,
     observation_hooks_installed: bool,
+    cpu_context_owner: Rc<()>,
 }
 
 impl Emu {
     pub fn new() -> Result<Self, EmuError> {
         let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, EmuData::default())
             .map_err(EmuError::Init)?;
+        uc.ctl_set_context_mode(ContextMode::CPU)
+            .map_err(EmuError::ConfigureCpuContext)?;
 
         map_region(&mut uc, STACK_BASE, STACK_SIZE, Prot::READ | Prot::WRITE)?;
         map_region(&mut uc, TEB_BASE, TEB_SIZE, Prot::READ | Prot::WRITE)?;
@@ -272,6 +301,7 @@ impl Emu {
         let mut emu = Self {
             uc,
             observation_hooks_installed: false,
+            cpu_context_owner: Rc::new(()),
         };
         emu.ensure_observation_hooks()?;
         Ok(emu)
@@ -460,6 +490,50 @@ impl Emu {
         self.uc
             .reg_read(reg)
             .map_err(|source| EmuError::ReadReg { reg, source })
+    }
+
+    /// Capture the current Unicorn CPU state into a new reusable context.
+    ///
+    /// See [`CpuContext`] for the intentionally narrow snapshot scope.
+    pub fn capture_cpu_context(&self) -> Result<CpuContext, EmuError> {
+        let context = self
+            .uc
+            .context_init()
+            .map_err(EmuError::CaptureCpuContext)?;
+        Ok(CpuContext {
+            context,
+            owner: Rc::clone(&self.cpu_context_owner),
+        })
+    }
+
+    /// Overwrite an owned context with the current Unicorn CPU state.
+    ///
+    /// A context from another [`Emu`] is rejected before calling Unicorn.
+    pub fn save_cpu_context(&self, context: &mut CpuContext) -> Result<(), EmuError> {
+        if !Rc::ptr_eq(&self.cpu_context_owner, &context.owner) {
+            return Err(EmuError::ForeignCpuContext);
+        }
+
+        self.uc
+            .context_save(&mut context.context)
+            .map_err(EmuError::SaveCpuContext)
+    }
+
+    /// Restore Unicorn CPU state from an owned context.
+    ///
+    /// A context from another [`Emu`] is rejected before calling Unicorn. See
+    /// [`CpuContext`] for state that deliberately remains live across restore.
+    /// Because [`Emu::run`] and [`Emu::resume`] take an explicit start address,
+    /// a caller resuming this state must read the restored `RIP` and pass it as
+    /// that address.
+    pub fn restore_cpu_context(&mut self, context: &CpuContext) -> Result<(), EmuError> {
+        if !Rc::ptr_eq(&self.cpu_context_owner, &context.owner) {
+            return Err(EmuError::ForeignCpuContext);
+        }
+
+        self.uc
+            .context_restore(&context.context)
+            .map_err(EmuError::RestoreCpuContext)
     }
 
     pub fn read_mem(&self, addr: u64, len: usize) -> Result<Vec<u8>, EmuError> {
@@ -995,6 +1069,33 @@ mod tests {
         0x48, 0x0f, 0xaf, 0xc1, // imul rax, rcx
         0x48, 0x83, 0xc0, 0x07, // add rax, 7
     ];
+    const SEEDED_GPRS: [RegisterX86; 15] = [
+        RegisterX86::RAX,
+        RegisterX86::RBX,
+        RegisterX86::RCX,
+        RegisterX86::RDX,
+        RegisterX86::RSI,
+        RegisterX86::RDI,
+        RegisterX86::RBP,
+        RegisterX86::R8,
+        RegisterX86::R9,
+        RegisterX86::R10,
+        RegisterX86::R11,
+        RegisterX86::R12,
+        RegisterX86::R13,
+        RegisterX86::R14,
+        RegisterX86::R15,
+    ];
+
+    struct CpuStateSeed {
+        gpr_base: u64,
+        rsp: u64,
+        rip: u64,
+        eflags: u64,
+        fs_base: u64,
+        gs_base: u64,
+        xmm0: [u8; 16],
+    }
 
     fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -1020,6 +1121,39 @@ mod tests {
         } else {
             (1u64 << (size * 8)) - 1
         }
+    }
+
+    fn write_cpu_state(emu: &mut Emu, seed: &CpuStateSeed) {
+        for (index, &reg) in SEEDED_GPRS.iter().enumerate() {
+            emu.write_reg(reg, seed.gpr_base + index as u64).unwrap();
+        }
+        emu.write_reg(RegisterX86::RSP, seed.rsp).unwrap();
+        emu.write_reg(RegisterX86::RIP, seed.rip).unwrap();
+        emu.write_reg(RegisterX86::EFLAGS, seed.eflags).unwrap();
+        emu.write_reg(RegisterX86::FS_BASE, seed.fs_base).unwrap();
+        emu.write_reg(RegisterX86::GS_BASE, seed.gs_base).unwrap();
+        emu.uc
+            .reg_write_long(RegisterX86::XMM0, &seed.xmm0)
+            .unwrap();
+    }
+
+    fn assert_cpu_state(emu: &Emu, seed: &CpuStateSeed) {
+        for (index, &reg) in SEEDED_GPRS.iter().enumerate() {
+            assert_eq!(
+                emu.read_reg(reg).unwrap(),
+                seed.gpr_base + index as u64,
+                "unexpected value for {reg:?}"
+            );
+        }
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), seed.rsp);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), seed.rip);
+        assert_eq!(emu.read_reg(RegisterX86::EFLAGS).unwrap(), seed.eflags);
+        assert_eq!(emu.read_reg(RegisterX86::FS_BASE).unwrap(), seed.fs_base);
+        assert_eq!(emu.read_reg(RegisterX86::GS_BASE).unwrap(), seed.gs_base);
+        assert_eq!(
+            emu.uc.reg_read_long(RegisterX86::XMM0).unwrap().as_ref(),
+            seed.xmm0.as_slice()
+        );
     }
 
     fn minimal_pe64_with_text_pattern() -> Vec<u8> {
@@ -1088,6 +1222,161 @@ mod tests {
             STACK_BASE + STACK_SIZE
         );
         assert_eq!(emu.read_reg(RegisterX86::GS_BASE).unwrap(), TEB_BASE);
+    }
+
+    #[test]
+    fn cpu_context_roundtrips_and_can_be_overwritten() {
+        let captured = CpuStateSeed {
+            gpr_base: 0x1111_0000_0000_0000,
+            rsp: STACK_BASE + 0x1_0000,
+            rip: CODE_BASE + 0x10,
+            eflags: 0x202,
+            fs_base: PEB_BASE,
+            gs_base: TEB_BASE,
+            xmm0: [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ],
+        };
+        let overwritten = CpuStateSeed {
+            gpr_base: 0x2222_0000_0000_0000,
+            rsp: STACK_BASE + 0x2_0000,
+            rip: CODE_BASE + 0x20,
+            eflags: 0x246,
+            fs_base: STACK_BASE,
+            gs_base: PEB_BASE,
+            xmm0: [
+                0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+                0x11, 0x00,
+            ],
+        };
+        let poison = CpuStateSeed {
+            gpr_base: 0x3333_0000_0000_0000,
+            rsp: STACK_BASE + 0x3_0000,
+            rip: CODE_BASE + 0x30,
+            eflags: 0x286,
+            fs_base: TEB_BASE,
+            gs_base: STACK_BASE,
+            xmm0: [
+                0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45,
+                0x23, 0x01,
+            ],
+        };
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &[0x90; 0x40]).unwrap();
+
+        write_cpu_state(&mut emu, &captured);
+        let mut context = emu.capture_cpu_context().unwrap();
+
+        write_cpu_state(&mut emu, &poison);
+        emu.restore_cpu_context(&context).unwrap();
+        assert_cpu_state(&emu, &captured);
+
+        write_cpu_state(&mut emu, &overwritten);
+        emu.save_cpu_context(&mut context).unwrap();
+        write_cpu_state(&mut emu, &poison);
+        emu.restore_cpu_context(&context).unwrap();
+        assert_cpu_state(&emu, &overwritten);
+    }
+
+    #[test]
+    fn cpu_context_restore_leaves_memory_observations_and_hooks_live() {
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &[0x90; 3]).unwrap();
+
+        let shared_address = STACK_BASE + 0x800;
+        emu.write_mem(shared_address, &[0x11, 0x22, 0x33, 0x44])
+            .unwrap();
+        let context = emu.capture_cpu_context().unwrap();
+
+        emu.install_code_trace_hook().unwrap();
+        emu.write_mem(shared_address, &[0xaa, 0xbb, 0xcc, 0xdd])
+            .unwrap();
+        emu.run(CODE_BASE, CODE_BASE + 1, 1).unwrap();
+        emu.run(CODE_BASE + 1, CODE_BASE + 2, 1).unwrap();
+
+        let history_before_restore = vec![CODE_BASE, CODE_BASE + 1];
+        assert_eq!(emu.executed_addresses(), history_before_restore);
+        assert_eq!(emu.recent_rips(), vec![CODE_BASE, CODE_BASE + 1]);
+        assert_eq!(emu.uc.get_data().instr_count, 2);
+
+        emu.restore_cpu_context(&context).unwrap();
+
+        assert_eq!(
+            emu.read_mem(shared_address, 4).unwrap(),
+            vec![0xaa, 0xbb, 0xcc, 0xdd]
+        );
+        assert_eq!(emu.executed_addresses(), history_before_restore);
+        assert_eq!(emu.recent_rips(), vec![CODE_BASE, CODE_BASE + 1]);
+        assert_eq!(emu.uc.get_data().instr_count, 2);
+
+        emu.run(CODE_BASE + 2, CODE_BASE + 3, 1).unwrap();
+        assert_eq!(
+            emu.executed_addresses(),
+            vec![CODE_BASE, CODE_BASE + 1, CODE_BASE + 2]
+        );
+        assert_eq!(
+            emu.recent_rips(),
+            vec![CODE_BASE, CODE_BASE + 1, CODE_BASE + 2]
+        );
+        assert_eq!(emu.uc.get_data().instr_count, 3);
+    }
+
+    #[test]
+    fn foreign_cpu_context_is_rejected_without_side_effects() {
+        let owner_captured = CpuStateSeed {
+            gpr_base: 0x4444_0000_0000_0000,
+            rsp: STACK_BASE + 0x4_0000,
+            rip: CODE_BASE + 0x10,
+            eflags: 0x202,
+            fs_base: PEB_BASE,
+            gs_base: TEB_BASE,
+            xmm0: [0x44; 16],
+        };
+        let owner_poison = CpuStateSeed {
+            gpr_base: 0x5555_0000_0000_0000,
+            rsp: STACK_BASE + 0x5_0000,
+            rip: CODE_BASE + 0x20,
+            eflags: 0x246,
+            fs_base: STACK_BASE,
+            gs_base: PEB_BASE,
+            xmm0: [0x55; 16],
+        };
+        let foreign_destination = CpuStateSeed {
+            gpr_base: 0x6666_0000_0000_0000,
+            rsp: STACK_BASE + 0x6_0000,
+            rip: CODE_BASE + 0x30,
+            eflags: 0x286,
+            fs_base: TEB_BASE,
+            gs_base: STACK_BASE,
+            xmm0: [0x66; 16],
+        };
+
+        let mut owner = Emu::new().unwrap();
+        owner.map_code(CODE_BASE, &[0x90; 0x40]).unwrap();
+        write_cpu_state(&mut owner, &owner_captured);
+        let mut context = owner.capture_cpu_context().unwrap();
+        write_cpu_state(&mut owner, &owner_poison);
+
+        let mut foreign = Emu::new().unwrap();
+        foreign.map_code(CODE_BASE, &[0x90; 0x40]).unwrap();
+        write_cpu_state(&mut foreign, &foreign_destination);
+
+        assert!(matches!(
+            foreign.save_cpu_context(&mut context),
+            Err(EmuError::ForeignCpuContext)
+        ));
+        assert_cpu_state(&foreign, &foreign_destination);
+
+        assert!(matches!(
+            foreign.restore_cpu_context(&context),
+            Err(EmuError::ForeignCpuContext)
+        ));
+        assert_cpu_state(&foreign, &foreign_destination);
+
+        owner.restore_cpu_context(&context).unwrap();
+        assert_cpu_state(&owner, &owner_captured);
     }
 
     #[test]
