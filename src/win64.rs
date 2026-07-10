@@ -40,6 +40,12 @@ const EMULATED_EXECUTABLE_PATH: [u16; 12] = [
 /// The handle remains unmapped and distinct from the allocator backing.
 const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
 
+/// Start of the finite opaque vectored-exception-handler token namespace. It
+/// begins immediately after the fixed PEB mapping and ends at the process-heap
+/// handle, which is the exclusive upper bound. Tokens remain unmapped.
+const VECTORED_EXCEPTION_HANDLER_TOKEN_BASE: u64 = crate::emu::PEB_BASE + crate::emu::PEB_SIZE;
+const VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE: u64 = 0x10;
+
 /// Start of the registry-backed opaque kernel-handle namespace. These values
 /// remain unmapped; `HEAP_ARENA_BASE` is the exclusive upper bound.
 const KERNEL_HANDLE_BASE: u64 = 0x0000_000f_3000_1000;
@@ -337,6 +343,12 @@ struct KernelHandle {
     inheritable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VectoredExceptionHandlerRegistration {
+    token: u64,
+    handler: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Win64Env {
     image_base: u64,
@@ -344,6 +356,8 @@ pub struct Win64Env {
     current_thread_id: u32,
     current_directory: [u16; 3],
     executable_path: [u16; 12],
+    next_vectored_exception_handler_token: u64,
+    vectored_exception_handlers: Vec<VectoredExceptionHandlerRegistration>,
     next_kernel_handle: u64,
     kernel_handles: BTreeMap<u64, KernelHandle>,
     heap_cursor: u64,
@@ -363,6 +377,8 @@ impl Win64Env {
             current_thread_id: EMULATED_CURRENT_THREAD_ID,
             current_directory: EMULATED_CURRENT_DIRECTORY,
             executable_path: EMULATED_EXECUTABLE_PATH,
+            next_vectored_exception_handler_token: VECTORED_EXCEPTION_HANDLER_TOKEN_BASE,
+            vectored_exception_handlers: Vec::new(),
             next_kernel_handle: KERNEL_HANDLE_BASE,
             kernel_handles: BTreeMap::new(),
             heap_cursor: HEAP_ARENA_BASE,
@@ -373,6 +389,35 @@ impl Win64Env {
             proc_stubs: BTreeMap::new(),
             proc_stub_mapped_end: PROC_STUB_BASE,
         }
+    }
+
+    fn add_vectored_exception_handler(&mut self, first: u32, handler: u64) -> u64 {
+        // Bounded policy: registration only records the opaque callback value
+        // and insertion order. It does not inspect callback memory or model
+        // dispatch, removal, lifetime, or synchronization semantics.
+        let token = self.next_vectored_exception_handler_token;
+        let Some(next_token) = token.checked_add(VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE) else {
+            return 0;
+        };
+        if !(VECTORED_EXCEPTION_HANDLER_TOKEN_BASE..EMULATED_PROCESS_HEAP_HANDLE).contains(&token)
+            || !token.is_multiple_of(VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE)
+            || next_token > EMULATED_PROCESS_HEAP_HANDLE
+            || self
+                .vectored_exception_handlers
+                .iter()
+                .any(|registration| registration.token == token)
+        {
+            return 0;
+        }
+
+        let registration = VectoredExceptionHandlerRegistration { token, handler };
+        if first == 0 {
+            self.vectored_exception_handlers.push(registration);
+        } else {
+            self.vectored_exception_handlers.insert(0, registration);
+        }
+        self.next_vectored_exception_handler_token = next_token;
+        token
     }
 
     fn open_thread(&mut self, desired_access: u32, inheritable: bool, thread_id: u32) -> u64 {
@@ -808,6 +853,19 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "RtlAddVectoredExceptionHandler" => {
+            // First is ULONG and consumes only ECX. Handler is a pointer and
+            // retains the full RDX value, including NULL or an unmapped value.
+            let first = emu.read_reg(RegisterX86::RCX)? as u32;
+            let handler = emu.read_reg(RegisterX86::RDX)?;
+            let ret = env.add_vectored_exception_handler(first, handler);
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
         "RtlAllocateHeap" => {
             let heap_handle = emu.read_reg(RegisterX86::RCX)?;
             // Flags is ULONG, so the x64 ABI consumes only EDX.
@@ -1193,6 +1251,33 @@ mod tests {
         };
         assert_eq!(name, "RtlAllocateHeap");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn call_rtl_add_vectored_exception_handler(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        first: u64,
+        handler: u64,
+    ) -> u64 {
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RCX, first).unwrap();
+        emu.write_reg(RegisterX86::RDX, handler).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "RtlAddVectoredExceptionHandler").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected RtlAddVectoredExceptionHandler to be handled");
+        };
+        assert_eq!(name, "RtlAddVectoredExceptionHandler");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), handler);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
         ret
@@ -2459,6 +2544,245 @@ mod tests {
     }
 
     #[test]
+    fn rtl_add_vectored_exception_handler_handles_exact_observed_call() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let observed_handler = 0x0000_0001_4006_aa83;
+
+        assert!(emu.read_mem(observed_handler, 1).is_err());
+        let token =
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, observed_handler);
+
+        assert_eq!(token, VECTORED_EXCEPTION_HANDLER_TOKEN_BASE);
+        assert_ne!(token, 0);
+        assert!(token > u64::from(u32::MAX));
+        assert!(token < EMULATED_PROCESS_HEAP_HANDLE);
+        assert!(emu.read_mem(token, 1).is_err());
+        assert_eq!(
+            env.vectored_exception_handlers,
+            vec![VectoredExceptionHandlerRegistration {
+                token,
+                handler: observed_handler,
+            }]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), token);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            0x1234_5678_9abc_def0
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RSP).unwrap(),
+            crate::emu::STACK_BASE + 0x408
+        );
+    }
+
+    #[test]
+    fn rtl_add_vectored_exception_handler_uses_low_32_first_bits_and_full_handler_width_in_order() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let handler_a = 0x1111_2222_3333_4444;
+        let handler_b = 0x5555_6666_7777_8888;
+        let handler_c = 0x9999_aaaa_bbbb_cccc;
+        let handler_d = 0xdddd_eeee_ffff_0001;
+
+        let token_a = call_rtl_add_vectored_exception_handler(
+            &mut env,
+            &mut emu,
+            0xaaaa_bbbb_0000_0000,
+            handler_a,
+        );
+        let token_b = call_rtl_add_vectored_exception_handler(
+            &mut env,
+            &mut emu,
+            0xcccc_dddd_0000_0000,
+            handler_b,
+        );
+        let token_c = call_rtl_add_vectored_exception_handler(
+            &mut env,
+            &mut emu,
+            0xeeee_ffff_0000_0001,
+            handler_c,
+        );
+        let token_d = call_rtl_add_vectored_exception_handler(
+            &mut env,
+            &mut emu,
+            0x1234_5678_8000_0000,
+            handler_d,
+        );
+
+        assert_eq!(token_a, VECTORED_EXCEPTION_HANDLER_TOKEN_BASE);
+        assert_eq!(token_b, token_a + VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE);
+        assert_eq!(token_c, token_b + VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE);
+        assert_eq!(token_d, token_c + VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE);
+        assert_eq!(
+            env.vectored_exception_handlers,
+            vec![
+                VectoredExceptionHandlerRegistration {
+                    token: token_d,
+                    handler: handler_d,
+                },
+                VectoredExceptionHandlerRegistration {
+                    token: token_c,
+                    handler: handler_c,
+                },
+                VectoredExceptionHandlerRegistration {
+                    token: token_a,
+                    handler: handler_a,
+                },
+                VectoredExceptionHandlerRegistration {
+                    token: token_b,
+                    handler: handler_b,
+                },
+            ]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), handler_d);
+    }
+
+    #[test]
+    fn rtl_add_vectored_exception_handler_keeps_duplicate_and_zero_callbacks_independent() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let duplicate_handler = 0x0000_7fff_dead_beef;
+
+        assert!(emu.read_mem(duplicate_handler, 1).is_err());
+        assert!(emu.read_mem(0, 1).is_err());
+        let first =
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, duplicate_handler);
+        let zero = call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, 0);
+        let duplicate =
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, duplicate_handler);
+
+        assert_ne!(first, zero);
+        assert_ne!(first, duplicate);
+        assert_ne!(zero, duplicate);
+        assert_eq!(
+            env.vectored_exception_handlers,
+            vec![
+                VectoredExceptionHandlerRegistration {
+                    token: first,
+                    handler: duplicate_handler,
+                },
+                VectoredExceptionHandlerRegistration {
+                    token: zero,
+                    handler: 0,
+                },
+                VectoredExceptionHandlerRegistration {
+                    token: duplicate,
+                    handler: duplicate_handler,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rtl_add_vectored_exception_handler_allocator_failures_are_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+
+        for rejected_cursor in [
+            VECTORED_EXCEPTION_HANDLER_TOKEN_BASE - VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE,
+            VECTORED_EXCEPTION_HANDLER_TOKEN_BASE + 1,
+            EMULATED_PROCESS_HEAP_HANDLE,
+            u64::MAX,
+        ] {
+            env.next_vectored_exception_handler_token = rejected_cursor;
+            let registrations_before = env.vectored_exception_handlers.clone();
+            assert_eq!(
+                call_rtl_add_vectored_exception_handler(
+                    &mut env,
+                    &mut emu,
+                    0,
+                    0x1111_2222_3333_4444,
+                ),
+                0
+            );
+            assert_eq!(env.next_vectored_exception_handler_token, rejected_cursor);
+            assert_eq!(env.vectored_exception_handlers, registrations_before);
+        }
+
+        env.next_vectored_exception_handler_token = VECTORED_EXCEPTION_HANDLER_TOKEN_BASE;
+        let first =
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, 0x5555_6666_7777_8888);
+        assert_eq!(first, VECTORED_EXCEPTION_HANDLER_TOKEN_BASE);
+
+        env.next_vectored_exception_handler_token = first;
+        let registrations_before_collision = env.vectored_exception_handlers.clone();
+        assert_eq!(
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, 0x9999_aaaa_bbbb_cccc),
+            0
+        );
+        assert_eq!(env.next_vectored_exception_handler_token, first);
+        assert_eq!(
+            env.vectored_exception_handlers,
+            registrations_before_collision
+        );
+
+        let last_token = EMULATED_PROCESS_HEAP_HANDLE - VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE;
+        env.next_vectored_exception_handler_token = last_token;
+        assert_eq!(
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, 0xdddd_eeee_ffff_0001),
+            last_token
+        );
+        assert_eq!(
+            env.next_vectored_exception_handler_token,
+            EMULATED_PROCESS_HEAP_HANDLE
+        );
+
+        let registrations_at_limit = env.vectored_exception_handlers.clone();
+        assert_eq!(
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, u64::MAX),
+            0
+        );
+        assert_eq!(
+            env.next_vectored_exception_handler_token,
+            EMULATED_PROCESS_HEAP_HANDLE
+        );
+        assert_eq!(env.vectored_exception_handlers, registrations_at_limit);
+    }
+
+    #[test]
+    fn rtl_add_vectored_exception_handler_is_deterministic_and_isolated_per_environment() {
+        let mut first_emu = Emu::new().unwrap();
+        let mut first_env = Win64Env::new(IMAGE_BASE);
+        let mut second_emu = Emu::new().unwrap();
+        let mut second_env = Win64Env::new(IMAGE_BASE);
+
+        let first_token = call_rtl_add_vectored_exception_handler(
+            &mut first_env,
+            &mut first_emu,
+            0,
+            0x1111_2222_3333_4444,
+        );
+        let second_token = call_rtl_add_vectored_exception_handler(
+            &mut second_env,
+            &mut second_emu,
+            0,
+            0x5555_6666_7777_8888,
+        );
+
+        assert_eq!(first_token, VECTORED_EXCEPTION_HANDLER_TOKEN_BASE);
+        assert_eq!(second_token, VECTORED_EXCEPTION_HANDLER_TOKEN_BASE);
+        assert_eq!(first_env.vectored_exception_handlers.len(), 1);
+        assert_eq!(second_env.vectored_exception_handlers.len(), 1);
+        assert_eq!(
+            first_env.vectored_exception_handlers[0].handler,
+            0x1111_2222_3333_4444
+        );
+        assert_eq!(
+            second_env.vectored_exception_handlers[0].handler,
+            0x5555_6666_7777_8888
+        );
+        assert_eq!(
+            first_env.next_vectored_exception_handler_token,
+            VECTORED_EXCEPTION_HANDLER_TOKEN_BASE + VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE
+        );
+        assert_eq!(
+            second_env.next_vectored_exception_handler_token,
+            VECTORED_EXCEPTION_HANDLER_TOKEN_BASE + VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE
+        );
+    }
+
+    #[test]
     fn open_thread_handles_observed_call_with_dirty_upper_halves() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -3129,6 +3453,62 @@ mod tests {
             emu.read_reg(RegisterX86::RIP).unwrap(),
             image.entry_point_va() + 22
         );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_name_resolved_ntdll_rtl_add_vectored_exception_handler_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let ntdll_base = env.ensure_loaded_module(&mut emu, "ntdll.dll").unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("ntdll.dll")
+            .unwrap()
+            .export_stub("RtlAddVectoredExceptionHandler")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, ntdll_base, "RtlAddVectoredExceptionHandler")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+
+        let observed_handler = 0x0000_0001_4006_aa83u64;
+        assert!(emu.read_mem(observed_handler, 1).is_err());
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&1u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xba]);
+        code.extend_from_slice(&observed_handler.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(
+            result.handled,
+            vec!["RtlAddVectoredExceptionHandler".to_owned()]
+        );
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        let token = emu.read_reg(RegisterX86::RAX).unwrap();
+        assert_eq!(token, VECTORED_EXCEPTION_HANDLER_TOKEN_BASE);
+        assert!(token > u64::from(u32::MAX));
+        assert!(emu.read_mem(token, 1).is_err());
+        assert!(emu.read_mem(observed_handler, 1).is_err());
+        assert_eq!(
+            env.vectored_exception_handlers,
+            vec![VectoredExceptionHandlerRegistration {
+                token,
+                handler: observed_handler,
+            }]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
     }
 
