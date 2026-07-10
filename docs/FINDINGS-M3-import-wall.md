@@ -792,20 +792,20 @@ stop:    Other("max_calls reached")
 The shown `0x00007fff00301020` is the name-resolved `RtlAllocateHeap` stub in
 this synthetic-module layout, not a stable production constant.
 
-The corresponding requested-size (`R8`) captures were:
+The corresponding flag (`RDX`) and requested-size (`R8`) captures were:
 
-| Sample | Target call | `max_calls` | `R8` |
-|---|---:|---:|---:|
-| 1 | 18 | 17 | `0x1000` |
-| 1 | 20 | 19 | `0x10` |
-| 2 | 18 | 17 | `0x1000` |
-| 2 | 20 | 19 | `0x10` |
-| 3 | 18 | 17 | `0x1000` |
-| 3 | 20 | 19 | `0x10` |
-| 3 | 22 | 21 | `0x410` |
-| 3 | 24 | 23 | `0x10` |
-| 3 | 26 | 25 | `0x410` |
-| 3 | 28 | 27 | `0x10` |
+| Sample | Target call | `max_calls` | `RDX` | `R8` |
+|---|---:|---:|---:|---:|
+| 1 | 18 | 17 | `0x8` | `0x1000` |
+| 1 | 20 | 19 | `0x8` | `0x10` |
+| 2 | 18 | 17 | `0x8` | `0x1000` |
+| 2 | 20 | 19 | `0x8` | `0x10` |
+| 3 | 18 | 17 | `0x8` | `0x1000` |
+| 3 | 20 | 19 | `0x8` | `0x10` |
+| 3 | 22 | 21 | `0x8` | `0x410` |
+| 3 | 24 | 23 | `0x8` | `0x10` |
+| 3 | 26 | 25 | `0x8` | `0x410` |
+| 3 | 28 | 27 | `0x8` | `0x10` |
 
 The final `ReachedUntil` is again a trampoline `ret` whose consumed target is
 zero. On sample 1 it occurs after call 20 with `RIP = 0`, `RAX = 0`, and
