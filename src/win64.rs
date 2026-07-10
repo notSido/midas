@@ -27,6 +27,10 @@ const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 /// Deterministic ID for the current thread exposed by the emulated environment.
 const EMULATED_CURRENT_THREAD_ID: u32 = 1;
 
+/// Host-independent unmanifested Windows 8 compatibility view returned by
+/// `GetVersion`: major 6, minor 2, build 9200, with the platform bit clear.
+const EMULATED_WINDOWS_VERSION: u32 = 0x23f0_0206;
+
 /// Host-independent current directory exposed by each emulated environment.
 const EMULATED_CURRENT_DIRECTORY: [u16; 3] = [0x43, 0x3a, 0x5c];
 
@@ -79,6 +83,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "SetCurrentDirectoryW",
     "GetModuleFileNameW",
     "OpenThread",
+    "GetVersion",
 ];
 
 /// Seed ntdll export names observed during the bootstrap export walk; this is
@@ -741,6 +746,16 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
         }
         "GetCurrentThreadId" => {
             let ret = u64::from(env.current_thread_id);
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "GetVersion" => {
+            // DWORD is a 32-bit ABI value; explicitly zero-extend it into RAX.
+            let ret = u64::from(EMULATED_WINDOWS_VERSION);
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
             Ok(ApiOutcome::Handled {
@@ -1851,6 +1866,86 @@ mod tests {
         );
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), first_id);
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            second_return_address
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), second_rsp + 8);
+    }
+
+    #[test]
+    fn get_version_returns_stable_packed_environment_policy_without_arguments() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first_rsp = crate::emu::STACK_BASE + 0x400;
+        let second_rsp = crate::emu::STACK_BASE + 0x500;
+        let first_return_address = 0x1234_5678_9abc_def0_u64;
+        let second_return_address = 0x0fed_cba9_8765_4321_u64;
+        emu.write_mem(first_rsp, &first_return_address.to_le_bytes())
+            .unwrap();
+        emu.write_mem(second_rsp, &second_return_address.to_le_bytes())
+            .unwrap();
+
+        let first_rcx = u64::MAX;
+        let first_rdx = 0xaaaa_5555_ffff_0000;
+        let first_r8 = 0x0123_4567_89ab_cdef;
+        let first_r9 = 0xfedc_ba98_7654_3210;
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RCX, first_rcx).unwrap();
+        emu.write_reg(RegisterX86::RDX, first_rdx).unwrap();
+        emu.write_reg(RegisterX86::R8, first_r8).unwrap();
+        emu.write_reg(RegisterX86::R9, first_r9).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, first_rsp).unwrap();
+
+        let first = dispatch(&mut env, &mut emu, "GetVersion").unwrap();
+        let expected = u64::from(EMULATED_WINDOWS_VERSION);
+        assert_eq!(
+            first,
+            ApiOutcome::Handled {
+                name: "GetVersion".to_owned(),
+                ret: expected,
+            }
+        );
+        let packed = u32::try_from(expected).unwrap();
+        assert_eq!(packed, 0x23f0_0206);
+        assert_eq!(packed & 0xff, 6);
+        assert_eq!((packed >> 8) & 0xff, 2);
+        assert_eq!((packed >> 16) & 0x7fff, 9200);
+        assert_eq!(packed >> 31, 0);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), first_rcx);
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), first_rdx);
+        assert_eq!(emu.read_reg(RegisterX86::R8).unwrap(), first_r8);
+        assert_eq!(emu.read_reg(RegisterX86::R9).unwrap(), first_r9);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            first_return_address
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), first_rsp + 8);
+
+        let second_rcx = 0x1111_2222_3333_4444;
+        let second_rdx = 0x5555_6666_7777_8888;
+        let second_r8 = 0x9999_aaaa_bbbb_cccc;
+        let second_r9 = 0xdddd_eeee_ffff_0000;
+        emu.write_reg(RegisterX86::RAX, 0xffff_ffff_0000_0000)
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, second_rcx).unwrap();
+        emu.write_reg(RegisterX86::RDX, second_rdx).unwrap();
+        emu.write_reg(RegisterX86::R8, second_r8).unwrap();
+        emu.write_reg(RegisterX86::R9, second_r9).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, second_rsp).unwrap();
+
+        let second = dispatch(&mut env, &mut emu, "GetVersion").unwrap();
+        assert_eq!(second, first);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), second_rcx);
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), second_rdx);
+        assert_eq!(emu.read_reg(RegisterX86::R8).unwrap(), second_r8);
+        assert_eq!(emu.read_reg(RegisterX86::R9).unwrap(), second_r9);
         assert_eq!(
             emu.read_reg(RegisterX86::RIP).unwrap(),
             second_return_address
@@ -3187,6 +3282,45 @@ mod tests {
             emu.read_reg(RegisterX86::RIP).unwrap(),
             image.entry_point_va() + 12
         );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_get_version_via_name_resolved_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("GetVersion")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, kernel32_base, "GetVersion")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["GetVersion".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            u64::from(EMULATED_WINDOWS_VERSION)
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
     }
 

@@ -1670,3 +1670,150 @@ sample 2 reaches its earlier independent indirect call through zero after call
 claimed. Formal
 sample 1 remains the milestone artifact; samples 2 and 3 remain engineering
 corroboration until their provenance records are completed.
+
+## GetVersion is the causal call-35 frontier
+
+This diagnosis starts from exact merged `RtlAddVectoredExceptionHandler` commit
+`661e8b285aff591bebbed3031dc28cbfc308f76d`. On that baseline, formal sample 1
+returns the first registration token `0x0000000f20001000` to
+`0x0000000140227ab4`, executes 5,781 more instructions, and reaches `RIP = 0`.
+The FNV-1a digest over the little-endian 64-bit instruction addresses in that
+suffix is `0x3fec30c5cec96161`.
+
+The terminal zero is carried through the existing VM dispatch chain. On formal
+sample 1, `RBP = 0x000000014006f9e0`; bytecode cursor
+`0x0000000140211e72` selects context offset `0x88`. The context qword at
+`RBP + 0x88` points to handler slot `0x00000001400d42a7`.
+`.themida+0x5caf5` reads zero from that slot, `.themida+0x5cb1a` writes the zero
+to stack cell `0x0000000fffffefc0`, and `.themida+0x5cb7c: ret 0` consumes it.
+The slot's last whole-qword writer is `.themida+0xaccf7: mov [r9],rbx`, observed
+735,488 instructions into the leg after handled call 6, with `R9` equal to the
+slot and `RBX = 0`. Its bytecode cursor is `0x0000000140242ff6`, beginning with
+words `0x0088, 0x0000, 0x013c`; the source selector is zero and reads the
+zeroed `RBP + 0` context qword. A disposable late patch replacing only the slot
+with the already-mapped registered callback preserved all 5,781 instruction
+addresses and the digest but made the final `ret` land at the callback. This
+establishes the slot-to-terminal-return edge; it does not identify the missing
+name by itself.
+
+The missing name was determined with two export-name A/B experiments. A broad
+variant parsed exactly 1,664 export names from the authorized
+`samples/kernel32.dll` reference and used the names only; the DLL was never
+mapped or executed. It preserved the exact 34-call prefix and then stopped at
+an unhandled `GetVersion` export. A narrow variant added only `GetVersion` to
+the baseline seed and reproduced the same call at the ordinary 60,000,000
+per-leg cap. The broad-layout stub `0x00007fff00010470` and narrow-layout stub
+`0x00007fff00001090` are synthetic export-layout results, not sample constants.
+Together, the broad discovery and one-name A/B establish `GetVersion` as formal
+call 35.
+
+The trace hooks, slot patch, export-name variants, diagnostic sources, and raw
+logs used for this diagnosis were temporary and uncommitted; their isolated
+worktrees were removed. The committed artifacts are the bounded implementation
+and tests plus the production replays recorded below.
+
+Stopping production after 34 handled calls now preserves the exact pre-call
+state:
+
+```text
+RAX = 0x0000000000000000
+RCX = 0x0000000000000001
+RDX = 0x000000014006aa83
+R8  = 0x0000000000000208
+R9  = 0x0000000000000000
+RIP = 0x00007fff00001090
+RSP = 0x0000000fffffefc8
+[RSP] = 0x00000001401ffc3d
+```
+
+The documented signature is `DWORD GetVersion(void)`, so the register values
+other than `RAX`, `RIP`, and `RSP` are restored incidental state rather than API
+arguments. Microsoft documents the result packing and the version-manifest
+behavior at
+<https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getversion>.
+The formal PE's resource data-directory entry is zero, and no sidecar manifest
+is present with the captured sample. Midas therefore uses an explicit,
+host-independent unmanifested Windows 8 compatibility policy: major 6, minor 2,
+build 9200, and a clear platform bit, packed as `DWORD 0x23f00206`. This is a
+fixed emulated-environment policy, not host OS detection or a claim that the
+finite sample trace determines Windows version semantics.
+
+A disposable return-sensitivity trace measured the formal post-call path:
+
+| Return | Post-return instructions | FNV-1a RIP digest |
+|---|---:|---:|
+| `0x00000000` | 21,888 | `0xec2af30cbcaf1b27` |
+| `0x23f00206` (6.2.9200) | 22,275 | `0x6b2b7e01ee2164f9` |
+| `0x4a65000a` (10.0.19045) | 22,275 | `0x6b2b7e01ee2164f9` |
+
+All three variants handled exactly 35 calls, reached no later named API, and
+eventually returned through zero. Additional isolated controls changed the
+build, minor, and major fields separately. A major value of 6 alone selected
+the 22,275-instruction path; minor 2 alone and build 9200 alone selected the
+short path. Majors 6, 7, and 10 shared the long digest, major 4 selected the
+short path, and major 5 selected a third 22,472-instruction path with digest
+`0xe569a4df55a5bdbd`. This finite experiment establishes that the captured
+branch is sensitive to a major-version class. It does not justify the chosen
+minor/build values, which remain the explicit compatibility policy above.
+
+The implementation adds the observed name to the synthetic kernel32 seed and
+returns `0x23f00206` zero-extended through full `RAX`, followed by the normal
+x64 API return. This handler does not read or mutate the incidental argument
+registers; their preservation is modeled behavior, not an ABI guarantee. It
+does not inspect guest resources or manifests, consult the host OS, apply
+compatibility shims, model service-pack or product-type data, implement
+`GetVersionEx`/`VerifyVersionInfo`, or update last-error state.
+
+The two focused tests cover:
+
+- two direct calls from dirty result/argument-register states, exact packing of
+  major, minor, build, and platform fields, stable full-width return,
+  non-mutation of incidental registers, and exact `RIP`/`RSP` effects; and
+- a call through the name-resolved synthetic kernel32 export stub without a
+  fixed RVA, with the expected trap, result, loop target, and balanced stack.
+
+Reproduce the production path with:
+
+```text
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 34
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+The exact formal sample-1 production suffix is:
+
+```text
+  033: SetCurrentDirectoryW
+  034: RtlAddVectoredExceptionHandler
+  035: GetVersion
+stop: ReachedUntil
+```
+
+Release `run_loader` and `trap_postmortem` agree on the handled call counts and
+names. The full post-mortems are:
+
+| Sample | Calls | `GetVersion` position | Stop | `RAX` | `RIP` | `RSP` |
+|---|---:|---:|---|---:|---:|---:|
+| 1 | 35 | 35 | `Other("ReachedUntil")` | `0x0000000140058fa0` | `0x0` | `0x0000000fffffef78` |
+| 2 | 33 | not called | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0000000fffffefc8` |
+| 3 | 34 | not called | `Other("ReachedUntil")` | `0x000000014008f837` | `0x0` | `0x0000000fffffef78` |
+
+The final `RAX` values are later guest state, not `GetVersion` return captures.
+The direct and name-resolved tests establish the exact zero-extended
+`0x23f00206` return and control effects.
+
+### New frontier
+
+`GetVersion` advances formal sample 1 through call 35 and selects the observed
+nonzero-major path. The guest then executes 22,275 post-return instructions and
+returns through zero without another named API. The source of that new terminal
+zero has not yet been diagnosed. Sample 2 retains its separate indirect
+call-through-zero after call 33; sample 3 retains its separate ret-to-zero after
+call 34 and does not exercise `GetVersion`. Formal sample 1 remains the
+milestone artifact; samples 2 and 3 remain engineering corroboration until
+their provenance records are completed.
