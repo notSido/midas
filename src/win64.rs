@@ -34,6 +34,19 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "ExitProcess",
 ];
 
+/// Seed ntdll export names observed during the bootstrap export walk; this is
+/// not a completeness claim.
+const NTDLL_EXPORTS: &[&str] = &[
+    "RtlEnterCriticalSection",
+    "RtlLeaveCriticalSection",
+    "RtlInitializeCriticalSection",
+    "RtlAddVectoredExceptionHandler",
+    "NtQueryObject",
+    "RtlAllocateHeap",
+    "RtlReAllocateHeap",
+    "RtlFreeHeap",
+];
+
 #[derive(Debug, Clone)]
 pub struct SyntheticModule {
     pub base: u64,
@@ -287,7 +300,9 @@ impl Win64Env {
     }
 
     fn loaded_base(&self, name: &str) -> Option<u64> {
-        self.modules.get(&name.to_ascii_lowercase()).copied()
+        self.modules
+            .get(&normalize_module_name(name).to_ascii_lowercase())
+            .copied()
     }
 
     fn ensure_module(
@@ -310,6 +325,22 @@ impl Win64Env {
 
     fn ensure_kernel32(&mut self, emu: &mut Emu) -> Result<u64, EmuError> {
         self.ensure_module(emu, "kernel32.dll", KERNEL32_EXPORTS)
+    }
+
+    fn ensure_loaded_module(&mut self, emu: &mut Emu, name: &str) -> Result<u64, EmuError> {
+        let normalized = normalize_module_name(name);
+        let module_name = normalized
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(normalized.as_str());
+        let exports = if module_name.eq_ignore_ascii_case("kernel32.dll") {
+            KERNEL32_EXPORTS
+        } else if module_name.eq_ignore_ascii_case("ntdll.dll") {
+            NTDLL_EXPORTS
+        } else {
+            &[]
+        };
+        self.ensure_module(emu, &normalized, exports)
     }
 
     fn export_stub_by_base(&self, module_base: u64, name: &str) -> Option<u64> {
@@ -429,12 +460,13 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
     match name {
         "GetModuleHandleA" => {
             let module_name = read_arg_ascii_z(emu, RegisterX86::RCX)?;
+            let normalized_module_name = normalize_module_name(&module_name);
             let base = if module_name.is_empty() {
                 env.image_base
-            } else if module_name.eq_ignore_ascii_case("kernel32.dll") {
+            } else if normalized_module_name.eq_ignore_ascii_case("kernel32.dll") {
                 env.ensure_kernel32(emu)?
             } else {
-                env.loaded_base(&module_name).unwrap_or(0)
+                env.loaded_base(&normalized_module_name).unwrap_or(0)
             };
             emu.write_reg(RegisterX86::RAX, base)?;
             api_return(emu)?;
@@ -451,10 +483,8 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             // pointer and a pointer to "" to the empty string, both handled here.
             let base = if module_name.is_empty() {
                 0
-            } else if module_name.eq_ignore_ascii_case("kernel32.dll") {
-                env.ensure_kernel32(emu)?
             } else {
-                env.ensure_module(emu, &module_name, &[])?
+                env.ensure_loaded_module(emu, &module_name)?
             };
             emu.write_reg(RegisterX86::RAX, base)?;
             api_return(emu)?;
@@ -484,6 +514,20 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "RtlInitializeCriticalSection" => {
+            let address = emu.read_reg(RegisterX86::RCX)?;
+            // This is the minimal state currently exercised by the loader; a
+            // complete Windows debug-list model is intentionally out of scope.
+            let mut critical_section = [0u8; 40];
+            critical_section[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+            emu.write_mem(address, &critical_section)?;
+            emu.write_reg(RegisterX86::RAX, 0)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: 0,
+            })
+        }
         _ => Ok(ApiOutcome::Unhandled {
             name: name.to_owned(),
         }),
@@ -493,6 +537,16 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
 fn read_arg_ascii_z(emu: &Emu, reg: RegisterX86) -> Result<String, EmuError> {
     let address = emu.read_reg(reg)?;
     read_ascii_z_at(emu, address)
+}
+
+fn normalize_module_name(name: &str) -> String {
+    let component_start = name.rfind(['/', '\\']).map_or(0, |index| index + 1);
+    let component = &name[component_start..];
+    if !component.is_empty() && !component.contains('.') {
+        format!("{name}.dll")
+    } else {
+        name.to_owned()
+    }
 }
 
 fn read_ascii_z_at(emu: &Emu, address: u64) -> Result<String, EmuError> {
@@ -953,6 +1007,193 @@ mod tests {
     }
 
     #[test]
+    fn loadlibrarya_ntdll_exports_match_seed() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let name_addr = crate::emu::STACK_BASE + 0x100;
+        let rsp = crate::emu::STACK_BASE + 0x200;
+        emu.write_mem(name_addr, b"ntdll.dll\0").unwrap();
+        emu.write_mem(rsp, &0x1234_u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, name_addr).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let ApiOutcome::Handled { ret: base, .. } =
+            dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap()
+        else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+        let export_dir = base + u64::from(SYNTHETIC_EXPORT_DIR_RVA);
+        let names_rva = read_u32_emu(&emu, export_dir + 32);
+        let count = read_u32_emu(&emu, export_dir + 24);
+        let names = (0..count)
+            .map(|i| {
+                read_ascii_z_emu(
+                    &emu,
+                    base + u64::from(read_u32_emu(
+                        &emu,
+                        base + u64::from(names_rva) + u64::from(i) * 4,
+                    )),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "NtQueryObject",
+            "RtlAddVectoredExceptionHandler",
+            "RtlAllocateHeap",
+            "RtlEnterCriticalSection",
+            "RtlFreeHeap",
+            "RtlInitializeCriticalSection",
+            "RtlLeaveCriticalSection",
+            "RtlReAllocateHeap",
+        ];
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn loadlibrarya_extensionless_ntdll_reuses_normalized_seed() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let name_addr = crate::emu::STACK_BASE + 0x100;
+        let rsp = crate::emu::STACK_BASE + 0x200;
+        emu.write_mem(name_addr, b"ntdll\0").unwrap();
+        emu.write_mem(rsp, &0x1234_u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, name_addr).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let first = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        let ApiOutcome::Handled {
+            ret: first_base, ..
+        } = first
+        else {
+            panic!("expected LoadLibraryA to be handled");
+        };
+        assert!(env.synthetic_modules.contains_key("ntdll.dll"));
+        assert_eq!(
+            env.synthetic_modules.get("ntdll.dll").unwrap().base,
+            first_base
+        );
+        let export_dir = first_base + u64::from(SYNTHETIC_EXPORT_DIR_RVA);
+        let names_rva = read_u32_emu(&emu, export_dir + 32);
+        let count = read_u32_emu(&emu, export_dir + 24);
+        assert_eq!(count, 8);
+        let names = (0..count)
+            .map(|i| {
+                read_ascii_z_emu(
+                    &emu,
+                    first_base
+                        + u64::from(read_u32_emu(
+                            &emu,
+                            first_base + u64::from(names_rva) + u64::from(i) * 4,
+                        )),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "NtQueryObject",
+                "RtlAddVectoredExceptionHandler",
+                "RtlAllocateHeap",
+                "RtlEnterCriticalSection",
+                "RtlFreeHeap",
+                "RtlInitializeCriticalSection",
+                "RtlLeaveCriticalSection",
+                "RtlReAllocateHeap",
+            ]
+        );
+        emu.write_mem(name_addr, b"NTDLL\0").unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let second = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
+        assert_eq!(
+            second,
+            ApiOutcome::Handled {
+                name: "LoadLibraryA".to_owned(),
+                ret: first_base,
+            }
+        );
+        assert_eq!(
+            env.synthetic_modules.get("ntdll.dll").unwrap().base,
+            first_base
+        );
+    }
+
+    #[test]
+    fn normalize_module_name_handles_extensions_and_paths() {
+        assert_eq!(normalize_module_name("ntdll"), "ntdll.dll");
+        assert_eq!(normalize_module_name("dir/ntdll"), "dir/ntdll.dll");
+        assert_eq!(normalize_module_name(r"dir\ntdll"), r"dir\ntdll.dll");
+        assert_eq!(normalize_module_name("ntdll.sys"), "ntdll.sys");
+        assert_eq!(normalize_module_name("ntdll."), "ntdll.");
+        assert_eq!(normalize_module_name(""), "");
+    }
+
+    #[test]
+    fn rtl_initialize_critical_section_initializes_layout_and_returns() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let critical_section = crate::emu::STACK_BASE + 0x300;
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        emu.write_mem(critical_section, &[0xa5; 40]).unwrap();
+        let return_address: u64 = 0x1234_5678_9abc_def0;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, critical_section).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let outcome = dispatch(&mut env, &mut emu, "RtlInitializeCriticalSection").unwrap();
+        assert_eq!(
+            outcome,
+            ApiOutcome::Handled {
+                name: "RtlInitializeCriticalSection".to_owned(),
+                ret: 0,
+            }
+        );
+        let mut expected = [0u8; 40];
+        expected[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(emu.read_mem(critical_section, 40).unwrap(), expected);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn trap_dispatches_ntdll_critical_section_initialization() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let ntdll_base = env.ensure_loaded_module(&mut emu, "ntdll.dll").unwrap();
+        let module = env.synthetic_modules.get("ntdll.dll").unwrap();
+        let stub =
+            ntdll_base + u64::from(*module.exports.get("RtlInitializeCriticalSection").unwrap());
+        let critical_section = crate::emu::STACK_BASE + 0x300;
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        emu.write_mem(critical_section, &[0xa5; 40]).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&critical_section.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(
+            result.handled,
+            vec!["RtlInitializeCriticalSection".to_owned()]
+        );
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        let mut expected = [0u8; 40];
+        expected[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(emu.read_mem(critical_section, 40).unwrap(), expected);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            image.entry_point_va() + 22
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
     fn synthetic_kernel32_stub_region_is_readable() {
         let mut emu = Emu::new().unwrap();
         let module =
@@ -985,6 +1226,55 @@ mod tests {
 
         assert_ne!(ret, 0);
         assert_eq!(read_u32_emu(&emu, ret + 0x3c), 0x80);
+    }
+
+    #[test]
+    fn getmodulehandlea_extensionless_mixed_case_kernel32_maps_and_reuses() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut data = vec![0u8; 0x1000];
+        data[..b"KeRnEl32\0".len()].copy_from_slice(b"KeRnEl32\0");
+        data[0x100..0x100 + b"kErNeL32\0".len()].copy_from_slice(b"kErNeL32\0");
+        emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
+            .unwrap();
+
+        let return_address = IMAGE_BASE + u64::from(CODE_RVA) + 0x80;
+        let stack_address = IMAGE_BASE + u64::from(CODE_RVA);
+        emu.map_code(stack_address, &return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA))
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+
+        let first = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
+        let ApiOutcome::Handled {
+            ret: first_base, ..
+        } = first
+        else {
+            panic!("expected GetModuleHandleA to be handled");
+        };
+        assert_ne!(first_base, 0);
+        assert!(env.synthetic_modules.contains_key("kernel32.dll"));
+        assert_eq!(env.synthetic_modules["kernel32.dll"].base, first_base);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), stack_address + 8);
+
+        emu.write_reg(RegisterX86::RCX, IMAGE_BASE + u64::from(DATA_RVA) + 0x100)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, stack_address).unwrap();
+
+        let second = dispatch(&mut env, &mut emu, "GetModuleHandleA").unwrap();
+        assert_eq!(
+            second,
+            ApiOutcome::Handled {
+                name: "GetModuleHandleA".to_owned(),
+                ret: first_base,
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), first_base);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), stack_address + 8);
+        assert_eq!(env.synthetic_modules.len(), 1);
     }
 
     #[test]
@@ -1175,6 +1465,9 @@ mod tests {
 
         assert_ne!(ret, 0);
         assert_eq!(read_u32_emu(&emu, ret + 0x3c), 0x80);
+        let export_dir = ret + u64::from(SYNTHETIC_EXPORT_DIR_RVA);
+        assert_eq!(read_u32_emu(&emu, export_dir + 20), 0);
+        assert_eq!(read_u32_emu(&emu, export_dir + 24), 0);
     }
 
     #[test]
@@ -1451,9 +1744,7 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for index in 0..count {
             let name = format!("Api{index:04}");
-            let addr = env
-                .resolve_proc(&mut emu, kernel32_base, &name)
-                .unwrap();
+            let addr = env.resolve_proc(&mut emu, kernel32_base, &name).unwrap();
             assert_ne!(addr, 0);
             assert!((PROC_STUB_BASE..FAKE_MODULE_BASE_START).contains(&addr));
             assert!(emu.read_mem(addr, PROC_STUB_STRIDE as usize).is_ok());
