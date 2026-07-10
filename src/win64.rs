@@ -27,6 +27,11 @@ const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 /// Deterministic ID for the current thread exposed by the emulated environment.
 const EMULATED_CURRENT_THREAD_ID: u32 = 1;
 
+/// First ID in the finite created-thread namespace. The `u64` cursor can also
+/// represent one past `u32::MAX`, leaving `u32::MAX` available as a valid ID.
+const CREATED_THREAD_ID_BASE: u64 = 2;
+const CREATED_THREAD_ID_EXHAUSTED: u64 = u32::MAX as u64 + 1;
+
 /// Host-independent unmanifested Windows 8 compatibility view returned by
 /// `GetVersion`: major 6, minor 2, build 9200, with the platform bit clear.
 const EMULATED_WINDOWS_VERSION: u32 = 0x23f0_0206;
@@ -83,6 +88,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "SetCurrentDirectoryW",
     "GetModuleFileNameW",
     "OpenThread",
+    "CreateThread",
     "GetVersion",
 ];
 
@@ -349,6 +355,14 @@ struct KernelHandle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunnableUnscheduledThread {
+    start_address: u64,
+    parameter: u64,
+    requested_stack_size: u64,
+    creation_flags: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VectoredExceptionHandlerRegistration {
     token: u64,
     handler: u64,
@@ -365,6 +379,8 @@ pub struct Win64Env {
     vectored_exception_handlers: Vec<VectoredExceptionHandlerRegistration>,
     next_kernel_handle: u64,
     kernel_handles: BTreeMap<u64, KernelHandle>,
+    next_thread_id: u64,
+    created_threads: BTreeMap<u32, RunnableUnscheduledThread>,
     heap_cursor: u64,
     heap_allocations: BTreeMap<u64, HeapAllocation>,
     modules: BTreeMap<String, u64>,
@@ -386,6 +402,8 @@ impl Win64Env {
             vectored_exception_handlers: Vec::new(),
             next_kernel_handle: KERNEL_HANDLE_BASE,
             kernel_handles: BTreeMap::new(),
+            next_thread_id: CREATED_THREAD_ID_BASE,
+            created_threads: BTreeMap::new(),
             heap_cursor: HEAP_ARENA_BASE,
             heap_allocations: BTreeMap::new(),
             modules: BTreeMap::new(),
@@ -425,36 +443,122 @@ impl Win64Env {
         token
     }
 
-    fn open_thread(&mut self, desired_access: u32, inheritable: bool, thread_id: u32) -> u64 {
-        // Bounded support policy: accept any subset of the legacy all-access
-        // mask. This is not complete ACL, token, or security semantics.
-        if desired_access & !LEGACY_THREAD_ALL_ACCESS != 0 || thread_id != self.current_thread_id {
-            return 0;
-        }
-
+    fn kernel_handle_candidate(&self) -> Option<(u64, u64)> {
         let handle = self.next_kernel_handle;
-        let Some(next_handle) = handle.checked_add(KERNEL_HANDLE_STRIDE) else {
-            return 0;
-        };
+        let next_handle = handle.checked_add(KERNEL_HANDLE_STRIDE)?;
         if !(KERNEL_HANDLE_BASE..HEAP_ARENA_BASE).contains(&handle)
             || next_handle > HEAP_ARENA_BASE
             || !handle.is_multiple_of(KERNEL_HANDLE_STRIDE)
             || self.kernel_handles.contains_key(&handle)
         {
+            return None;
+        }
+        Some((handle, next_handle))
+    }
+
+    fn thread_id_candidate(&self) -> Option<(u32, u64)> {
+        let cursor = self.next_thread_id;
+        if !(CREATED_THREAD_ID_BASE..CREATED_THREAD_ID_EXHAUSTED).contains(&cursor) {
+            return None;
+        }
+        let thread_id = u32::try_from(cursor).ok()?;
+        let next_thread_id = cursor.checked_add(1)?;
+        if next_thread_id > CREATED_THREAD_ID_EXHAUSTED
+            || thread_id == self.current_thread_id
+            || self.created_threads.contains_key(&thread_id)
+        {
+            return None;
+        }
+        Some((thread_id, next_thread_id))
+    }
+
+    fn insert_kernel_handle(&mut self, handle: u64, next_handle: u64, kernel_handle: KernelHandle) {
+        let previous = self.kernel_handles.insert(handle, kernel_handle);
+        debug_assert!(previous.is_none());
+        self.next_kernel_handle = next_handle;
+    }
+
+    fn open_thread(&mut self, desired_access: u32, inheritable: bool, thread_id: u32) -> u64 {
+        // Bounded support policy: accept any subset of the legacy all-access
+        // mask. This is not complete ACL, token, or security semantics.
+        let thread_exists =
+            thread_id == self.current_thread_id || self.created_threads.contains_key(&thread_id);
+        if desired_access & !LEGACY_THREAD_ALL_ACCESS != 0 || !thread_exists {
             return 0;
         }
 
-        let previous = self.kernel_handles.insert(
+        let Some((handle, next_handle)) = self.kernel_handle_candidate() else {
+            return 0;
+        };
+
+        self.insert_kernel_handle(
             handle,
+            next_handle,
             KernelHandle {
                 object: KernelObject::Thread { thread_id },
                 desired_access,
                 inheritable,
             },
         );
-        debug_assert!(previous.is_none());
-        self.next_kernel_handle = next_handle;
         handle
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_thread(
+        &mut self,
+        emu: &mut Emu,
+        thread_attributes: u64,
+        requested_stack_size: u64,
+        start_address: u64,
+        parameter: u64,
+        creation_flags: u32,
+        thread_id_output: u64,
+    ) -> Result<u64, EmuError> {
+        // Bounded policy: record a runnable-but-unscheduled thread, but do not
+        // allocate a guest stack/TEB or inspect/execute either pointer.
+        // Lifecycle, signaling, wait/close, ACL/token, and last-error behavior
+        // are likewise outside this slice.
+        if thread_attributes != 0 || requested_stack_size != 0 || creation_flags != 0 {
+            return Ok(0);
+        }
+
+        let Some((thread_id, next_thread_id)) = self.thread_id_candidate() else {
+            return Ok(0);
+        };
+        let Some((handle, next_handle)) = self.kernel_handle_candidate() else {
+            return Ok(0);
+        };
+
+        // Output validation and the DWORD write precede every state mutation.
+        // `write_mem` preflights the full range, so an error cannot partially
+        // modify the guest output or consume either allocator cursor.
+        if thread_id_output != 0 {
+            emu.write_mem(thread_id_output, &thread_id.to_le_bytes())?;
+        }
+
+        let previous = self.created_threads.insert(
+            thread_id,
+            RunnableUnscheduledThread {
+                start_address,
+                parameter,
+                requested_stack_size,
+                creation_flags,
+            },
+        );
+        debug_assert!(previous.is_none());
+        self.next_thread_id = next_thread_id;
+        self.insert_kernel_handle(
+            handle,
+            next_handle,
+            KernelHandle {
+                object: KernelObject::Thread { thread_id },
+                // This is the complete bounded Midas rights universe, not the
+                // version-dependent Windows THREAD_ALL_ACCESS definition.
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: false,
+            },
+        );
+        Ok(handle)
     }
 
     fn allocate_heap(
@@ -855,6 +959,36 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "CreateThread" => {
+            // Pointer/SIZE_T arguments retain their full widths. Stack arg 5
+            // is a DWORD read from the low half of its eight-byte ABI slot;
+            // stack arg 6 remains a full pointer.
+            let thread_attributes = emu.read_reg(RegisterX86::RCX)?;
+            let requested_stack_size = emu.read_reg(RegisterX86::RDX)?;
+            let start_address = emu.read_reg(RegisterX86::R8)?;
+            let parameter = emu.read_reg(RegisterX86::R9)?;
+            let rsp = emu.read_reg(RegisterX86::RSP)?;
+            let creation_flags_address = checked_stack_argument_address(rsp, 0x28, 4)?;
+            let thread_id_output_address = checked_stack_argument_address(rsp, 0x30, 8)?;
+            let creation_flags = read_u32_at(emu, creation_flags_address)?;
+            let thread_id_output = read_u64_at(emu, thread_id_output_address)?;
+
+            let ret = env.create_thread(
+                emu,
+                thread_attributes,
+                requested_stack_size,
+                start_address,
+                parameter,
+                creation_flags,
+                thread_id_output,
+            )?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
         "OpenThread" => {
             // DWORD/BOOL arguments consume only the low 32 bits on Win64.
             let desired_access = emu.read_reg(RegisterX86::RCX)? as u32;
@@ -921,6 +1055,37 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             name: name.to_owned(),
         }),
     }
+}
+
+fn checked_stack_argument_address(rsp: u64, offset: u64, size: u64) -> Result<u64, EmuError> {
+    debug_assert!(size > 0);
+    let address = rsp
+        .checked_add(offset)
+        .ok_or(EmuError::AddressRangeOverflow {
+            base: rsp,
+            size: offset,
+        })?;
+    address
+        .checked_add(size - 1)
+        .ok_or(EmuError::AddressRangeOverflow {
+            base: address,
+            size,
+        })?;
+    Ok(address)
+}
+
+fn read_u32_at(emu: &Emu, address: u64) -> Result<u32, EmuError> {
+    let bytes = emu.read_mem(address, 4)?;
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&bytes);
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_u64_at(emu: &Emu, address: u64) -> Result<u64, EmuError> {
+    let bytes = emu.read_mem(address, 8)?;
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&bytes);
+    Ok(u64::from_le_bytes(value))
 }
 
 fn read_arg_ascii_z(emu: &Emu, reg: RegisterX86) -> Result<String, EmuError> {
@@ -1322,6 +1487,86 @@ mod tests {
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
         ret
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct CreateThreadArgs {
+        thread_attributes: u64,
+        requested_stack_size: u64,
+        start_address: u64,
+        parameter: u64,
+        creation_flags_slot: u64,
+        thread_id_output: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ThreadAllocatorState {
+        next_thread_id: u64,
+        created_threads: BTreeMap<u32, RunnableUnscheduledThread>,
+        next_kernel_handle: u64,
+        kernel_handles: BTreeMap<u64, KernelHandle>,
+    }
+
+    fn thread_allocator_state(env: &Win64Env) -> ThreadAllocatorState {
+        ThreadAllocatorState {
+            next_thread_id: env.next_thread_id,
+            created_threads: env.created_threads.clone(),
+            next_kernel_handle: env.next_kernel_handle,
+            kernel_handles: env.kernel_handles.clone(),
+        }
+    }
+
+    fn prepare_create_thread_call(
+        emu: &mut Emu,
+        args: CreateThreadArgs,
+        rsp: u64,
+        return_address: u64,
+    ) {
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_mem(rsp + 0x28, &args.creation_flags_slot.to_le_bytes())
+            .unwrap();
+        emu.write_mem(rsp + 0x30, &args.thread_id_output.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RAX, 0xaaaa_bbbb_cccc_dddd)
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, args.thread_attributes)
+            .unwrap();
+        emu.write_reg(RegisterX86::RDX, args.requested_stack_size)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, args.start_address).unwrap();
+        emu.write_reg(RegisterX86::R9, args.parameter).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0x1111_2222_3333_4444)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+    }
+
+    fn call_create_thread(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        args: CreateThreadArgs,
+        rsp: u64,
+        return_address: u64,
+    ) -> Result<u64, EmuError> {
+        prepare_create_thread_call(emu, args, rsp, return_address);
+        let outcome = dispatch(env, emu, "CreateThread")?;
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected CreateThread to be handled");
+        };
+        assert_eq!(name, "CreateThread");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RCX).unwrap(),
+            args.thread_attributes
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RDX).unwrap(),
+            args.requested_stack_size
+        );
+        assert_eq!(emu.read_reg(RegisterX86::R8).unwrap(), args.start_address);
+        assert_eq!(emu.read_reg(RegisterX86::R9).unwrap(), args.parameter);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        Ok(ret)
     }
 
     fn call_get_current_directory_w(
@@ -3052,6 +3297,518 @@ mod tests {
     }
 
     #[test]
+    fn create_thread_handles_exact_observed_call_after_open_thread() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first_handle = call_open_thread(
+            &mut env,
+            &mut emu,
+            u64::from(LEGACY_THREAD_ALL_ACCESS),
+            0,
+            u64::from(EMULATED_CURRENT_THREAD_ID),
+        );
+        assert_eq!(first_handle, KERNEL_HANDLE_BASE);
+
+        let formal_rsp = 0x0000_000f_ffff_ef78;
+        let formal_return_address = 0x0000_0001_4025_961e;
+        let formal_start_address = 0x0000_0001_4005_8fa0;
+        let start_page = formal_start_address & !(u64::from(PAGE_SIZE) - 1);
+        emu.map_code(start_page, &[0; PAGE_SIZE as usize]).unwrap();
+        let args = CreateThreadArgs {
+            start_address: formal_start_address,
+            ..CreateThreadArgs::default()
+        };
+
+        let handle =
+            call_create_thread(&mut env, &mut emu, args, formal_rsp, formal_return_address)
+                .unwrap();
+
+        assert_eq!(handle, KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE);
+        assert_ne!(handle, 0);
+        assert!(emu.read_mem(handle, 1).is_err());
+        assert_eq!(env.next_thread_id, 3);
+        assert_eq!(env.next_kernel_handle, handle + KERNEL_HANDLE_STRIDE);
+        assert_eq!(
+            env.created_threads.get(&2),
+            Some(&RunnableUnscheduledThread {
+                start_address: formal_start_address,
+                parameter: 0,
+                requested_stack_size: 0,
+                creation_flags: 0,
+            })
+        );
+        assert_eq!(
+            env.kernel_handles.get(&handle),
+            Some(&KernelHandle {
+                object: KernelObject::Thread { thread_id: 2 },
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: false,
+            })
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::R8).unwrap(), formal_start_address);
+        assert_eq!(emu.read_reg(RegisterX86::R9).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), handle);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            formal_return_address
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), formal_rsp + 8);
+    }
+
+    #[test]
+    fn create_thread_preserves_full_width_values_allocates_fresh_ids_and_opens_created_id() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let output = wide_buffer_address();
+        assert!(output > u64::from(u32::MAX));
+        emu.map_zeroed_rw(output, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(output, &[0xcc; 16]).unwrap();
+        let rsp = crate::emu::STACK_BASE + 0x600;
+        let return_address = 0x1234_5678_9abc_def0;
+
+        let first_parameter = 0xfedc_ba98_7654_3210;
+        let first = call_create_thread(
+            &mut env,
+            &mut emu,
+            CreateThreadArgs {
+                start_address: 0,
+                parameter: first_parameter,
+                creation_flags_slot: 0xa5a5_5a5a_0000_0000,
+                thread_id_output: output,
+                ..CreateThreadArgs::default()
+            },
+            rsp,
+            return_address,
+        )
+        .unwrap();
+        assert_eq!(first, KERNEL_HANDLE_BASE);
+        assert_eq!(
+            emu.read_mem(output, 8).unwrap(),
+            vec![2, 0, 0, 0, 0xcc, 0xcc, 0xcc, 0xcc]
+        );
+        assert_eq!(
+            env.created_threads.get(&2),
+            Some(&RunnableUnscheduledThread {
+                start_address: 0,
+                parameter: first_parameter,
+                requested_stack_size: 0,
+                creation_flags: 0,
+            })
+        );
+
+        let unmapped_start = 0x7654_3210_fedc_ba98;
+        let second_parameter = 0x8000_0001_0000_0002;
+        assert!(emu.read_mem(unmapped_start, 1).is_err());
+        let second = call_create_thread(
+            &mut env,
+            &mut emu,
+            CreateThreadArgs {
+                start_address: unmapped_start,
+                parameter: second_parameter,
+                creation_flags_slot: 0xffff_ffff_0000_0000,
+                thread_id_output: output + 8,
+                ..CreateThreadArgs::default()
+            },
+            rsp,
+            return_address,
+        )
+        .unwrap();
+        assert_eq!(second, KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE);
+        assert_eq!(read_u32_emu(&emu, output + 8), 3);
+        assert_eq!(emu.read_mem(output + 12, 4).unwrap(), vec![0xcc; 4]);
+        assert_eq!(
+            env.created_threads.get(&3),
+            Some(&RunnableUnscheduledThread {
+                start_address: unmapped_start,
+                parameter: second_parameter,
+                requested_stack_size: 0,
+                creation_flags: 0,
+            })
+        );
+
+        let opened = call_open_thread(
+            &mut env,
+            &mut emu,
+            u64::from(LEGACY_THREAD_ALL_ACCESS),
+            0,
+            2,
+        );
+        assert_eq!(opened, KERNEL_HANDLE_BASE + 2 * KERNEL_HANDLE_STRIDE);
+        assert_eq!(
+            env.kernel_handles.get(&opened),
+            Some(&KernelHandle {
+                object: KernelObject::Thread { thread_id: 2 },
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: false,
+            })
+        );
+
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let current = dispatch(&mut env, &mut emu, "GetCurrentThreadId").unwrap();
+        assert!(matches!(
+            current,
+            ApiOutcome::Handled {
+                name,
+                ret: 1
+            } if name == "GetCurrentThreadId"
+        ));
+    }
+
+    #[test]
+    fn create_thread_policy_failures_return_null_without_state_or_output_access() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x600;
+        let return_address = 0x1234_5678_9abc_def0;
+        let unmapped_output = 0x0000_0000_dead_0000;
+        assert!(emu.read_mem(unmapped_output, 1).is_err());
+        let mapped_output = wide_buffer_address();
+        emu.map_zeroed_rw(mapped_output, u64::from(PAGE_SIZE))
+            .unwrap();
+        let initial_state = thread_allocator_state(&env);
+        let unsupported = [
+            CreateThreadArgs {
+                thread_attributes: 1,
+                ..CreateThreadArgs::default()
+            },
+            CreateThreadArgs {
+                thread_attributes: 0x1_0000_0000,
+                ..CreateThreadArgs::default()
+            },
+            CreateThreadArgs {
+                requested_stack_size: 1,
+                ..CreateThreadArgs::default()
+            },
+            CreateThreadArgs {
+                requested_stack_size: 0x1_0000_0000,
+                ..CreateThreadArgs::default()
+            },
+            CreateThreadArgs {
+                creation_flags_slot: 0xffff_ffff_0000_0001,
+                ..CreateThreadArgs::default()
+            },
+            CreateThreadArgs {
+                creation_flags_slot: 0x0000_0000_0000_0004,
+                ..CreateThreadArgs::default()
+            },
+            CreateThreadArgs {
+                creation_flags_slot: 0x0000_0000_0001_0000,
+                ..CreateThreadArgs::default()
+            },
+        ];
+
+        for mut args in unsupported {
+            emu.write_mem(mapped_output, &0x7856_3412u32.to_le_bytes())
+                .unwrap();
+            args.thread_id_output = mapped_output;
+            assert_eq!(
+                call_create_thread(&mut env, &mut emu, args, rsp, return_address).unwrap(),
+                0
+            );
+            assert_eq!(thread_allocator_state(&env), initial_state);
+            assert_eq!(read_u32_emu(&emu, mapped_output), 0x7856_3412);
+
+            args.thread_id_output = unmapped_output;
+            assert_eq!(
+                call_create_thread(&mut env, &mut emu, args, rsp, return_address).unwrap(),
+                0
+            );
+            assert_eq!(thread_allocator_state(&env), initial_state);
+        }
+
+        let accepted = call_create_thread(
+            &mut env,
+            &mut emu,
+            CreateThreadArgs {
+                creation_flags_slot: 0xffff_ffff_0000_0000,
+                ..CreateThreadArgs::default()
+            },
+            rsp,
+            return_address,
+        )
+        .unwrap();
+        assert_eq!(accepted, KERNEL_HANDLE_BASE);
+        assert_eq!(env.created_threads.get(&2).unwrap().creation_flags, 0);
+    }
+
+    #[test]
+    fn create_thread_id_allocator_supports_last_valid_and_fails_atomically() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let output = wide_buffer_address();
+        emu.map_zeroed_rw(output, u64::from(PAGE_SIZE)).unwrap();
+        let rsp = crate::emu::STACK_BASE + 0x600;
+        let return_address = 0x1234_5678_9abc_def0;
+        let args = CreateThreadArgs {
+            thread_id_output: output,
+            ..CreateThreadArgs::default()
+        };
+
+        env.next_thread_id = u64::from(u32::MAX);
+        assert_eq!(
+            call_create_thread(&mut env, &mut emu, args, rsp, return_address).unwrap(),
+            KERNEL_HANDLE_BASE
+        );
+        assert_eq!(read_u32_emu(&emu, output), u32::MAX);
+        assert_eq!(env.next_thread_id, CREATED_THREAD_ID_EXHAUSTED);
+        assert!(env.created_threads.contains_key(&u32::MAX));
+
+        for rejected_cursor in [
+            0,
+            1,
+            CREATED_THREAD_ID_EXHAUSTED,
+            CREATED_THREAD_ID_EXHAUSTED + 1,
+            u64::MAX,
+            u64::from(u32::MAX),
+        ] {
+            env.next_thread_id = rejected_cursor;
+            emu.write_mem(output, &0x7856_3412u32.to_le_bytes())
+                .unwrap();
+            let state_before = thread_allocator_state(&env);
+            assert_eq!(
+                call_create_thread(&mut env, &mut emu, args, rsp, return_address).unwrap(),
+                0
+            );
+            assert_eq!(thread_allocator_state(&env), state_before);
+            assert_eq!(read_u32_emu(&emu, output), 0x7856_3412);
+        }
+    }
+
+    #[test]
+    fn create_thread_handle_allocator_supports_last_valid_and_fails_atomically() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let output = wide_buffer_address();
+        emu.map_zeroed_rw(output, u64::from(PAGE_SIZE)).unwrap();
+        let rsp = crate::emu::STACK_BASE + 0x600;
+        let return_address = 0x1234_5678_9abc_def0;
+        let args = CreateThreadArgs {
+            thread_id_output: output,
+            ..CreateThreadArgs::default()
+        };
+        let last_handle = HEAP_ARENA_BASE - KERNEL_HANDLE_STRIDE;
+
+        env.next_kernel_handle = last_handle;
+        assert_eq!(
+            call_create_thread(&mut env, &mut emu, args, rsp, return_address).unwrap(),
+            last_handle
+        );
+        assert_eq!(read_u32_emu(&emu, output), 2);
+        assert_eq!(env.next_kernel_handle, HEAP_ARENA_BASE);
+        assert_eq!(env.next_thread_id, 3);
+
+        for rejected_cursor in [
+            HEAP_ARENA_BASE,
+            KERNEL_HANDLE_BASE - KERNEL_HANDLE_STRIDE,
+            KERNEL_HANDLE_BASE + 1,
+            u64::MAX,
+            last_handle,
+        ] {
+            env.next_kernel_handle = rejected_cursor;
+            emu.write_mem(output, &0x7856_3412u32.to_le_bytes())
+                .unwrap();
+            let state_before = thread_allocator_state(&env);
+            assert_eq!(
+                call_create_thread(&mut env, &mut emu, args, rsp, return_address).unwrap(),
+                0
+            );
+            assert_eq!(thread_allocator_state(&env), state_before);
+            assert_eq!(read_u32_emu(&emu, output), 0x7856_3412);
+        }
+    }
+
+    #[test]
+    fn create_thread_state_is_deterministic_and_isolated_per_environment() {
+        let mut first_emu = Emu::new().unwrap();
+        let mut first_env = Win64Env::new(IMAGE_BASE);
+        let mut second_emu = Emu::new().unwrap();
+        let mut second_env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x600;
+        let return_address = 0x1234_5678_9abc_def0;
+        let first_args = CreateThreadArgs {
+            start_address: 0x1111_2222_3333_4444,
+            parameter: 0xaaaa_bbbb_cccc_dddd,
+            ..CreateThreadArgs::default()
+        };
+        let second_args = CreateThreadArgs {
+            start_address: 0x5555_6666_7777_8888,
+            parameter: 0xeeee_ffff_0000_1111,
+            ..CreateThreadArgs::default()
+        };
+
+        let first = call_create_thread(
+            &mut first_env,
+            &mut first_emu,
+            first_args,
+            rsp,
+            return_address,
+        )
+        .unwrap();
+        let second = call_create_thread(
+            &mut second_env,
+            &mut second_emu,
+            second_args,
+            rsp,
+            return_address,
+        )
+        .unwrap();
+
+        assert_eq!(first, KERNEL_HANDLE_BASE);
+        assert_eq!(second, KERNEL_HANDLE_BASE);
+        assert_eq!(first_env.next_thread_id, 3);
+        assert_eq!(second_env.next_thread_id, 3);
+        assert_eq!(
+            first_env.created_threads.get(&2).unwrap().start_address,
+            first_args.start_address
+        );
+        assert_eq!(
+            second_env.created_threads.get(&2).unwrap().start_address,
+            second_args.start_address
+        );
+        assert_eq!(
+            first_env.created_threads.get(&2).unwrap().parameter,
+            first_args.parameter
+        );
+        assert_eq!(
+            second_env.created_threads.get(&2).unwrap().parameter,
+            second_args.parameter
+        );
+    }
+
+    #[test]
+    fn create_thread_stack_argument_read_errors_precede_all_mutations() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let stack_end = crate::emu::STACK_BASE + crate::emu::STACK_SIZE;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        let initial_rax = 0xaaaa_bbbb_cccc_dddd;
+        let initial_rip = 0x1111_2222_3333_4444;
+        let initial_state = thread_allocator_state(&env);
+
+        for (rsp, arg5_is_mapped, expected_read_size) in
+            [(stack_end - 0x28, false, 4), (stack_end - 0x30, true, 8)]
+        {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            if arg5_is_mapped {
+                emu.write_mem(rsp + 0x28, &0u64.to_le_bytes()).unwrap();
+            }
+            emu.write_reg(RegisterX86::RAX, initial_rax).unwrap();
+            emu.write_reg(RegisterX86::RCX, 0).unwrap();
+            emu.write_reg(RegisterX86::RDX, 0).unwrap();
+            emu.write_reg(RegisterX86::R8, 0).unwrap();
+            emu.write_reg(RegisterX86::R9, 0).unwrap();
+            emu.write_reg(RegisterX86::RIP, initial_rip).unwrap();
+            emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+            assert!(matches!(
+                dispatch(&mut env, &mut emu, "CreateThread"),
+                Err(EmuError::ReadMem { addr, size, .. })
+                    if addr == stack_end && size == expected_read_size
+            ));
+            assert_eq!(thread_allocator_state(&env), initial_state);
+            assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
+        }
+
+        for (rsp, expected_size) in [(u64::MAX - 0x27, 0x28), (u64::MAX - 0x2f, 0x30)] {
+            emu.write_reg(RegisterX86::RAX, initial_rax).unwrap();
+            emu.write_reg(RegisterX86::RIP, initial_rip).unwrap();
+            emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+            assert!(matches!(
+                dispatch(&mut env, &mut emu, "CreateThread"),
+                Err(EmuError::AddressRangeOverflow { base, size })
+                    if base == rsp && size == expected_size
+            ));
+            assert_eq!(thread_allocator_state(&env), initial_state);
+            assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
+        }
+
+        for (rsp, expected_base, expected_size) in [
+            (u64::MAX - 0x28, u64::MAX, 4),
+            (u64::MAX - 0x36, u64::MAX - 6, 8),
+        ] {
+            emu.write_reg(RegisterX86::RAX, initial_rax).unwrap();
+            emu.write_reg(RegisterX86::RIP, initial_rip).unwrap();
+            emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+            assert!(matches!(
+                dispatch(&mut env, &mut emu, "CreateThread"),
+                Err(EmuError::AddressRangeOverflow { base, size })
+                    if base == expected_base && size == expected_size
+            ));
+            assert_eq!(thread_allocator_state(&env), initial_state);
+            assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
+        }
+    }
+
+    #[test]
+    fn create_thread_invalid_output_errors_are_failure_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x600;
+        let return_address = 0x1234_5678_9abc_def0;
+        let initial_rax = 0xaaaa_bbbb_cccc_dddd;
+        let initial_rip = 0x1111_2222_3333_4444;
+        let unmapped_output = 0x0000_0000_dead_0000;
+        let readonly_output = wide_buffer_address();
+        emu.map_readonly(readonly_output, &[0x5a; 4]).unwrap();
+        let stack_end = crate::emu::STACK_BASE + crate::emu::STACK_SIZE;
+        let crossing_output = stack_end - 2;
+        emu.write_mem(crossing_output, &[0xab, 0xcd]).unwrap();
+        let initial_state = thread_allocator_state(&env);
+
+        for output in [
+            unmapped_output,
+            readonly_output,
+            crossing_output,
+            u64::MAX - 2,
+        ] {
+            let error = call_create_thread(
+                &mut env,
+                &mut emu,
+                CreateThreadArgs {
+                    thread_id_output: output,
+                    ..CreateThreadArgs::default()
+                },
+                rsp,
+                return_address,
+            )
+            .unwrap_err();
+            assert!(match output {
+                value if value == unmapped_output => matches!(
+                    error,
+                    EmuError::WriteUnmapped { addr, size: 4 } if addr == unmapped_output
+                ),
+                value if value == readonly_output => matches!(
+                    error,
+                    EmuError::WriteProt { addr, size: 4 } if addr == readonly_output
+                ),
+                value if value == crossing_output => matches!(
+                    error,
+                    EmuError::WriteUnmapped { addr, size: 4 } if addr == stack_end
+                ),
+                _ => matches!(
+                    error,
+                    EmuError::AddressRangeOverflow { base, size: 4 } if base == u64::MAX - 2
+                ),
+            });
+            assert_eq!(thread_allocator_state(&env), initial_state);
+            assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
+            assert_eq!(emu.read_mem(readonly_output, 4).unwrap(), vec![0x5a; 4]);
+            assert_eq!(emu.read_mem(crossing_output, 2).unwrap(), vec![0xab, 0xcd]);
+        }
+    }
+
+    #[test]
     fn rtl_allocate_heap_handles_observed_zeroed_page_request() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -3486,6 +4243,87 @@ mod tests {
         );
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_name_resolved_kernel32_create_thread_stub_with_balanced_stack() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("CreateThread")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, kernel32_base, "CreateThread")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let output = wide_buffer_address();
+        emu.map_zeroed_rw(output, u64::from(PAGE_SIZE)).unwrap();
+        let start_address = 0x7654_3210_fedc_ba98u64;
+        let parameter = 0x8000_0001_0000_0002u64;
+
+        let mut code = Vec::new();
+        // Reserve the Win64 shadow area plus the two stack-argument slots.
+        code.extend_from_slice(&[0x48, 0x83, 0xec, 0x30]);
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&0u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xba]);
+        code.extend_from_slice(&0u64.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xb8]);
+        code.extend_from_slice(&start_address.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xb9]);
+        code.extend_from_slice(&parameter.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xba]);
+        code.extend_from_slice(&0xffff_ffff_0000_0000u64.to_le_bytes());
+        code.extend_from_slice(&[0x4c, 0x89, 0x54, 0x24, 0x20]);
+        code.extend_from_slice(&[0x49, 0xbb]);
+        code.extend_from_slice(&output.to_le_bytes());
+        code.extend_from_slice(&[0x4c, 0x89, 0x5c, 0x24, 0x28]);
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0]);
+        code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x30]);
+        code.extend_from_slice(&[0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["CreateThread".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(read_u32_emu(&emu, output), 2);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), KERNEL_HANDLE_BASE);
+        assert_eq!(emu.read_reg(RegisterX86::R8).unwrap(), start_address);
+        assert_eq!(emu.read_reg(RegisterX86::R9).unwrap(), parameter);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(
+            env.created_threads.get(&2),
+            Some(&RunnableUnscheduledThread {
+                start_address,
+                parameter,
+                requested_stack_size: 0,
+                creation_flags: 0,
+            })
+        );
+        assert_eq!(
+            env.kernel_handles.get(&KERNEL_HANDLE_BASE),
+            Some(&KernelHandle {
+                object: KernelObject::Thread { thread_id: 2 },
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: false,
+            })
+        );
+        // The record is pending/runnable but unscheduled: no scheduler, guest
+        // stack/TEB, callback execution, lifecycle, signaling, wait, close,
+        // ACL/token, or last-error behavior is modeled.
     }
 
     #[test]
