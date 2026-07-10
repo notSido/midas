@@ -1817,3 +1817,239 @@ call-through-zero after call 33; sample 3 retains its separate ret-to-zero after
 call 34 and does not exercise `GetVersion`. Formal sample 1 remains the
 milestone artifact; samples 2 and 3 remain engineering corroboration until
 their provenance records are completed.
+
+## CreateThread is the causal call-36 frontier
+
+This diagnosis was captured against exact reviewed `GetVersion` commit
+`2f9758394e7a913bbf3620c5f1501589c94b6c3b`. The exact merged base for this
+slice is `a1beb21d9352fae2f9de0722bacc14350bb690a1`; both commits have tree
+`86f4ff658dd46e11a133b91ac6a857125e7d0c9a`. The diagnostic and merged
+starting code are therefore byte-identical. Formal sample 1 is the milestone
+artifact throughout this section. Samples 2 and 3 have the incomplete
+version/configuration/source provenance recorded in `samples/SAMPLES.md` and
+are cited only as engineering corroboration.
+
+On that baseline, `GetVersion` traps at synthetic stub
+`0x00007fff00001090` with `RSP = 0x0000000fffffefc8`. Dispatch returns
+`0x23f00206` to `0x00000001401ffc3d` and advances `RSP` to
+`0x0000000fffffefd0`. The suffix from there contains exactly 22,275 executed
+RIPs; its FNV-1a digest over little-endian 64-bit addresses is
+`0x6b2b7e01ee2164f9`. Its last instruction is
+`0x000000014005cb7c: ret 0`, which consumes zero from
+`0x0000000fffffef70` and leaves `RSP = 0x0000000fffffef78`. The last suffix
+write to that cell is instruction 22,244 at
+`0x000000014005cb1a: mov [rsi],r13`, with `RSI` equal to the cell and
+`R13 = 0`.
+
+The final dispatcher state gives the source of that zero. `RBP` is
+`0x000000014006f9e0`; the bytecode at `0x0000000140256028` begins
+`53 00 c8 0b 00 00`, whose selector `0x53` and displacement `0x0bc8` lead
+through handler-table slot `0x000000014007441e`, whose encoded value
+`0x00000001400ae431` resolves to handler `0x000000014005caae`. Its payload at
+`0x0000000140256bf0` begins
+`1e 96 25 00 80 00 88 00`: continuation RVA `0x25961e`, stack offset
+`0x80`, and context selector `0x88`. The selected qword is
+`[RBP + 0x88] = [0x000000014006fa68] = 0x000000014006f8f0`; that target
+contains zero, and no post-`GetVersion` instruction changes it.
+
+The target's earlier whole-qword writer occurs after handled call 6 and before
+call 7: watched epoch 7, instruction 1,027,184, at
+`0x00000001400accf7: mov [r9],rbx`, with `R9` equal to the target and
+`RBX = 0`; its old value was `0x69615bde`. The zero originated in the loader's
+manual walk of the synthetic kernel32 `IMAGE_EXPORT_DIRECTORY`. The path
+performs a linear ASCII export-name comparison whose sought first byte is
+`C`. The baseline candidates at exhaustion are `VirtualAlloc`, `VirtualFree`,
+and `VirtualProtect`; the remaining-name count drains to zero and
+`0x000000014013e90a: ret 18h` returns zero. At instruction 1,025,557,
+`0x00000001400ed1d1: push rax` places that zero on the VM stack, and the
+pop-copy sequence beginning at `0x00000001400ed1d8` propagates it. The last
+write to the `RBP + 0` context qword is instruction 1,026,934 at
+`0x00000001400996fc: mov [rcx],r15`, immediately after
+`0x00000001400996fa` pops zero from `0x0000000fffffefe0`. That context result
+feeds the later `0x00000001400accf7` store and is eventually selected by the
+final return handler.
+
+Two isolated export-name experiments identify the missing name without making
+the zero propagation itself a production mechanism:
+
+- A broad variant parsed exactly 1,664 names from the authorized
+  `samples/kernel32.dll` reference after checking its recorded hash. It used
+  only export names; it did not map or execute the DLL. The variant preserved
+  the exact handled calls 1–35, then reached an unhandled `CreateThread` at
+  broad-layout synthetic stub `0x00007fff0000e100`.
+- A narrow variant added only `CreateThread` to the 17-name baseline seed. At
+  the normal 60,000,000-instruction per-leg cap it reproduced call 36 at
+  narrow-layout synthetic stub `0x00007fff00001000`, with the same 22,275-RIP
+  suffix and digest before the call.
+
+The two stub addresses are consequences of their temporary synthetic export
+layouts, not constants from the sample. The preserved broad prefix plus the
+one-name A/B establishes `CreateThread` as formal sample-1 call 36.
+
+Stopping the narrow run immediately before dispatch captures this exact callee
+state:
+
+```text
+RAX       = 0x0000000140058fa0
+RCX       = 0x0000000000000000
+RDX       = 0x0000000000000000
+R8        = 0x0000000140058fa0
+R9        = 0x0000000000000000
+RSP       = 0x0000000fffffef78
+[RSP]     = 0x000000014025961e
+[RSP+0x28]= 0x0000000000000000
+[RSP+0x30]= 0x0000000000000000
+```
+
+Under the Win64 ABI, arguments 1–4 occupy `RCX`, `RDX`, `R8`, and `R9`, stack
+argument 5 begins at callee `RSP + 0x28`, and argument 6 begins at
+`RSP + 0x30`. Microsoft documents that convention at
+<https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170>.
+The observed call is therefore:
+
+```text
+CreateThread(NULL, 0, 0x0000000140058fa0, NULL, 0, NULL)
+```
+
+Microsoft documents the six-argument contract, NULL/default attributes and
+stack behavior, creation flags, optional `DWORD` thread-ID output, NULL failure
+return, thread handle, and the fact that an invalid start address need not make
+creation fail because the execution failure can be deferred until the new
+thread runs at
+<https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createthread>.
+Thread-ID lifetime and handle/ID distinction are documented at
+<https://learn.microsoft.com/en-us/windows/win32/procthread/thread-handles-and-identifiers>.
+
+The observed start address `0x0000000140058fa0` is readable in the mapped
+image and begins `jmp 0x00000001402864f8`. Both addresses lie in the RWX
+`.themida` section, whose characteristics are `0xe0000060`. The target begins
+with `pushf`, `sub rsp, 8`, an `r14` save, and opaque arithmetic. This evidence
+makes it a downstream thread-entry candidate only. The implementation neither
+schedules nor executes it, and this section does not classify it as the OEP.
+
+A disposable return-sensitivity handler compared three injected return values
+while leaving the formal call arguments unchanged:
+
+| Return | Post-return instructions | FNV-1a RIP digest | Later named calls | Stop |
+|---:|---:|---:|---|---|
+| `0x0000000000000000` | 19,572 | `0x203e6e80809eb565` | 37 `GetProcessHeap`; 38 `RtlAllocateHeap` | `RIP = 0` |
+| `0x0000000f30001010` | 19,572 | `0x203e6e80809eb565` | 37 `GetProcessHeap`; 38 `RtlAllocateHeap` | `RIP = 0` |
+| `0x0000000f30001020` | 19,572 | `0x203e6e80809eb565` | 37 `GetProcessHeap`; 38 `RtlAllocateHeap` | `RIP = 0` |
+
+The finite captured path is insensitive to NULL versus these two non-NULL
+handle identities. This does not imply that general guest code can ignore the
+documented success/failure distinction.
+
+### Bounded CreateThread policy
+
+The implementation adds `CreateThread` to the synthetic kernel32 seed and
+reads the six arguments at their ABI widths: full-width pointers and `SIZE_T`,
+exactly four bytes for `DWORD dwCreationFlags` at callee `RSP + 0x28`, and a
+full-width optional output pointer at `RSP + 0x30`. All arguments are read
+before state mutation.
+
+The accepted policy is deliberately limited to NULL thread attributes, zero
+requested stack size, and zero creation flags. It records the full start and
+parameter values without probing either address, allocates a fresh nonzero
+`DWORD` thread ID beginning at 2, and returns a fresh opaque handle from the
+existing bounded kernel-handle namespace. The record's state is runnable but
+unscheduled. If the optional output pointer is non-NULL, the handler validates
+and writes exactly four bytes before committing ID, thread, handle, or cursor
+state. The handle is noninheritable because the accepted attributes pointer is
+NULL and carries `0x001f03ff`, the complete legacy rights universe already
+modeled by Midas rather than a claim about every version-dependent Windows
+`THREAD_ALL_ACCESS` value.
+
+Created IDs are accepted by the existing `OpenThread` policy. ID 1 remains the
+current executing thread because no created record is scheduled. The ID cursor
+can issue every value through `u32::MAX` once and then enters an explicit
+exhausted state; the handle cursor retains its existing bounded unmapped range
+and stride. Unsupported attributes, stack size, or flags return NULL before
+probing an output pointer. ID/handle range, alignment, collision, and exhaustion
+failures also return NULL without changing output or allocator state. A valid
+request with an unmapped, read-only, page-crossing, or overflowing output range
+returns an emulator error before any thread state is committed.
+
+This slice does not allocate a guest stack, TEB, or TLS data; schedule or run a
+start routine; send DLL thread notifications; model suspended creation,
+resume/suspend, termination, waits, signaling, handle close/reuse, or process
+exit; implement ACL/token checks or detailed descriptor/inheritance behavior;
+or update last-error state. As with the other dispatch handlers, state committed
+before the shared return-stack read is not claimed transactional for a malformed
+API return frame.
+
+The nine focused tests cover:
+
+- the exact formal call after the earlier `OpenThread`, including the next
+  handle identity, ID 2, stored runnable-unscheduled record, and exact
+  `RAX`/`RIP`/`RSP` effects;
+- full-width start, parameter, and output pointers; acceptance of NULL and
+  deliberately unmapped starts without probing; fresh IDs; an exact four-byte
+  output write with adjacent-byte preservation; and `OpenThread` coherence for
+  a created ID;
+- every unsupported-policy case without output access, including dirty upper
+  bytes in the eight-byte stack slot proving that only the low four-byte flags
+  object is consumed;
+- last-valid ID and handle allocation, explicit exhaustion, malformed cursor,
+  alignment, and occupied-candidate cases with unchanged allocator/output
+  state on rejection;
+- deterministic isolation between two `Win64Env` instances;
+- unmapped and overflowing stack arguments before result, control, or thread
+  mutation;
+- unmapped, read-only, page-crossing, and overflowing optional output ranges
+  with output and state preservation; and
+- a call through the name-resolved synthetic kernel32 export stub, using a
+  real 0x30-byte caller reservation for the shadow area and two stack arguments,
+  with balanced caller `RSP` and no fixed stub RVA.
+
+Reproduce the tests and production paths with:
+
+```text
+cargo test --all-targets
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 35
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+The exact formal sample-1 production suffix is:
+
+```text
+  034: RtlAddVectoredExceptionHandler
+  035: GetVersion
+  036: CreateThread
+  037: GetProcessHeap
+  038: RtlAllocateHeap
+stop: ReachedUntil
+```
+
+Release `run_loader` and `trap_postmortem` agree on these handled-call counts
+and names:
+
+| Sample | Evidence role | Calls | `CreateThread` position | Start address | Stop | `RAX` | `RIP` | `RSP` |
+|---|---|---:|---:|---:|---|---:|---:|---:|
+| 1 | formal | 38 | 36 | `0x0000000140058fa0` | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0000000fffffefc8` |
+| 2 | engineering corroboration | 33 | not called | — | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0000000fffffefc8` |
+| 3 | engineering corroboration | 37 | 35 | `0x000000014008f837` | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0000000fffffefc8` |
+
+The final `RAX` values are later guest state, not `CreateThread` return
+captures. The direct and name-resolved tests establish the successful bounded
+handle and exact return-control effects.
+
+### New frontier
+
+`CreateThread` advances formal sample 1 through call 36. Production then uses
+the existing `GetProcessHeap` and `RtlAllocateHeap` handlers as calls 37 and 38
+before returning through zero. A disposable broad export-name control on formal
+sample 1, corroborated by a narrow `CreateThread`-plus-`Sleep` seed, continues
+to `Sleep` as call 39 with `RCX = 1`; both the disposable NULL and non-NULL
+`CreateThread` return variants reach the same call. The production export seed
+does not contain `Sleep`, so its captured path stops after call 38 at the
+ret-to-zero and `Sleep` is not implemented in this slice. Sample 2 does not call
+`CreateThread`; sample 3 corroborates it at its separate call 35 and reaches 37
+calls before ret-to-zero, subject to its provenance limitation. Scheduling the
+recorded thread-entry candidate also remains outside this slice.
