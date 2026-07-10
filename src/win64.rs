@@ -14,11 +14,17 @@ const PROC_STUB_BASE: u64 = 0x0000_7ffe_0000_0000;
 const PROC_STUB_STRIDE: u64 = 16;
 const PAGE_SIZE: u32 = 0x1000;
 
+const HEAP_ARENA_BASE: u64 = 0x0000_000f_4000_0000;
+const HEAP_ARENA_SIZE: u64 = 0x1000_0000;
+const HEAP_ALIGNMENT: u64 = 16;
+const HEAP_NO_SERIALIZE: u32 = 0x1;
+const HEAP_ZERO_MEMORY: u32 = 0x8;
+
 /// Emulated-environment policy for the default user UI language: en-US.
 const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 
-/// Opaque process-heap handle in the gap between the fixed PEB and stack
-/// mappings. It remains unmapped; no allocator backing is modeled.
+/// Opaque process-heap handle in the gap between the fixed PEB and heap arena.
+/// The handle remains unmapped and distinct from the allocator backing.
 const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
 
 /// RVA of the synthetic module's IMAGE_EXPORT_DIRECTORY.
@@ -274,10 +280,18 @@ fn write_ascii_z(image: &mut [u8], offset: usize, value: &str) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeapAllocation {
+    requested_size: u64,
+    mapped_size: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Win64Env {
     image_base: u64,
     process_heap: u64,
+    heap_cursor: u64,
+    heap_allocations: BTreeMap<u64, HeapAllocation>,
     modules: BTreeMap<String, u64>,
     next_base: u64,
     synthetic_modules: BTreeMap<String, SyntheticModule>,
@@ -290,12 +304,59 @@ impl Win64Env {
         Self {
             image_base,
             process_heap: EMULATED_PROCESS_HEAP_HANDLE,
+            heap_cursor: HEAP_ARENA_BASE,
+            heap_allocations: BTreeMap::new(),
             modules: BTreeMap::new(),
             next_base: FAKE_MODULE_BASE_START,
             synthetic_modules: BTreeMap::new(),
             proc_stubs: BTreeMap::new(),
             proc_stub_mapped_end: PROC_STUB_BASE,
         }
+    }
+
+    fn allocate_heap(
+        &mut self,
+        emu: &mut Emu,
+        heap_handle: u64,
+        flags: u32,
+        requested_size: u64,
+    ) -> Result<u64, EmuError> {
+        if heap_handle != self.process_heap || flags & !(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY) != 0
+        {
+            return Ok(0);
+        }
+
+        let page_size = u64::from(PAGE_SIZE);
+        // Environment policy: a zero-byte request consumes a fresh minimum
+        // block so success remains distinguishable from NULL failure.
+        let effective_size = requested_size.max(1);
+        let Some(mapped_size) = effective_size
+            .checked_add(page_size - 1)
+            .map(|size| size & !(page_size - 1))
+        else {
+            return Ok(0);
+        };
+        let allocation = HeapAllocation {
+            requested_size,
+            mapped_size,
+        };
+        if allocation.requested_size > allocation.mapped_size {
+            return Ok(0);
+        }
+
+        let allocation_base = self.heap_cursor;
+        let Some(next_cursor) = allocation_base.checked_add(allocation.mapped_size) else {
+            return Ok(0);
+        };
+        let arena_end = HEAP_ARENA_BASE + HEAP_ARENA_SIZE;
+        if !allocation_base.is_multiple_of(HEAP_ALIGNMENT) || next_cursor > arena_end {
+            return Ok(0);
+        }
+
+        emu.map_zeroed_rw(allocation_base, allocation.mapped_size)?;
+        self.heap_allocations.insert(allocation_base, allocation);
+        self.heap_cursor = next_cursor;
+        Ok(allocation_base)
     }
 
     fn module_base(&mut self, name: &str) -> u64 {
@@ -527,6 +588,19 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
         }
         "GetProcessHeap" => {
             let ret = env.process_heap;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "RtlAllocateHeap" => {
+            let heap_handle = emu.read_reg(RegisterX86::RCX)?;
+            // Flags is ULONG, so the x64 ABI consumes only EDX.
+            let flags = emu.read_reg(RegisterX86::RDX)? as u32;
+            let requested_size = emu.read_reg(RegisterX86::R8)?;
+            let ret = env.allocate_heap(emu, heap_handle, flags, requested_size)?;
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
             Ok(ApiOutcome::Handled {
@@ -835,6 +909,32 @@ mod tests {
             bytes.push(byte);
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn call_rtl_allocate_heap(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        heap_handle: u64,
+        flags: u64,
+        requested_size: u64,
+    ) -> u64 {
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, heap_handle).unwrap();
+        emu.write_reg(RegisterX86::RDX, flags).unwrap();
+        emu.write_reg(RegisterX86::R8, requested_size).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "RtlAllocateHeap").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected RtlAllocateHeap to be handled");
+        };
+        assert_eq!(name, "RtlAllocateHeap");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
     }
 
     #[test]
@@ -1232,6 +1332,176 @@ mod tests {
     }
 
     #[test]
+    fn rtl_allocate_heap_handles_observed_zeroed_page_request() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+
+        let allocation = call_rtl_allocate_heap(
+            &mut env,
+            &mut emu,
+            process_heap,
+            u64::from(HEAP_ZERO_MEMORY),
+            0x1000,
+        );
+
+        assert_eq!(allocation, HEAP_ARENA_BASE);
+        assert_ne!(allocation, 0);
+        assert!(allocation.is_multiple_of(HEAP_ALIGNMENT));
+        assert_eq!(emu.read_mem(allocation, 16).unwrap(), vec![0; 16]);
+        assert_eq!(
+            emu.read_mem(allocation + u64::from(PAGE_SIZE) - 16, 16)
+                .unwrap(),
+            vec![0; 16]
+        );
+        emu.write_mem(allocation, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(emu.read_mem(allocation, 4).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            env.heap_allocations.get(&allocation),
+            Some(&HeapAllocation {
+                requested_size: 0x1000,
+                mapped_size: u64::from(PAGE_SIZE),
+            })
+        );
+        assert_eq!(env.heap_cursor, HEAP_ARENA_BASE + u64::from(PAGE_SIZE));
+    }
+
+    #[test]
+    fn rtl_allocate_heap_returns_distinct_nonoverlapping_blocks() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+
+        let first = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, 17);
+        let marker = [0xa5; 17];
+        emu.write_mem(first, &marker).unwrap();
+
+        let second = call_rtl_allocate_heap(
+            &mut env,
+            &mut emu,
+            process_heap,
+            u64::from(HEAP_NO_SERIALIZE),
+            u64::from(PAGE_SIZE) + 1,
+        );
+        let third = call_rtl_allocate_heap(
+            &mut env,
+            &mut emu,
+            process_heap,
+            0xa5a5_5a5a_0000_0000 | u64::from(HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY),
+            32,
+        );
+
+        let first_size = env.heap_allocations[&first].mapped_size;
+        let second_size = env.heap_allocations[&second].mapped_size;
+        assert!(first + first_size <= second);
+        assert!(second + second_size <= third);
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_eq!(emu.read_mem(first, marker.len()).unwrap(), marker);
+        assert_eq!(emu.read_mem(third, 16).unwrap(), vec![0; 16]);
+    }
+
+    #[test]
+    fn rtl_allocate_heap_rejects_invalid_heap_handle_without_state_change() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let invalid_heap = env.process_heap + 1;
+        let cursor = env.heap_cursor;
+        let allocations = env.heap_allocations.clone();
+
+        let ret = call_rtl_allocate_heap(
+            &mut env,
+            &mut emu,
+            invalid_heap,
+            u64::from(HEAP_ZERO_MEMORY),
+            0x1000,
+        );
+
+        assert_eq!(ret, 0);
+        assert_eq!(env.heap_cursor, cursor);
+        assert_eq!(env.heap_allocations, allocations);
+        assert!(emu.read_mem(HEAP_ARENA_BASE, 1).is_err());
+    }
+
+    #[test]
+    fn rtl_allocate_heap_rejects_unsupported_flags_without_state_change() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let cursor = env.heap_cursor;
+        let allocations = env.heap_allocations.clone();
+
+        let ret = call_rtl_allocate_heap(
+            &mut env,
+            &mut emu,
+            process_heap,
+            u64::from(HEAP_ZERO_MEMORY | 0x2),
+            0x1000,
+        );
+
+        assert_eq!(ret, 0);
+        assert_eq!(env.heap_cursor, cursor);
+        assert_eq!(env.heap_allocations, allocations);
+        assert!(emu.read_mem(HEAP_ARENA_BASE, 1).is_err());
+    }
+
+    #[test]
+    fn rtl_allocate_heap_reports_size_failures_without_state_change() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let initial_cursor = env.heap_cursor;
+        let initial_allocations = env.heap_allocations.clone();
+
+        let oversized =
+            call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, HEAP_ARENA_SIZE + 1);
+        assert_eq!(oversized, 0);
+        assert_eq!(env.heap_cursor, initial_cursor);
+        assert_eq!(env.heap_allocations, initial_allocations);
+
+        let overflowed = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, u64::MAX);
+        assert_eq!(overflowed, 0);
+        assert_eq!(env.heap_cursor, initial_cursor);
+        assert_eq!(env.heap_allocations, initial_allocations);
+
+        let page_size = u64::from(PAGE_SIZE);
+        env.heap_cursor = HEAP_ARENA_BASE + HEAP_ARENA_SIZE - page_size;
+        let exhausted_cursor = env.heap_cursor;
+        let exhausted_allocations = env.heap_allocations.clone();
+        let exhausted = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, page_size + 1);
+        assert_eq!(exhausted, 0);
+        assert_eq!(env.heap_cursor, exhausted_cursor);
+        assert_eq!(env.heap_allocations, exhausted_allocations);
+        assert!(emu.read_mem(exhausted_cursor, 1).is_err());
+    }
+
+    #[test]
+    fn rtl_allocate_heap_zero_size_returns_unique_minimum_blocks() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+
+        let first = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, 0);
+        let second = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, 0);
+
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+        assert_eq!(env.heap_allocations[&first].requested_size, 0);
+        assert_eq!(
+            env.heap_allocations[&first].mapped_size,
+            u64::from(PAGE_SIZE)
+        );
+        assert_eq!(env.heap_allocations[&second].requested_size, 0);
+        assert_eq!(
+            env.heap_allocations[&second].mapped_size,
+            u64::from(PAGE_SIZE)
+        );
+        assert_eq!(emu.read_mem(first, 1).unwrap(), vec![0]);
+        assert_eq!(emu.read_mem(second, 1).unwrap(), vec![0]);
+    }
+
+    #[test]
     fn trap_dispatches_get_process_heap_via_export_stub() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
@@ -1362,6 +1632,62 @@ mod tests {
             emu.read_reg(RegisterX86::RIP).unwrap(),
             image.entry_point_va() + 22
         );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_name_resolved_ntdll_rtl_allocate_heap_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let ntdll_base = env.ensure_loaded_module(&mut emu, "ntdll.dll").unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("ntdll.dll")
+            .unwrap()
+            .export_stub("RtlAllocateHeap")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, ntdll_base, "RtlAllocateHeap")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+
+        let process_heap = env.process_heap;
+        let requested_size = 0x30u64;
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&process_heap.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xba]);
+        code.extend_from_slice(&u64::from(HEAP_ZERO_MEMORY).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xb8]);
+        code.extend_from_slice(&requested_size.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["RtlAllocateHeap".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        let allocation = emu.read_reg(RegisterX86::RAX).unwrap();
+        assert_ne!(allocation, 0);
+        assert_eq!(
+            env.heap_allocations.get(&allocation),
+            Some(&HeapAllocation {
+                requested_size,
+                mapped_size: u64::from(PAGE_SIZE),
+            })
+        );
+        assert_eq!(
+            emu.read_mem(allocation, requested_size as usize).unwrap(),
+            vec![0; requested_size as usize]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
     }
 
