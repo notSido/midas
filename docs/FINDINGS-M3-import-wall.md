@@ -945,7 +945,8 @@ stop: ReachedUntil
 ```
 
 At `98969a2`, sample 2 has the same 21-call sequence as engineering
-corroboration. Both then return through zero; full `trap_postmortem` captures
+corroboration. Both then reach a zero-target control transfer; full
+`trap_postmortem` captures
 show `RAX = 1`, `RIP = 0`, and `[RSP-8] = 0`. Sample 3 retains its
 six-allocation, 28-call sequence and ret-to-zero, with no
 `GetCurrentThreadId` call. Its provenance remains incomplete, and its
@@ -1072,7 +1073,7 @@ sequence with the same six allocation sizes and does not call
 `GetCurrentThreadId` or `OpenThread`; its incomplete provenance prevents its use
 as formal milestone evidence.
 
-Full `trap_postmortem` captures reach a later trampoline return through zero:
+Full `trap_postmortem` captures reach a later zero-target control transfer:
 
 | Sample | Calls | Stop | `RAX` | `RIP` | `[RSP-8]` |
 |---|---:|---|---:|---:|---:|
@@ -1219,7 +1220,7 @@ stop: ReachedUntil
 ```
 
 The full post-mortems show that the API returns `3` and all three paths later
-reach another trampoline return through zero:
+reach another zero-target control transfer:
 
 | Sample | Calls | API position | Stop | `RAX` | `RIP` | `[RSP-8]` |
 |---|---:|---:|---|---:|---:|---:|
@@ -1358,7 +1359,7 @@ The exact formal sample-1 production suffix is:
 stop: ReachedUntil
 ```
 
-All three paths later reach another trampoline return through zero:
+All three paths later reach another zero-target control transfer:
 
 | Sample | Calls | API position | Stop | `RAX` | `RIP` | `[RSP-8]` |
 |---|---:|---:|---|---:|---:|---:|
@@ -1514,6 +1515,158 @@ propagation and advances formal sample 1 through call 33. Formal sample 1 then
 directly calls the named, currently unhandled ntdll export
 `RtlAddVectoredExceptionHandler` with `RCX = 1` and
 `RDX = 0x000000014006aa83`; sample 3 corroborates that API with its own handler
-address after two additional calls. Sample 2 instead reaches a null return.
+address after two additional calls. Sample 2 instead reaches an indirect call
+through zero.
 `RtlAddVectoredExceptionHandler` is the formal next Win64 frontier and is not yet
 implemented.
+
+## RtlAddVectoredExceptionHandler is the direct call-34 frontier
+
+This slice starts from exact merged `SetCurrentDirectoryW` commit
+`5893703dedff575ad6fc6913029d5dd4390b322f`. No export-name A/B was needed:
+the baseline already stopped at the name-resolved ntdll stub. Stopping formal
+sample 1 after its first 33 handled calls preserves the exact pre-call state:
+
+```text
+RCX = 0x0000000000000001
+RDX = 0x000000014006aa83
+R8  = 0x0000000000000208
+R9  = 0x0000000000000000
+RIP = 0x00007fff00301010
+RSP = 0x0000000fffffefc8
+[RSP] = 0x0000000140227ab4
+```
+
+Thus formal call 34 is
+`RtlAddVectoredExceptionHandler(1, 0x000000014006aa83)`. Sample 3 reaches the
+same named call as engineering corroboration on its separate path, with
+`RCX = 1`, callback `RDX = 0x00000001400e5dbc`, and return address
+`0x0000000140210e33`. Its provenance is incomplete, so it is not formal
+milestone evidence. Sample 2 does not exercise this export in the captured
+path.
+
+Microsoft documents the public
+`AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)`
+contract: zero appends the handler, nonzero puts it first, success returns an
+opaque handle, and failure returns NULL. The handle is later consumed by
+`RemoveVectoredExceptionHandler`. The public contracts are recorded at
+<https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-addvectoredexceptionhandler>,
+<https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-removevectoredexceptionhandler>,
+and
+<https://learn.microsoft.com/en-us/windows/win32/api/winnt/nc-winnt-pvectored_exception_handler>.
+The observed export is the lower-level ntdll name, not the documented wrapper.
+
+Clean-room compatibility implementations corroborate that the private
+`RtlAddVectoredExceptionHandler` has the same two arguments. ReactOS at
+[`c296dcfa`](https://github.com/reactos/reactos/blob/c296dcfa29e7f32b623d8ed3e70604a06472fda2/sdk/lib/rtl/vectoreh.c#L152-L193)
+and Wine at
+[`f26c699d`](https://gitlab.winehq.org/wine/wine/-/blob/f26c699db5176caee6883210f949110de3af520d/dlls/ntdll/exception.c#L102-117)
+both allocate a fresh registration, insert it at the head for any nonzero
+`First` and at the tail for zero, and return the registration as the handle.
+Neither implementation probes or deduplicates the callback during
+registration. Their private node layouts differ, reinforcing that the returned
+value must remain opaque. This is compatibility evidence, not an assertion
+about native Windows' private layout. In particular, accepting a NULL callback
+without probing it is a bounded Midas policy supported by those implementations,
+not a Microsoft-documented guarantee for invalid input.
+
+A disposable return-sensitivity experiment checked whether the captured guest
+path selected a particular handle identity. Temporary variants returned NULL,
+the callback address, or opaque value `0x0000000f30002000`, then performed the
+same normal API return. Formal sample 1 executed 5,781 post-return instruction
+addresses under every variant with FNV-64 digest `0x3fec30c5cec96161` and the
+same later ret-to-zero state. Sample 3 executed 7,552 under every variant with
+digest `0x1c13248694b65815` and the same stop. This finite trace shows that the
+captured paths ignore the registration return value; it does not justify
+returning failure or exposing the callback as the handle. The variants and raw
+logs were temporary and uncommitted.
+
+The bounded `Win64Env` policy therefore models registration identity and order
+without inventing callback execution:
+
+- dispatch consumes only low `ECX` for the `ULONG First` argument and the full
+  `RDX` callback value;
+- every success stores the callback exactly, including duplicate, NULL, or
+  unmapped values, without a guest-memory read or probe;
+- `First == 0` appends, while any nonzero low-32-bit value prepends;
+- every call receives a fresh, full-width opaque token. The deterministic token
+  namespace begins immediately after the fixed PEB mapping at
+  `0x0000000f20001000`, advances by `0x10`, and has the unmapped process-heap
+  handle `0x0000000f30000000` as its exclusive upper bound; and
+- checked-add, range, alignment, collision, and exhaustion failures return NULL
+  without changing the token cursor or ordered registration list. A success
+  writes the token to full `RAX` and performs the normal x64 return.
+
+The namespace is intentionally unmapped and disjoint from the fixed guest
+mappings and modeled heap backing; the opaque token does not expose either
+ReactOS' or Wine's node layout or substitute the callback value. This slice does
+not invoke callbacks, remove registrations, dispatch
+exceptions, allocate guest-visible nodes, maintain reference counts, model
+lifetime or process exit, synchronize concurrent access, or update last-error
+state. Registration state changes before the shared `api_return` reads the
+guest return stack, so invalid-return-stack transactionality remains outside
+this slice's allocator-atomicity claim, consistent with the existing dispatcher
+contract.
+
+The six focused tests cover:
+
+- the exact formal sample-1 arguments, a callback deliberately unmapped in the
+  synthetic test environment, the first opaque token, its unmapped/full-width
+  identity, and exact `RAX`/`RIP`/`RSP` return effects;
+- dirty upper `RCX` bits, low-32-bit zero/nonzero interpretation, FIFO tail and
+  repeated-head ordering, sequential fresh tokens, and full-width callbacks;
+- independent duplicate and NULL callback registrations without callback-memory
+  access;
+- below-range, misaligned, upper-bound, overflow, collision, last-valid-token,
+  and exhausted-cursor cases, with cursor/list preservation on every failure;
+- deterministic isolation between two `Win64Env` instances; and
+- a call through the name-resolved synthetic ntdll export stub without a fixed
+  RVA, preserving the observed arguments and balanced stack.
+
+Reproduce the production path with:
+
+```text
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 33
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 33
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+The exact formal sample-1 production suffix is:
+
+```text
+  031: GetCurrentDirectoryW
+  032: GetModuleFileNameW
+  033: SetCurrentDirectoryW
+  034: RtlAddVectoredExceptionHandler
+stop: ReachedUntil
+```
+
+Release `run_loader` and `trap_postmortem` agree on the handled call counts and
+names. The full post-mortems are:
+
+| Sample | Calls | Registration position | Stop | `RAX` | `RIP` | `RSP` |
+|---|---:|---:|---|---:|---:|---:|
+| 1 | 34 | 34 | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0000000fffffefc8` |
+| 2 | 33 | not called | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0000000fffffefc8` |
+| 3 | 34 | 34 | `Other("ReachedUntil")` | `0x000000014008f837` | `0x0` | `0x0000000fffffef78` |
+
+The final `RAX` values are later guest state, not registration-return captures.
+The direct and name-resolved tests establish the successful first token
+`0x0000000f20001000` and its exact return-register effects.
+
+### New frontier
+
+`RtlAddVectoredExceptionHandler` advances formal sample 1 through call 34. It
+then executes the finite post-return path and returns through zero without
+another named API. Sample 3 corroborates that shape after its separate call 34;
+sample 2 reaches its earlier independent indirect call through zero after call
+33. The next causal gap has not yet been diagnosed, and no next API name is
+claimed. Formal
+sample 1 remains the milestone artifact; samples 2 and 3 remain engineering
+corroboration until their provenance records are completed.
