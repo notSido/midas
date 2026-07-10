@@ -17,6 +17,10 @@ const PAGE_SIZE: u32 = 0x1000;
 /// Emulated-environment policy for the default user UI language: en-US.
 const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 
+/// Opaque process-heap handle in the gap between the fixed PEB and stack
+/// mappings. It remains unmapped; no allocator backing is modeled.
+const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
+
 /// RVA of the synthetic module's IMAGE_EXPORT_DIRECTORY.
 pub const SYNTHETIC_EXPORT_DIR_RVA: u32 = 0x200;
 
@@ -29,6 +33,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "LoadLibraryA",
     "LoadLibraryW",
     "GetProcAddress",
+    "GetProcessHeap",
     "GetModuleHandleA",
     "GetModuleHandleW",
     "VirtualAlloc",
@@ -272,6 +277,7 @@ fn write_ascii_z(image: &mut [u8], offset: usize, value: &str) {
 #[derive(Debug, Clone)]
 pub struct Win64Env {
     image_base: u64,
+    process_heap: u64,
     modules: BTreeMap<String, u64>,
     next_base: u64,
     synthetic_modules: BTreeMap<String, SyntheticModule>,
@@ -283,6 +289,7 @@ impl Win64Env {
     pub fn new(image_base: u64) -> Self {
         Self {
             image_base,
+            process_heap: EMULATED_PROCESS_HEAP_HANDLE,
             modules: BTreeMap::new(),
             next_base: FAKE_MODULE_BASE_START,
             synthetic_modules: BTreeMap::new(),
@@ -511,6 +518,15 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                     env.resolve_proc(emu, module_base, &proc_name)?
                 }
             };
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "GetProcessHeap" => {
+            let ret = env.process_heap;
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
             Ok(ApiOutcome::Handled {
@@ -1162,6 +1178,89 @@ mod tests {
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn get_process_heap_returns_stable_environment_handle() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let first_return_address: u64 = 0x1234_5678_9abc_def0;
+        emu.write_mem(rsp, &first_return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RDX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let first = dispatch(&mut env, &mut emu, "GetProcessHeap").unwrap();
+        let ApiOutcome::Handled {
+            ret: first_handle, ..
+        } = first
+        else {
+            panic!("expected GetProcessHeap to be handled");
+        };
+        assert_ne!(first_handle, 0);
+        assert_eq!(first_handle, env.process_heap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), first_handle);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            first_return_address
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+
+        let second_return_address: u64 = 0x0fed_cba9_8765_4321;
+        emu.write_mem(rsp, &second_return_address.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RAX, 0).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let second = dispatch(&mut env, &mut emu, "GetProcessHeap").unwrap();
+        assert_eq!(
+            second,
+            ApiOutcome::Handled {
+                name: "GetProcessHeap".to_owned(),
+                ret: first_handle,
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), first_handle);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            second_return_address
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn trap_dispatches_get_process_heap_via_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.ensure_kernel32(&mut emu).unwrap();
+        let module = env.synthetic_modules.get("kernel32.dll").unwrap();
+        let stub = module.export_stub("GetProcessHeap").unwrap();
+        let expected_handle = env.process_heap;
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["GetProcessHeap".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_ne!(expected_handle, 0);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected_handle);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            image.entry_point_va() + 12
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
     }
 
     #[test]
