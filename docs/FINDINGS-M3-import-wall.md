@@ -187,13 +187,13 @@ With a synthetic kernel32 PE (DOS + NT headers + a real export directory) mapped
 at the `GetModuleHandleA` base, the loader parses the export table successfully
 and advances past the `e_lfanew` read. It then resolves an export and **reads the
 resolved function's code bytes**: sample 1 faults with `ReadUnmapped` at
-`kernel32_base + 0x1040`, which is stub slot 4 (`stub_region_rva 0x1000 + 4*16`) =
-`LoadLibraryA` (exports are name-sorted). i.e. after obtaining kernel32's base the
-loader resolves `LoadLibraryA` and inspects its bytes before use (a common
-anti-hook / relocation check). The absolute stub RVA is a property of the
-synthetic layout, not the sample: `stub_region_rva` is the export area rounded up
-to a page (`0x1000` for the current 9-name export set), so the stub region starts
-at `+0x1000` and slot 4 lands at `+0x1040`.
+`kernel32_base + 0x1040`, which was stub slot 4 (`stub_region_rva 0x1000 + 4*16`) =
+`LoadLibraryA` in the then-current name-sorted export set. i.e. after obtaining
+kernel32's base the loader resolves `LoadLibraryA` and inspects its bytes before use
+(a common anti-hook / relocation check). The absolute stub RVA was a property of
+that synthetic layout, not the sample: `stub_region_rva` was the export area rounded
+up to a page (`0x1000` for that 9-name export set), so the stub region started at
+`+0x1000` and slot 4 landed at `+0x1040`.
 
 Consequence for the design: the export **stub region must be readable** (mapped
 read-only) so the loader can inspect a resolved function's bytes, while remaining
@@ -218,8 +218,8 @@ export-call trap dispatching on `FetchProt` as well as `FetchUnmapped`:
   `FetchProt`, which the trap catches and dispatches by name.
 - On **all three** samples the run is now identical: one handled API
   (`GetModuleHandleA`), then a stop at an unhandled export call resolved by name to
-  **`LoadLibraryA`** (stub RVA `0x1040` = slot 4 in the name-sorted synthetic export
-  table). So the loader's bootstrap sequence is
+  **`LoadLibraryA`** (stub RVA `0x1040` = slot 4 in the then-current name-sorted
+  synthetic export table). So the loader's bootstrap sequence is
   `GetModuleHandleA("kernel32.dll")` → resolve/inspect/**call `LoadLibraryA`**.
 - This is a captured CLI artifact, not a committed test (long, sample-dependent).
   The `FetchProt` mechanism and the readable-stub read are covered by committed
@@ -285,8 +285,9 @@ export-call trap reverse-maps a faulting stub across all registered modules.
 
 - With the five loaded DLLs now parseable, the loader gets past the `user32_base+0x3c`
   read and the header/export-directory parse, and advances to resolving and **calling**
-  `GetProcAddress` from kernel32 (kernel32 stub `rva=0x1030` = slot 3 in the name-sorted
-  export table). Identical on all three samples. So the loader's bootstrap is the
+  `GetProcAddress` from kernel32 (kernel32 stub `rva=0x1030` = slot 3 in the
+  then-current name-sorted export table). Identical on all three samples. So the
+  loader's bootstrap is the
   classic `GetModuleHandle`/`LoadLibrary` → resolve `GetProcAddress` → resolve
   everything else pattern.
 - Captured CLI artifact, not a committed test (long, sample-dependent). The parseable
@@ -560,3 +561,72 @@ The critical-section effect fixes this specific null propagation. The next
 `ReachedUntil` after the shared 15-call prefix has not yet been diagnosed by a
 committed production artifact, so no further API behavior is justified by this
 section alone.
+
+## GetUserDefaultUILanguage is the causal call-16 gap
+
+After the merged `RtlInitializeCriticalSection` slice, the baseline handles 15
+APIs and then reaches the previously observed ret-to-zero. A sample-1 runtime
+trace localized the final null handler slot to `0x14006d3b6`. Its last writer is
+`0x1400accf7` (`mov [r9],rbx`), which stores `RBX = 0`; the final dispatcher at
+`0x14005caf5` later reads that zero.
+
+An isolated A/B diagnostic changed only `KERNEL32_EXPORTS` by adding
+`GetUserDefaultUILanguage`. With that name present, the same writer stores the
+synthetic export stub `0x7fff00001040` into the same slot, and the same final
+dispatcher reads that address. The export-call trap then reports
+`GetUserDefaultUILanguage` as call 16. This directly ties the availability of
+that export name to this handler slot and call; it does not justify any other
+API. The stub address is a diagnostic observation, not a production constant:
+the synthetic export builder sorts names, so RVAs can move when the seed changes.
+
+The production slice seeds only that observed kernel32 name. Its no-argument
+dispatch returns deterministic nonzero `LANGID 0x0409` (en-US) as the emulated
+environment's default UI-language policy, writes it to `RAX`, and performs the
+normal x64 return. Focused tests assert the direct `RAX`/`RIP`/`RSP` effect and
+an end-to-end call through the synthetic kernel32 export stub; the trap test
+looks the stub up by name rather than fixing its RVA.
+
+Reproduce the sample-dependent result with:
+
+```
+cargo build --release --example run_loader
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+```
+
+Each captured run emitted this call/stop summary:
+
+```
+handled APIs:
+  001: GetModuleHandleA
+  002: LoadLibraryA
+  003: LoadLibraryA
+  004: LoadLibraryA
+  005: LoadLibraryA
+  006: LoadLibraryA
+  007: GetProcAddress
+  008: GetProcAddress
+  009: RtlInitializeCriticalSection
+  010: GetModuleHandleA
+  011: LoadLibraryA
+  012: GetModuleHandleA
+  013: LoadLibraryA
+  014: GetModuleHandleA
+  015: LoadLibraryA
+  016: GetUserDefaultUILanguage
+stop: ReachedUntil
+```
+
+Returning the environment-policy LANGID advances each sample by approximately
+1.1 million instructions beyond the 15-call wall to this later
+`ReachedUntil`. Samples 2 and 3 corroborate the engineering result, but their
+incomplete version/config/source provenance in `samples/SAMPLES.md` means they
+are not formal milestone evidence.
+
+### New frontier
+
+A separate broad-name diagnostic observed the next selected and called
+kernel32 export as `GetProcessHeap`. This slice does not seed or dispatch
+`GetProcessHeap` and claims no semantics for it; it is only the next observed
+Win64 frontier.
