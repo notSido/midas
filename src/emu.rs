@@ -321,6 +321,28 @@ impl Emu {
             })
     }
 
+    /// Map a nonzero, page-aligned region as explicitly zeroed RW/NX memory.
+    pub(crate) fn map_zeroed_rw(&mut self, base: u64, size: u64) -> Result<(), EmuError> {
+        let end = checked_end(base, size)?;
+        map_region(&mut self.uc, base, size, Prot::READ | Prot::WRITE)?;
+
+        let zero_page = [0u8; PAGE_SIZE as usize];
+        let mut page = base;
+        while page < end {
+            self.uc
+                .mem_write(page, &zero_page)
+                .map_err(|source| EmuError::WriteMem {
+                    addr: page,
+                    size: zero_page.len(),
+                    source,
+                })?;
+            page = page
+                .checked_add(PAGE_SIZE)
+                .ok_or(EmuError::AddressRangeOverflow { base, size })?;
+        }
+        Ok(())
+    }
+
     pub fn map_image(
         &mut self,
         image: &pe::PeImage,
@@ -1109,6 +1131,29 @@ mod tests {
         let address = STACK_BASE + 0x100;
         emu.write_mem(address, &[1, 2, 3, 4]).unwrap();
         assert_eq!(emu.read_mem(address, 4).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn map_zeroed_rw_maps_writable_non_executable_pages() {
+        let mut emu = Emu::new().unwrap();
+        let base = 0x0000_0000_0700_0000;
+        emu.map_zeroed_rw(base, PAGE_SIZE * 2).unwrap();
+
+        assert_eq!(emu.read_mem(base, 16).unwrap(), vec![0; 16]);
+        assert_eq!(emu.read_mem(base + PAGE_SIZE - 8, 16).unwrap(), vec![0; 16]);
+
+        let address = base + PAGE_SIZE - 2;
+        emu.write_mem(address, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(emu.read_mem(address, 4).unwrap(), vec![1, 2, 3, 4]);
+
+        let report = emu.run_observed(base, 1).unwrap();
+        assert_eq!(
+            report.stop_reason,
+            StopReason::MemoryFault(super::MemFault {
+                kind: FaultKind::FetchProt,
+                address: base,
+            })
+        );
     }
 
     #[test]

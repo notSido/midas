@@ -687,3 +687,85 @@ stub to `RtlAllocateHeap` by name. Sample 1 is the formal artifact; samples 2 an
 `RtlAllocateHeap` is now the next observed and called export on all three
 samples. It is present in the synthetic ntdll export table but has no dispatch or
 allocation semantics yet, so the trap stops before executing it.
+
+## RtlAllocateHeap advances the loader through repeated process-heap requests
+
+The fault-time capture at the previous wall was identical on all three samples:
+`RCX = 0x0000000f30000000` (the stable `GetProcessHeap` result), `RDX = 0x8`
+(`HEAP_ZERO_MEMORY`), `R8 = 0x1000`, and `R9 = 0`. A one-call diagnostic return
+with a fresh zeroed writable page showed no reads or writes to that first block
+before the loader called `GetProcessHeap` again 12,588 instructions later. This
+justified a general multi-block allocator rather than a one-address return value.
+
+The production model accepts the environment's process-heap handle and allocates
+distinct RW/NX pages from a bounded 256 MiB bump arena. It tracks requested and
+mapped sizes for later ownership checks, guarantees at least 16-byte alignment,
+and explicitly zeroes fresh mappings. The currently modeled flag subset is
+`HEAP_NO_SERIALIZE` and `HEAP_ZERO_MEMORY`; unsupported flags, invalid handles,
+checked-arithmetic failure, and arena exhaustion return `NULL` without changing
+allocator state. Treating a zero-byte request as a fresh minimum block is an
+explicit environment policy, not an observed loader requirement. Free,
+reallocation, exception-generating allocation failure, and block reuse are not
+implemented by this slice.
+
+Focused tests cover the RW/NX mapping primitive, the exact observed call,
+alignment and writeability, distinct non-overlapping blocks, metadata, the
+low-32-bit `ULONG` flag ABI, failure atomicity, bounded exhaustion, zero-size
+uniqueness, and an end-to-end call through the name-resolved synthetic ntdll
+stub. Reproduce the sample-dependent result with:
+
+```
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+```
+
+Exact sample-1 output:
+
+```
+handled APIs:
+  001: GetModuleHandleA
+  002: LoadLibraryA
+  003: LoadLibraryA
+  004: LoadLibraryA
+  005: LoadLibraryA
+  006: LoadLibraryA
+  007: GetProcAddress
+  008: GetProcAddress
+  009: RtlInitializeCriticalSection
+  010: GetModuleHandleA
+  011: LoadLibraryA
+  012: GetModuleHandleA
+  013: LoadLibraryA
+  014: GetModuleHandleA
+  015: LoadLibraryA
+  016: GetUserDefaultUILanguage
+  017: GetProcessHeap
+  018: RtlAllocateHeap
+  019: GetProcessHeap
+  020: RtlAllocateHeap
+stop: ReachedUntil
+```
+
+`trap_postmortem` stopped immediately before call 20 by setting `max_calls = 19`.
+On samples 1 and 2 that second allocation again uses the process-heap handle and
+flag `0x8`, but requests `0x10` bytes. Sample 3 follows the same first two calls,
+then makes four more allocations before its stop; its six requested sizes are
+`0x1000`, `0x10`, `0x410`, `0x10`, `0x410`, `0x10`, all with flag `0x8`. Thus the
+shared artifact is the same two-allocation prefix, while the longer sample-3
+sequence is payload-dependent engineering evidence. Sample 1 is the formal
+artifact; samples 2 and 3 retain the provenance limitation recorded in
+`samples/SAMPLES.md`.
+
+The final `ReachedUntil` is again a trampoline `ret` whose consumed target is
+zero. On sample 1 it occurs after call 20 with `RIP = 0`, `RAX = 0`, and
+`[RSP-8] = 0`; samples 2 and 3 reach the same class of stop after calls 20 and 28
+respectively.
+
+### New frontier
+
+The cause of this later null VM-handler value has not yet been diagnosed. In
+particular, the current artifact does not establish whether another missing
+synthetic export, an API side effect, or an internal VM value is responsible.
+That dependency must be traced before another Win64 behavior is added.
