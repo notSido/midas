@@ -90,6 +90,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "OpenThread",
     "CreateThread",
     "GetVersion",
+    "Sleep",
 ];
 
 /// Seed ntdll export names observed during the bootstrap export walk; this is
@@ -772,6 +773,7 @@ impl Default for Win64Env {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiOutcome {
     Handled { name: String, ret: u64 },
+    HandledVoid { name: String },
     Unhandled { name: String },
 }
 
@@ -865,6 +867,25 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             Ok(ApiOutcome::Handled {
                 name: name.to_owned(),
                 ret,
+            })
+        }
+        "Sleep" => {
+            // DWORD consumes only ECX. Zero and INFINITE are unsupported and
+            // return before the return stack is read or any state is mutated.
+            let interval = emu.read_reg(RegisterX86::RCX)? as u32;
+            if interval == 0 || interval == u32::MAX {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // Deterministic wait elision: every finite positive interval
+            // completes immediately. Sleep is VOID, so preserve RAX, all
+            // incidental registers, and flags as an explicit Midas policy,
+            // rather than as a Windows ABI guarantee.
+            api_return(emu)?;
+            Ok(ApiOutcome::HandledVoid {
+                name: name.to_owned(),
             })
         }
         "GetCurrentDirectoryW" => {
@@ -1222,7 +1243,7 @@ pub fn run_with_import_trap(
                     }
 
                     match dispatch(env, emu, &name)? {
-                        ApiOutcome::Handled { name, .. } => {
+                        ApiOutcome::Handled { name, .. } | ApiOutcome::HandledVoid { name } => {
                             handled.push(name);
                             rip = emu.read_reg(RegisterX86::RIP)?;
                             continue;
@@ -1284,7 +1305,7 @@ pub fn run_with_import_trap(
                 }
 
                 match dispatch(env, emu, &name)? {
-                    ApiOutcome::Handled { name, .. } => {
+                    ApiOutcome::Handled { name, .. } | ApiOutcome::HandledVoid { name } => {
                         handled.push(name);
                         rip = emu.read_reg(RegisterX86::RIP)?;
                     }
@@ -1408,6 +1429,79 @@ mod tests {
             bytes.push(byte);
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    const SLEEP_STATE_REGISTERS: [RegisterX86; 18] = [
+        RegisterX86::RAX,
+        RegisterX86::RBX,
+        RegisterX86::RCX,
+        RegisterX86::RDX,
+        RegisterX86::RSI,
+        RegisterX86::RDI,
+        RegisterX86::RBP,
+        RegisterX86::RSP,
+        RegisterX86::R8,
+        RegisterX86::R9,
+        RegisterX86::R10,
+        RegisterX86::R11,
+        RegisterX86::R12,
+        RegisterX86::R13,
+        RegisterX86::R14,
+        RegisterX86::R15,
+        RegisterX86::RIP,
+        RegisterX86::EFLAGS,
+    ];
+
+    fn seed_sleep_machine_state(emu: &mut Emu, rcx: u64, rsp: u64, rip: u64) {
+        for (register, value) in [
+            (RegisterX86::RAX, 0xaaaa_bbbb_cccc_dddd),
+            (RegisterX86::RBX, 0x0101_0202_0303_0404),
+            (RegisterX86::RDX, 0x1111_2222_3333_4444),
+            (RegisterX86::RSI, 0x2121_2222_2323_2424),
+            (RegisterX86::RDI, 0x3131_3232_3333_3434),
+            (RegisterX86::RBP, 0x4141_4242_4343_4444),
+            (RegisterX86::R8, 0x5151_5252_5353_5454),
+            (RegisterX86::R9, 0x6161_6262_6363_6464),
+            (RegisterX86::R10, 0x7171_7272_7373_7474),
+            (RegisterX86::R11, 0x8181_8282_8383_8484),
+            (RegisterX86::R12, 0x9191_9292_9393_9494),
+            (RegisterX86::R13, 0xa1a1_a2a2_a3a3_a4a4),
+            (RegisterX86::R14, 0xb1b1_b2b2_b3b3_b4b4),
+            (RegisterX86::R15, 0xc1c1_c2c2_c3c3_c4c4),
+        ] {
+            emu.write_reg(register, value).unwrap();
+        }
+        emu.write_reg(RegisterX86::RCX, rcx).unwrap();
+        emu.write_reg(RegisterX86::EFLAGS, 0x8c7).unwrap();
+        emu.write_reg(RegisterX86::RIP, rip).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        assert_eq!(emu.read_reg(RegisterX86::EFLAGS).unwrap(), 0x8c7);
+    }
+
+    fn sleep_machine_state(emu: &Emu) -> Vec<(RegisterX86, u64)> {
+        SLEEP_STATE_REGISTERS
+            .iter()
+            .map(|register| (*register, emu.read_reg(*register).unwrap()))
+            .collect()
+    }
+
+    fn assert_sleep_return_state(emu: &Emu, before: &[(RegisterX86, u64)], return_address: u64) {
+        for (register, value) in before {
+            let expected = match *register {
+                RegisterX86::RIP => return_address,
+                RegisterX86::RSP => *value + 8,
+                _ => *value,
+            };
+            assert_eq!(
+                emu.read_reg(*register).unwrap(),
+                expected,
+                "unexpected {register:?} change"
+            );
+        }
+    }
+
+    fn sleep_environment_state(env: &Win64Env) -> String {
+        format!("{env:#?}")
     }
 
     fn call_rtl_allocate_heap(
@@ -2196,6 +2290,117 @@ mod tests {
             second_return_address
         );
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), second_rsp + 8);
+    }
+
+    #[test]
+    fn sleep_observed_one_returns_void_and_preserves_machine_state() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let initial_rip = 0x1111_2222_3333_4444;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        let rcx = 0xfedc_ba98_0000_0001;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        seed_sleep_machine_state(&mut emu, rcx, rsp, initial_rip);
+        let before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+        let return_frame_before = emu.read_mem(rsp, 8).unwrap();
+
+        let outcome = dispatch(&mut env, &mut emu, "Sleep").unwrap();
+
+        assert_eq!(
+            outcome,
+            ApiOutcome::HandledVoid {
+                name: "Sleep".to_owned(),
+            }
+        );
+        assert_sleep_return_state(&emu, &before, return_address);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            0xaaaa_bbbb_cccc_dddd
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), rcx);
+        assert_eq!(emu.read_reg(RegisterX86::EFLAGS).unwrap(), 0x8c7);
+        assert_eq!(emu.read_mem(rsp, 8).unwrap(), return_frame_before);
+        assert_eq!(sleep_environment_state(&env), environment_before);
+    }
+
+    #[test]
+    fn sleep_elides_finite_positive_boundary_and_generalization_cases() {
+        for (index, interval) in [2, 0x8000_0000, u32::MAX - 1].into_iter().enumerate() {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let rsp = crate::emu::STACK_BASE + 0x400;
+            let return_address = 0x1234_5678_9abc_def0_u64 + index as u64;
+            let rcx = 0xa5a5_5a5a_0000_0000 | u64::from(interval);
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(&mut emu, rcx, rsp, 0x1111_2222_3333_4444);
+            let before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "Sleep").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::HandledVoid {
+                    name: "Sleep".to_owned(),
+                },
+                "interval {interval:#x}"
+            );
+            assert_sleep_return_state(&emu, &before, return_address);
+            assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), rcx);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn sleep_zero_and_infinite_are_unsupported_without_stack_access() {
+        for (rcx, rsp) in [
+            (0xffff_ffff_0000_0000, 0x0000_0000_dead_0000),
+            (0x1357_2468_ffff_ffff, u64::MAX),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            assert!(emu.read_mem(rsp, 8).is_err());
+            seed_sleep_machine_state(&mut emu, rcx, rsp, 0x1111_2222_3333_4444);
+            let before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "Sleep").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Unhandled {
+                    name: "Sleep".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn sleep_invalid_return_frame_pointers_are_failure_atomic() {
+        for (rcx, rsp) in [
+            (0xaaaa_5555_0000_0001, 0x0000_0000_dead_0000),
+            (0x5555_aaaa_ffff_fffe, u64::MAX),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            assert!(emu.read_mem(rsp, 8).is_err());
+            seed_sleep_machine_state(&mut emu, rcx, rsp, 0x1111_2222_3333_4444);
+            let before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let error = dispatch(&mut env, &mut emu, "Sleep").unwrap_err();
+
+            assert!(
+                matches!(error, EmuError::ReadMem { addr, size, .. } if addr == rsp && size == 8),
+                "unexpected return-frame error: {error:?}"
+            );
+            assert_eq!(sleep_machine_state(&emu), before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
     }
 
     #[test]
@@ -4079,6 +4284,53 @@ mod tests {
         );
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_name_resolved_kernel32_sleep_with_shadow_space() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("Sleep")
+            .unwrap();
+        let stub = env.resolve_proc(&mut emu, kernel32_base, "Sleep").unwrap();
+        assert_eq!(stub, export_stub);
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let interval = 0xa5a5_5a5a_0000_0002_u64;
+        let rax_sentinel = 0xaaaa_bbbb_cccc_dddd_u64;
+
+        let mut code = Vec::new();
+        // Reserve the Win64 caller shadow area and balance it after the call.
+        code.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]);
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&interval.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&rax_sentinel.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xbb]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xff, 0xd3]);
+        code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x20]);
+        code.extend_from_slice(&[0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+        let environment_before = sleep_environment_state(&env);
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["Sleep".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), rax_sentinel);
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), interval);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(sleep_environment_state(&env), environment_before);
     }
 
     #[test]
