@@ -692,21 +692,23 @@ allocation semantics yet, so the trap stops before executing it.
 
 The fault-time capture at the previous wall was identical on all three samples:
 `RCX = 0x0000000f30000000` (the stable `GetProcessHeap` result), `RDX = 0x8`
-(`HEAP_ZERO_MEMORY`), `R8 = 0x1000`, and `R9 = 0`. A one-call diagnostic return
-with a fresh zeroed writable page showed no reads or writes to that first block
-before the loader called `GetProcessHeap` again 12,588 instructions later. This
-justified a general multi-block allocator rather than a one-address return value.
+(`HEAP_ZERO_MEMORY`), `R8 = 0x1000`, and `R9 = 0`. The production replay below
+then observes the loader call `GetProcessHeap` again and make another allocation
+request. That repeated sequence directly justifies a general multi-block
+allocator rather than a one-address return value.
 
 The production model accepts the environment's process-heap handle and allocates
 distinct RW/NX pages from a bounded 256 MiB bump arena. It tracks requested and
 mapped sizes for later ownership checks, guarantees at least 16-byte alignment,
-and explicitly zeroes fresh mappings. The currently modeled flag subset is
-`HEAP_NO_SERIALIZE` and `HEAP_ZERO_MEMORY`; unsupported flags, invalid handles,
-checked-arithmetic failure, and arena exhaustion return `NULL` without changing
-allocator state. Treating a zero-byte request as a fresh minimum block is an
-explicit environment policy, not an observed loader requirement. Free,
-reallocation, exception-generating allocation failure, and block reuse are not
-implemented by this slice.
+and explicitly zeroes every fresh mapping. The accepted flag subset is
+`HEAP_NO_SERIALIZE` and `HEAP_ZERO_MEMORY`: the latter is satisfied for the
+observed calls, but absence of the flag is not behaviorally distinguished, and
+the former is a no-op in the single-threaded emulator. Unsupported flags,
+invalid handles, checked-arithmetic failure, and arena exhaustion return `NULL`
+without changing allocator state. Treating a zero-byte request as a fresh
+minimum block is an explicit environment policy, not an observed loader
+requirement. Free, reallocation, exception-generating allocation failure, and
+block reuse are not implemented by this slice.
 
 Focused tests cover the RW/NX mapping primitive, the exact observed call,
 alignment and writeability, distinct non-overlapping blocks, metadata, the
@@ -758,10 +760,73 @@ sequence is payload-dependent engineering evidence. Sample 1 is the formal
 artifact; samples 2 and 3 retain the provenance limitation recorded in
 `samples/SAMPLES.md`.
 
+The bounded argument captures used these exact invocations (setting
+`max_calls` one below the target API stops before dispatch and preserves its
+argument registers):
+
+```
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 17
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 19
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 17
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 19
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 17
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 19
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 21
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 23
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 25
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 27
+```
+
+Clipped sample-1 stdout immediately before call 20:
+
+```
+handled: [..., "RtlAllocateHeap", "GetProcessHeap"]
+stop:    Other("max_calls reached")
+  RCX = 0x0000000f30000000
+  RDX = 0x0000000000000008
+  R8 = 0x0000000000000010
+  R9 = 0x0000000000000000
+  RIP = 0x00007fff00301020
+```
+
+The shown `0x00007fff00301020` is the name-resolved `RtlAllocateHeap` stub in
+this synthetic-module layout, not a stable production constant.
+
+The corresponding requested-size (`R8`) captures were:
+
+| Sample | Target call | `max_calls` | `R8` |
+|---|---:|---:|---:|
+| 1 | 18 | 17 | `0x1000` |
+| 1 | 20 | 19 | `0x10` |
+| 2 | 18 | 17 | `0x1000` |
+| 2 | 20 | 19 | `0x10` |
+| 3 | 18 | 17 | `0x1000` |
+| 3 | 20 | 19 | `0x10` |
+| 3 | 22 | 21 | `0x410` |
+| 3 | 24 | 23 | `0x10` |
+| 3 | 26 | 25 | `0x410` |
+| 3 | 28 | 27 | `0x10` |
+
 The final `ReachedUntil` is again a trampoline `ret` whose consumed target is
 zero. On sample 1 it occurs after call 20 with `RIP = 0`, `RAX = 0`, and
 `[RSP-8] = 0`; samples 2 and 3 reach the same class of stop after calls 20 and 28
 respectively.
+
+Those final stops were reproduced with `max_calls = 200`:
+
+```
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+Relevant clipped stdout:
+
+| Sample | Stop | `RAX` | `RIP` | `[RSP-8]` |
+|---|---|---:|---:|---:|
+| 1 | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0` |
+| 2 | `Other("ReachedUntil")` | `0x0` | `0x0` | `0x0` |
+| 3 | `Other("ReachedUntil")` | `0x0000000f40005000` | `0x0` | `0x0` |
 
 ### New frontier
 
