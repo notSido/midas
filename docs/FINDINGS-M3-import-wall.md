@@ -630,3 +630,60 @@ A separate broad-name diagnostic observed the next selected and called
 kernel32 export as `GetProcessHeap`. This slice does not seed or dispatch
 `GetProcessHeap` and claims no semantics for it; it is only the next observed
 Win64 frontier.
+
+## GetProcessHeap advances the loader to RtlAllocateHeap
+
+The prior broad-name diagnostic identified `GetProcessHeap` as the export after
+call 16. The production slice adds only that observed kernel32 name and models
+the no-argument API as returning a deterministic, stable, nonzero opaque handle
+owned by `Win64Env`. The handle has no allocator backing in this slice; the code
+does not claim heap allocation or `PEB.ProcessHeap` coherence. Direct coverage
+calls the API twice in one environment and asserts the stable return plus the
+`RAX`/`RIP`/`RSP` effects. An end-to-end test resolves the synthetic export stub
+by name and exercises the normal export-call trap.
+
+Reproduce the sample-dependent result with:
+
+```
+cargo build --locked --release --example run_loader
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+```
+
+All three captured runs emitted the same call sequence and stop. Exact sample-1
+output:
+
+```
+handled APIs:
+  001: GetModuleHandleA
+  002: LoadLibraryA
+  003: LoadLibraryA
+  004: LoadLibraryA
+  005: LoadLibraryA
+  006: LoadLibraryA
+  007: GetProcAddress
+  008: GetProcAddress
+  009: RtlInitializeCriticalSection
+  010: GetModuleHandleA
+  011: LoadLibraryA
+  012: GetModuleHandleA
+  013: LoadLibraryA
+  014: GetModuleHandleA
+  015: LoadLibraryA
+  016: GetUserDefaultUILanguage
+  017: GetProcessHeap
+stop: unhandled API RtlAllocateHeap at export-stub or import rva=0x00001020
+```
+
+The reported `0x1020` is an address in the current name-sorted synthetic ntdll
+layout, not a production constant or sample property. The trap reverse-maps that
+stub to `RtlAllocateHeap` by name. Sample 1 is the formal artifact; samples 2 and
+3 corroborate the engineering result but retain the provenance limitation in
+`samples/SAMPLES.md`.
+
+### New frontier
+
+`RtlAllocateHeap` is now the next observed and called export on all three
+samples. It is present in the synthetic ntdll export table but has no dispatch or
+allocation semantics yet, so the trap stops before executing it.
