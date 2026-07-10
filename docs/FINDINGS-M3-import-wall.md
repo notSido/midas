@@ -2217,3 +2217,54 @@ not modeled. The child supplies observation-driven evidence for a future
 bounded `timeGetTime` policy and for context/stack/TEB isolation, while its zero
 edge requires diagnosis before a scheduler can claim faithful thread lifecycle.
 No result in this section identifies an OEP.
+
+## Owner-checked CPU contexts provide the restore primitive
+
+The next bounded groundwork slice began from exact merged Sleep commit
+`707936e6bd797aca1a17ce469b04fe8e1a93f869`. It changes only the emulator
+layer. No sample replay is part of this slice because no production runner or
+Win64 dispatch path consumes the new primitive.
+
+`Emu::new` now selects Unicorn `ContextMode::CPU`. The public opaque
+`CpuContext` supports three operations: capture the current CPU state into a
+new native allocation, overwrite that allocation with a later state, and
+restore it repeatedly. Every `Emu` and its contexts share a private `Rc<()>`
+identity token. Save and restore compare those tokens before entering Unicorn,
+so a context from another emulator is rejected without touching either native
+engine. The wrapper is movable but deliberately does not implement `Clone`.
+
+The tested CPU-state contract covers the 15 non-stack-pointer x64 general
+registers, `RIP`, `RSP`, `EFLAGS`, `FS_BASE`, `GS_BASE`, and a complete 16-byte
+XMM register. The public contract intentionally says CPU execution state rather
+than promising version-specific Unicorn internals. Guest memory contents and
+mappings, hooks, the `EmuData` observation buffers and counters, `Win64Env`,
+scheduling state, and time state are outside the context. A restore therefore
+switches CPU state while retaining shared guest memory and global observation
+history.
+
+Three synthetic tests establish the boundary:
+
+- capture/restore and reusable overwrite recover distinct seeded register sets;
+- memory changed after capture, executed-address history, recent RIPs,
+  instruction count, and an installed trace hook remain live after restore; and
+- foreign save and restore return `ForeignCpuContext` without changing the
+  destination CPU state or corrupting the context still owned by its source.
+
+The verification matrix is:
+
+```text
+cargo fmt --check
+cargo build --all-targets
+cargo test --all-targets              # 118 passed
+cargo clippy --all-targets -- -D warnings
+git diff --check
+```
+
+This is a scheduler prerequisite, not a scheduler. In particular, restoring a
+CPU context does not select `Win64Env.current_thread_id`, create stacks or TEBs,
+initialize TLS, model a clock, or classify thread termination. Because
+`Emu::resume` takes an explicit start address, a future context switch also has
+to read the restored `RIP` and pass it to resume. Context switches are intended
+at stopped or trapped boundaries, not from inside a running Unicorn hook. The
+child's unresolved zero-target edge still cannot be labeled a normal thread
+exit, and no result in this slice identifies an OEP.
