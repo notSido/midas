@@ -28,6 +28,7 @@ here. If a capability is not listed, it is not implemented.
 | Observed ntdll bootstrap export + `RtlAllocateHeap`: calls using the modeled process-heap handle allocate distinct page-backed blocks from a bounded 256 MiB bump arena. Blocks are at least 16-byte aligned, readable/writable, non-executable, and tracked by requested/mapped size. Fresh pages are explicitly zeroed, satisfying the observed `HEAP_ZERO_MEMORY` calls; absence of that flag is not behaviorally distinguished. Invalid handles, unsupported flags, overflow, and arena exhaustion return `NULL` without advancing allocator state. A zero-byte request receiving a fresh minimum block is an explicit environment policy. `RtlFreeHeap` and `RtlReAllocateHeap` are not implied. | `cargo test --all-targets` green: the RW/NX mapper test asserts zeroing, cross-page writes, and `FetchProt`; direct allocator tests cover the observed `(handle, 0x8, 0x1000)` call, alignment, writable/non-overlapping blocks, metadata, low-32-bit flags, failure atomicity, exhaustion, and zero-size uniqueness; an end-to-end test calls the name-resolved ntdll export stub. Current release `run_loader`/`trap_postmortem`: formal sample 1 and corroborating sample 2 each handle six allocations (`0x1000`, `0x10`, then after `OpenThread`, `0x410`, `0x10`, `0x410`, `0x10`; all flag `0x8`). Sample 3 follows its separate path to the same six request sizes, subject to its provenance limitation. | M3 |
 | Observed kernel32 export + `GetCurrentThreadId`: the synthetic kernel32 seed exposes the observed name; the no-argument stub returns deterministic nonzero `DWORD` 1 as the sole-thread `Win64Env` policy, zero-extends it into `RAX`, and performs the normal x64 return. Scheduling, thread lifecycle, system-wide uniqueness across environments, and TEB `ClientId` coherence are not modeled. | `cargo test --all-targets` green: a direct two-call test dirties the argument/result registers and asserts a stable 32-bit return plus exact `RAX`/`RIP`/`RSP` effects; an end-to-end test calls the name-resolved kernel32 export stub without a fixed RVA. Current release `run_loader`/`trap_postmortem`: formal sample 1 and corroborating sample 2 handle `GetCurrentThreadId` as call 21, then proceed to `OpenThread` and four further heap allocations. Sample 3 follows its separate six-allocation path and does not exercise this API in the captured run. | M3 |
 | Observed kernel32 export + `OpenThread`: Win64 dispatch consumes the low 32 bits of desired access, inheritability, and thread ID. For the sole modeled thread ID `1`, supported access masks are subsets of the observed legacy all-access mask `0x001f03ff` (including its unnamed `0x4` bit); each success creates a fresh bounded, opaque, unmapped handle record containing the target thread, requested access, and inheritability. Unknown IDs, unsupported access bits, handle collisions, overflow, and exhaustion return `NULL` without changing handle state. ACL/token checks, last-error values, actual child-process inheritance, closure, thread lifecycle, and other thread APIs are not modeled. | `cargo test --all-targets` green: direct dirty-upper-half coverage returns the first policy handle `0x0000000f30001000` and asserts exact metadata and `RAX`/`RIP`/`RSP` effects; repeated-open, inheritance, legacy-bit, boundary, collision, overflow/exhaustion, failure-atomicity, `GetCurrentThreadId` coherence, and name-resolved export-trap tests pass. Captured release replay on formal sample 1 calls `OpenThread(0x001f03ff, FALSE, 1)` as API 22 and advances through APIs 23–30 before a later ret-to-zero; sample 2 corroborates the sequence, while sample 3 does not exercise this API. | M3 |
+| Observed kernel32 export + `GetCurrentDirectoryW`: each `Win64Env` exposes a fixed host-independent process directory `C:\` as UTF-16. Dispatch consumes the low 32 bits of the `DWORD` capacity and the full 64-bit output pointer. A capacity of at least four `WCHAR`s receives `C:\` plus a UTF-16 NUL and returns `3`; a smaller capacity returns required size `4` without touching the buffer, an explicit deterministic Midas policy because Windows leaves undersized-buffer contents unspecified. `(0, NULL)` is therefore a valid size query. The `DWORD` result is deterministically zero-extended into `RAX`. Directory mutation, host-filesystem state, path normalization/namespaces, ANSI conversion, last-error modeling, and invalid-pointer-to-Windows-error translation are not implied. | `cargo test --all-targets` green with 79 tests: six focused cases cover `(0, NULL)`, exact output through a genuine pointer above `u32::MAX`, dirty upper `RCX` bits, oversized-buffer suffix preservation, undersized no-write behavior, repeat stability, exact `RAX`/`RIP`/`RSP`, and a call through the name-resolved export stub without a fixed RVA. Current release replay handles `GetCurrentDirectoryW(520, 0x0000000f40004000)` as formal sample-1 API 31, after the prior 30-call prefix, then reaches a later ret-to-zero; sample 2 corroborates the same call 31 and sample 3 its separate call 29, subject to their provenance limitation. | M3 |
 
 ## Not yet implemented
 
@@ -36,18 +37,16 @@ its VM-slot diagnosis, and the bounded in-image-stub experiment remain historica
 evidence in `docs/FINDINGS-M3-import-wall.md`; that experiment did not advance the
 observable frontier and did not prove candidate 1 causally false.
 
-The `OpenThread` slice advances formal sample 1 and corroborating sample 2 from
-`GetCurrentThreadId` at call 21 through `OpenThread` at call 22, then through four
-more allocations before a later null VM handler after call 30. Sample 3 retains
-its payload-dependent 28-call path with six allocations and does not call either
-thread API in the captured production run. Its separately observed
-`GetCurrentDirectoryW` selection is not implemented or bundled into the
-formal-sample slice. Samples 2 and 3 are engineering corroboration, not formal
-milestone evidence until their provenance is completed. The cause of the new
-later null handler has not yet been identified. TEB `ClientId`, scheduling,
-thread lifecycle, handle closure and last-error state, `RtlFreeHeap`, and
-`RtlReAllocateHeap` remain unmodeled; no handle-lifecycle, reuse, or reallocation
-semantics are claimed.
+The `GetCurrentDirectoryW` slice advances formal sample 1 and corroborating
+sample 2 through call 31 after the prior thread/heap sequence; sample 3 reaches
+the same API as call 29 on its separate payload-dependent path. All three then
+reach a later null VM handler. Samples 2 and 3 are engineering corroboration,
+not formal milestone evidence until their provenance is completed. The cause of
+this later null handler has not yet been identified, and no next API name is
+claimed. Current-directory mutation and fuller filesystem semantics, TEB
+`ClientId`, scheduling, thread lifecycle, handle closure and last-error state,
+`RtlFreeHeap`, and `RtlReAllocateHeap` remain unmodeled; no handle-lifecycle,
+reuse, or reallocation semantics are claimed.
 `examples/run_loader.rs` reproduces the current wall, and
 `docs/FINDINGS-M3-import-wall.md` records the full finding chain.
 
