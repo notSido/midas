@@ -8,6 +8,7 @@ use crate::{
 };
 
 const IMPORT_NAME_CAP: usize = 256;
+const SET_CURRENT_DIRECTORY_W_UNIT_CAP: usize = 260;
 const FAKE_MODULE_BASE_START: u64 = 0x0000_7fff_0000_0000;
 const FAKE_MODULE_BASE_STEP: u64 = 0x0010_0000;
 const PROC_STUB_BASE: u64 = 0x0000_7ffe_0000_0000;
@@ -69,6 +70,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "GetUserDefaultUILanguage",
     "GetCurrentThreadId",
     "GetCurrentDirectoryW",
+    "SetCurrentDirectoryW",
     "GetModuleFileNameW",
     "OpenThread",
 ];
@@ -619,6 +621,12 @@ pub enum ApiOutcome {
     Unhandled { name: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RawUtf16Read {
+    Terminated(Vec<u16>),
+    CapExhausted,
+}
+
 pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutcome, EmuError> {
     match name {
         "GetModuleHandleA" => {
@@ -714,6 +722,33 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             };
 
             let ret = u64::from(result);
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "SetCurrentDirectoryW" => {
+            let path = emu.read_reg(RegisterX86::RCX)?;
+            // Bounded policy scans at most the first 260 UTF-16 units,
+            // including any terminator. Read raw units so the selector can be
+            // matched without decoding or consulting host filesystem state.
+            let input = read_raw_utf16_z(emu, path, SET_CURRENT_DIRECTORY_W_UNIT_CAP)?;
+            let accepted = match input {
+                RawUtf16Read::Terminated(units) => {
+                    matches!(units.as_slice(), [0x43, 0x3a] | [0x63, 0x3a])
+                }
+                RawUtf16Read::CapExhausted => false,
+            };
+            if accepted {
+                // C: is drive-relative on Windows. The only modeled C-drive
+                // directory is C:\, so canonicalize the observed selector to it.
+                env.current_directory = EMULATED_CURRENT_DIRECTORY;
+            }
+
+            // BOOL is a 32-bit ABI value; explicitly zero-extend it into RAX.
+            let ret = u64::from(accepted);
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
             Ok(ApiOutcome::Handled {
@@ -818,6 +853,44 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
 fn read_arg_ascii_z(emu: &Emu, reg: RegisterX86) -> Result<String, EmuError> {
     let address = emu.read_reg(reg)?;
     read_ascii_z_at(emu, address)
+}
+
+fn read_raw_utf16_z(emu: &Emu, address: u64, unit_cap: usize) -> Result<RawUtf16Read, EmuError> {
+    let mut units = Vec::with_capacity(unit_cap);
+    for index in 0..unit_cap {
+        let index = u64::try_from(index).map_err(|_| EmuError::CodeTooLarge)?;
+        let unit_offset = index.checked_mul(2).ok_or(EmuError::AddressRangeOverflow {
+            base: address,
+            size: u64::MAX,
+        })?;
+        let read_size = unit_offset
+            .checked_add(2)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: address,
+                size: u64::MAX,
+            })?;
+        let unit_address =
+            address
+                .checked_add(unit_offset)
+                .ok_or(EmuError::AddressRangeOverflow {
+                    base: address,
+                    size: read_size,
+                })?;
+        unit_address
+            .checked_add(1)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: address,
+                size: read_size,
+            })?;
+
+        let bytes = emu.read_mem(unit_address, 2)?;
+        let unit = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if unit == 0 {
+            return Ok(RawUtf16Read::Terminated(units));
+        }
+        units.push(unit);
+    }
+    Ok(RawUtf16Read::CapExhausted)
 }
 
 fn normalize_module_name(name: &str) -> String {
@@ -1014,6 +1087,7 @@ mod tests {
     const IMPORT_RVA: u32 = 0x2000;
     const DATA_RVA: u32 = 0x3000;
     const IMAGE_SIZE: u32 = 0x4000;
+    const CURRENT_DIRECTORY_STATE_SENTINEL: [u16; 3] = [0x44, 0x3a, 0x5c];
     const CURRENT_DIRECTORY_W_BYTES: [u8; 8] = [0x43, 0, 0x3a, 0, 0x5c, 0, 0, 0];
     const MODULE_FILE_NAME_W_BYTES: [u8; 26] = [
         0x43, 0, 0x3a, 0, 0x5c, 0, 0x67, 0, 0x75, 0, 0x65, 0, 0x73, 0, 0x74, 0, 0x2e, 0, 0x65, 0,
@@ -1170,6 +1244,31 @@ mod tests {
             panic!("expected GetCurrentDirectoryW to be handled");
         };
         assert_eq!(name, "GetCurrentDirectoryW");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn call_set_current_directory_w(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        path: u64,
+        rsp: u64,
+        return_address: u64,
+    ) -> u64 {
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RCX, path).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "SetCurrentDirectoryW").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected SetCurrentDirectoryW to be handled");
+        };
+        assert_eq!(name, "SetCurrentDirectoryW");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
@@ -1828,6 +1927,281 @@ mod tests {
                 .unwrap(),
             CURRENT_DIRECTORY_W_BYTES
         );
+    }
+
+    #[test]
+    fn set_current_directory_w_handles_exact_observed_heap_derived_state() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let allocations = [0x1000, 0x10, 0x410].map(|requested_size| {
+            call_rtl_allocate_heap(
+                &mut env,
+                &mut emu,
+                process_heap,
+                u64::from(HEAP_ZERO_MEMORY),
+                requested_size,
+            )
+        });
+        let path = allocations[2];
+        assert_eq!(path, 0x0000_000f_4000_2000);
+        assert!(u32::try_from(path).is_err());
+
+        let module_ret = call_get_module_file_name_w(
+            &mut env,
+            &mut emu,
+            0,
+            path,
+            0x208,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        assert_eq!(module_ret, 12);
+        emu.write_mem(path + 4, &[0, 0]).unwrap();
+        let input_before = emu.read_mem(path, 0x410).unwrap();
+        assert_eq!(
+            &input_before[..10],
+            &[0x43, 0, 0x3a, 0, 0, 0, 0x67, 0, 0x75, 0]
+        );
+
+        let rsp = crate::emu::STACK_BASE + 0x500;
+        let return_address = 0x0fed_cba9_8765_4321;
+        let ret = call_set_current_directory_w(&mut env, &mut emu, path, rsp, return_address);
+
+        assert_eq!(ret, 1);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        assert_eq!(env.current_directory, EMULATED_CURRENT_DIRECTORY);
+        assert_eq!(emu.read_mem(path, 0x410).unwrap(), input_before);
+
+        let current_directory_buffer = allocations[0];
+        let current_ret = call_get_current_directory_w(
+            &mut env,
+            &mut emu,
+            4,
+            current_directory_buffer,
+            crate::emu::STACK_BASE + 0x600,
+            0x1020_3040_5060_7080,
+        );
+        assert_eq!(current_ret, 3);
+        assert_eq!(
+            emu.read_mem(current_directory_buffer, CURRENT_DIRECTORY_W_BYTES.len())
+                .unwrap(),
+            CURRENT_DIRECTORY_W_BYTES
+        );
+        assert_eq!(emu.read_mem(path, 0x410).unwrap(), input_before);
+    }
+
+    #[test]
+    fn set_current_directory_w_accepts_lowercase_selector_and_canonicalizes() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let page = wide_buffer_address();
+        emu.map_zeroed_rw(page, u64::from(PAGE_SIZE)).unwrap();
+        let path = page + 0x100;
+        assert!(u32::try_from(path).is_err());
+        let input = utf16le_with_nul(&[0x63, 0x3a]).unwrap();
+        emu.write_mem(path, &input).unwrap();
+        env.current_directory = [0x63, 0x3a, 0x5c];
+
+        let ret = call_set_current_directory_w(
+            &mut env,
+            &mut emu,
+            path,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+
+        assert_eq!(ret, 1);
+        assert_eq!(env.current_directory, EMULATED_CURRENT_DIRECTORY);
+        assert_eq!(emu.read_mem(path, input.len()).unwrap(), input);
+
+        let current_directory_buffer = page + 0x200;
+        let current_ret = call_get_current_directory_w(
+            &mut env,
+            &mut emu,
+            4,
+            current_directory_buffer,
+            crate::emu::STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+        assert_eq!(current_ret, 3);
+        assert_eq!(
+            emu.read_mem(current_directory_buffer, CURRENT_DIRECTORY_W_BYTES.len())
+                .unwrap(),
+            CURRENT_DIRECTORY_W_BYTES
+        );
+    }
+
+    #[test]
+    fn set_current_directory_w_rejects_paths_outside_bounded_policy() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let page = wide_buffer_address();
+        emu.map_zeroed_rw(page, u64::from(PAGE_SIZE)).unwrap();
+        // A test-only noncanonical sentinel makes unintended normalization on
+        // rejected inputs observable.
+        env.current_directory = CURRENT_DIRECTORY_STATE_SENTINEL;
+        let state_before = env.current_directory;
+        let cases: [(&str, &[u16]); 5] = [
+            ("empty", &[]),
+            ("other drive", &[0x44, 0x3a]),
+            (
+                "drive-relative subdirectory",
+                &[0x43, 0x3a, 0x73, 0x75, 0x62, 0x64, 0x69, 0x72],
+            ),
+            ("relative path", &[0x73, 0x75, 0x62, 0x64, 0x69, 0x72]),
+            (
+                "UNC path",
+                &[
+                    0x5c, 0x5c, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x5c, 0x73, 0x68, 0x61, 0x72,
+                    0x65,
+                ],
+            ),
+        ];
+
+        for (index, (label, units)) in cases.into_iter().enumerate() {
+            let path = page + index as u64 * 0x100;
+            let sentinel = [0xa5; 0x80];
+            emu.write_mem(path, &sentinel).unwrap();
+            let bytes = utf16le_with_nul(units).unwrap();
+            emu.write_mem(path, &bytes).unwrap();
+            let input_before = emu.read_mem(path, sentinel.len()).unwrap();
+            let rsp = crate::emu::STACK_BASE + 0x400 + index as u64 * 0x20;
+            let return_address = 0x1234_5678_9abc_def0 + index as u64;
+
+            let ret = call_set_current_directory_w(&mut env, &mut emu, path, rsp, return_address);
+
+            assert_eq!(ret, 0, "{label}");
+            assert_eq!(env.current_directory, state_before, "{label}");
+            assert_eq!(
+                emu.read_mem(path, sentinel.len()).unwrap(),
+                input_before,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_current_directory_w_cap_exhaustion_stops_at_mapped_page_boundary() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let page = wide_buffer_address();
+        let next_page = page + u64::from(PAGE_SIZE);
+        emu.map_zeroed_rw(page, u64::from(PAGE_SIZE)).unwrap();
+        assert!(emu.read_mem(next_page, 1).is_err());
+
+        const POLICY_UNIT_CAP: usize = 260;
+        assert_eq!(SET_CURRENT_DIRECTORY_W_UNIT_CAP, POLICY_UNIT_CAP);
+        let mut input = Vec::with_capacity(POLICY_UNIT_CAP * 2);
+        for _ in 0..POLICY_UNIT_CAP {
+            input.extend_from_slice(&0x41_u16.to_le_bytes());
+        }
+        let path = next_page - u64::try_from(input.len()).unwrap();
+        assert_eq!(path + u64::try_from(input.len()).unwrap(), next_page);
+        emu.write_mem(path, &input).unwrap();
+        env.current_directory = CURRENT_DIRECTORY_STATE_SENTINEL;
+        let state_before = env.current_directory;
+
+        let ret = call_set_current_directory_w(
+            &mut env,
+            &mut emu,
+            path,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+
+        assert_eq!(ret, 0);
+        assert_eq!(env.current_directory, state_before);
+        assert_eq!(emu.read_mem(path, input.len()).unwrap(), input);
+        assert!(emu.read_mem(next_page, 1).is_err());
+    }
+
+    #[test]
+    fn set_current_directory_w_invalid_base_pointers_are_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.current_directory = CURRENT_DIRECTORY_STATE_SENTINEL;
+        let state_before = env.current_directory;
+        let unmapped = 0x0000_0000_dead_0000;
+        assert!(emu.read_mem(unmapped, 1).is_err());
+
+        for (index, path) in [0, unmapped].into_iter().enumerate() {
+            let rsp = crate::emu::STACK_BASE + 0x400 + index as u64 * 0x20;
+            let return_address = 0x1234_5678_9abc_def0 + index as u64;
+            let rax_before = 0xa5a5_5a5a_1122_3344 + index as u64;
+            let rip_before = 0x0fed_cba9_8765_4321 + index as u64;
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            emu.write_reg(RegisterX86::RAX, rax_before).unwrap();
+            emu.write_reg(RegisterX86::RCX, path).unwrap();
+            emu.write_reg(RegisterX86::RIP, rip_before).unwrap();
+            emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+            assert!(matches!(
+                dispatch(&mut env, &mut emu, "SetCurrentDirectoryW"),
+                Err(EmuError::ReadMem { addr, size: 2, .. }) if addr == path
+            ));
+            assert_eq!(env.current_directory, state_before);
+            assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), rax_before);
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), rip_before);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
+        }
+
+        let path = u64::MAX;
+        let rsp = crate::emu::STACK_BASE + 0x500;
+        let return_address = 0x1020_3040_5060_7080_u64;
+        let rax_before = 0xa5a5_5a5a_5566_7788;
+        let rip_before = 0x8877_6655_4433_2211;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RAX, rax_before).unwrap();
+        emu.write_reg(RegisterX86::RCX, path).unwrap();
+        emu.write_reg(RegisterX86::RIP, rip_before).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "SetCurrentDirectoryW"),
+            Err(EmuError::AddressRangeOverflow { base, size: 2 }) if base == path
+        ));
+        assert_eq!(env.current_directory, state_before);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), rax_before);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), rip_before);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
+    }
+
+    #[test]
+    fn set_current_directory_w_unmapped_terminator_is_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let page = wide_buffer_address();
+        let next_page = page + u64::from(PAGE_SIZE);
+        emu.map_zeroed_rw(page, u64::from(PAGE_SIZE)).unwrap();
+        let path = next_page - 4;
+        let prefix = [0x43, 0, 0x3a, 0];
+        emu.write_mem(path, &prefix).unwrap();
+        assert!(emu.read_mem(next_page, 1).is_err());
+
+        env.current_directory = CURRENT_DIRECTORY_STATE_SENTINEL;
+        let state_before = env.current_directory;
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        let rax_before = 0xa5a5_5a5a_1122_3344;
+        let rip_before = 0x0fed_cba9_8765_4321;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RAX, rax_before).unwrap();
+        emu.write_reg(RegisterX86::RCX, path).unwrap();
+        emu.write_reg(RegisterX86::RIP, rip_before).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "SetCurrentDirectoryW"),
+            Err(EmuError::ReadMem { addr, size: 2, .. }) if addr == next_page
+        ));
+        assert_eq!(env.current_directory, state_before);
+        assert_eq!(emu.read_mem(path, prefix.len()).unwrap(), prefix);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), rax_before);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), rip_before);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
     }
 
     #[test]
@@ -2540,6 +2914,69 @@ mod tests {
                 .unwrap(),
             CURRENT_DIRECTORY_W_BYTES
         );
+    }
+
+    #[test]
+    fn trap_dispatches_set_current_directory_w_via_name_resolved_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("SetCurrentDirectoryW")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, kernel32_base, "SetCurrentDirectoryW")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+
+        let buffer = wide_buffer_address();
+        assert!(u32::try_from(buffer).is_err());
+        emu.map_zeroed_rw(buffer, u64::from(PAGE_SIZE)).unwrap();
+        let path = utf16le_with_nul(&[0x43, 0x3a]).unwrap();
+        emu.write_mem(buffer, &path).unwrap();
+        let input_before = emu.read_mem(buffer, path.len()).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&buffer.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["SetCurrentDirectoryW".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(emu.read_mem(buffer, path.len()).unwrap(), input_before);
+
+        let current_directory_buffer = buffer + 0x100;
+        let current_ret = call_get_current_directory_w(
+            &mut env,
+            &mut emu,
+            4,
+            current_directory_buffer,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        assert_eq!(current_ret, 3);
+        assert_eq!(
+            emu.read_mem(current_directory_buffer, CURRENT_DIRECTORY_W_BYTES.len())
+                .unwrap(),
+            CURRENT_DIRECTORY_W_BYTES
+        );
+        assert_eq!(emu.read_mem(buffer, path.len()).unwrap(), input_before);
     }
 
     #[test]
