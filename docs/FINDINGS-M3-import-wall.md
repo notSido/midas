@@ -1086,3 +1086,151 @@ The null VM-handler value after formal sample-1 call 30 has not yet been
 diagnosed. No next API name is claimed. Sample 3's separately observed
 `GetCurrentDirectoryW` selection remains unimplemented and is not evidence for
 the formal sample-1 mechanism.
+
+## GetCurrentDirectoryW is the causal post-allocation gap
+
+Historical baseline note: the diagnosis in this section started from exact
+merged `OpenThread` commit `f654d7a81afe887fed44c84337545cd88a2299d4`.
+That baseline is the 30-call formal sample-1 path recorded in the preceding
+section.
+
+A temporary broad-name diagnostic first added the 1,664 export names parsed
+from the authorized `samples/kernel32.dll`. The larger export walk required a
+`600000000` per-leg instruction cap, but retained formal sample 1's exact first
+30 production calls and changed the later null handler into an unhandled
+`GetCurrentDirectoryW` call 31. Because the broad table changes both the
+synthetic export layout and export-walk cost, it was discovery evidence only.
+
+The decisive sample-1 A/B added only `GetCurrentDirectoryW` to the baseline
+kernel32 seed and completed under the normal `60000000` cap. In both legs, the
+post-call-30 path has 8,794 instructions and reaches the same final dispatcher
+at `0x14005caf5`. The dispatch chain uses `RBP = 0x14006f9e0`, context cell
+`0x14006fa68`, and handler slot `0x14005ea32`. The slot's last writer in both
+legs is `0x1400accf7` (`mov [r9],rbx`) during the leg after call 6. Its bytecode
+cursor is `0x140249ac2`, with words `[0x88, 0, 0x13c]`; destination selector
+`0x88` and source selector `0` are unchanged. At baseline the writer's source
+and stored value are zero. With only the new name present, both become the
+name-resolved stub `0x00007fff00001010`, and the same final dispatcher reads
+that address before the export trap reports `GetCurrentDirectoryW` as call 31.
+The addresses are sample-1 and synthetic-layout evidence, not production
+constants.
+
+The broad-name table, single-name patch, memory-watch extension, trace driver,
+and raw logs were temporary and uncommitted. The production code resolves and
+dispatches the export by name. The committed tests and production replays below
+are the independently reproducible artifacts.
+
+Stopping before formal sample-1 call 31 with `max_calls = 30` preserves these
+Win64 arguments:
+
+```text
+RCX = 0x0000000000000208
+RDX = 0x0000000f40004000
+RIP = 0x00007fff00001010
+[RSP-8] = 0x00007fff00001010
+```
+
+Thus the observed call is
+`GetCurrentDirectoryW(0x208, 0x0000000f40004000)`. The capacity is 520
+`WCHAR`s, matching the `0x410`-byte fifth heap allocation in the captured
+sequence. Sample 2 has the same call 31 as engineering corroboration. Sample 3
+selects the same API as call 29 after its separate six-allocation path; its
+incomplete provenance prevents that path from serving as formal milestone
+evidence.
+
+The documented Windows signature is
+`DWORD GetCurrentDirectoryW(DWORD nBufferLength, LPWSTR lpBuffer)`. On Win64,
+dispatch consumes only the low 32 bits of `RCX` for the capacity and the full
+64-bit `RDX` pointer. Capacity counts UTF-16 code units, not bytes. For a path
+containing `L` units, a sufficient buffer receives the path plus one UTF-16 NUL
+and the return is `L`, excluding the NUL. An insufficient buffer returns
+`L + 1`, including space for the NUL; Windows does not specify the resulting
+buffer contents. `(0, NULL)` is the documented size query. The Microsoft
+contract is recorded at
+<https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getcurrentdirectory>.
+
+The bounded environment policy gives every `Win64Env` the fixed,
+host-independent directory `C:\` (`[0x0043, 0x003a, 0x005c]`). Its path length
+is three UTF-16 units and its required capacity is four. Capacity at least four
+atomically writes `43 00 3a 00 5c 00 00 00`, leaves later bytes untouched, and
+returns `3`. Smaller capacities return `4` without reading or writing the
+buffer; the no-write choice is Midas policy for Windows' unspecified
+undersized-buffer contents. Dispatch writes a deterministic zero-extended
+`DWORD` result to `RAX` and performs the normal x64 return. Zero-extension is
+environment policy rather than a claim about undefined high return bits on
+Windows.
+
+This slice does not consult the host current directory or filesystem. It does
+not implement `SetCurrentDirectoryW`, per-drive state, UNC/device/extended
+namespaces, long-path policy, normalization, case resolution, symlinks,
+`GetCurrentDirectoryA`, concurrency, or last-error state. A sufficient request
+with an invalid guest pointer remains an emulator memory error rather than an
+invented Windows error mapping.
+
+The six focused test cases cover:
+
+- the documented `(0, NULL)` size query without a buffer access;
+- the exact observed `(0x208, 0x0000000f40004000)` call, obtaining the pointer
+  as the fifth modeled heap allocation after requests `0x1000`, `0x10`,
+  `0x410`, `0x10`, `0x410`, then checking the UTF-16 result and untouched
+  suffix;
+- dirty upper `RCX` bits with low capacity four and a genuine output pointer
+  above `u32::MAX`, proving DWORD-width capacity and full-width pointer use;
+- capacities one, two, and three returning four without changing a sentinel
+  buffer;
+- stable content and return values across repeated calls; and
+- a call through the name-resolved synthetic kernel32 export stub without a
+  fixed RVA.
+
+All direct calls assert deterministic full `RAX` plus exact `RIP` and `RSP`
+return effects. The existing atomic `Emu::write_mem` primitive validates the
+entire destination range before writing it.
+
+Reproduce the production path with:
+
+```text
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 30
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 30
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 28
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+The exact formal sample-1 production suffix is:
+
+```text
+  021: GetCurrentThreadId
+  022: OpenThread
+  023: GetProcessHeap
+  024: RtlAllocateHeap
+  025: GetProcessHeap
+  026: RtlAllocateHeap
+  027: GetProcessHeap
+  028: RtlAllocateHeap
+  029: GetProcessHeap
+  030: RtlAllocateHeap
+  031: GetCurrentDirectoryW
+stop: ReachedUntil
+```
+
+The full post-mortems show that the API returns `3` and all three paths later
+reach another trampoline return through zero:
+
+| Sample | Calls | API position | Stop | `RAX` | `RIP` | `[RSP-8]` |
+|---|---:|---:|---|---:|---:|---:|
+| 1 | 31 | 31 | `Other("ReachedUntil")` | `0x3` | `0x0` | `0x0` |
+| 2 | 31 | 31 | `Other("ReachedUntil")` | `0x3` | `0x0` | `0x0` |
+| 3 | 29 | 29 | `Other("ReachedUntil")` | `0x3` | `0x0` | `0x0` |
+
+### New frontier
+
+`GetCurrentDirectoryW` fixes the specific post-allocation null propagation and
+advances formal sample 1 through call 31. The cause of the later null handler
+has not yet been diagnosed, and no next API name is claimed. Sample 1 remains
+the formal artifact; samples 2 and 3 remain engineering corroboration until
+their provenance records are completed.

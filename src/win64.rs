@@ -26,6 +26,9 @@ const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 /// Deterministic ID for the current thread exposed by the emulated environment.
 const EMULATED_CURRENT_THREAD_ID: u32 = 1;
 
+/// Host-independent current directory exposed by each emulated environment.
+const EMULATED_CURRENT_DIRECTORY: [u16; 3] = [0x43, 0x3a, 0x5c];
+
 /// Opaque process-heap handle in the gap between the fixed PEB and heap arena.
 /// The handle remains unmapped and distinct from the allocator backing.
 const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
@@ -59,6 +62,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "ExitProcess",
     "GetUserDefaultUILanguage",
     "GetCurrentThreadId",
+    "GetCurrentDirectoryW",
     "OpenThread",
 ];
 
@@ -316,6 +320,7 @@ pub struct Win64Env {
     image_base: u64,
     process_heap: u64,
     current_thread_id: u32,
+    current_directory: [u16; 3],
     next_kernel_handle: u64,
     kernel_handles: BTreeMap<u64, KernelHandle>,
     heap_cursor: u64,
@@ -333,6 +338,7 @@ impl Win64Env {
             image_base,
             process_heap: EMULATED_PROCESS_HEAP_HANDLE,
             current_thread_id: EMULATED_CURRENT_THREAD_ID,
+            current_directory: EMULATED_CURRENT_DIRECTORY,
             next_kernel_handle: KERNEL_HANDLE_BASE,
             kernel_handles: BTreeMap::new(),
             heap_cursor: HEAP_ARENA_BASE,
@@ -667,6 +673,46 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "GetCurrentDirectoryW" => {
+            // DWORD capacity consumes only ECX; the LPWSTR uses the full RDX.
+            let capacity = emu.read_reg(RegisterX86::RCX)? as u32;
+            let buffer = emu.read_reg(RegisterX86::RDX)?;
+            let path_len =
+                u32::try_from(env.current_directory.len()).map_err(|_| EmuError::CodeTooLarge)?;
+            let required = path_len.checked_add(1).ok_or(EmuError::CodeTooLarge)?;
+
+            let result = if capacity < required {
+                // Midas policy: Windows does not document undersized buffer
+                // contents, so do not read or write the buffer in this case.
+                required
+            } else {
+                let byte_len = env
+                    .current_directory
+                    .len()
+                    .checked_add(1)
+                    .and_then(|units| units.checked_mul(std::mem::size_of::<u16>()))
+                    .ok_or(EmuError::CodeTooLarge)?;
+                let mut bytes = Vec::with_capacity(byte_len);
+                for unit in env
+                    .current_directory
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0))
+                {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                emu.write_mem(buffer, &bytes)?;
+                path_len
+            };
+
+            let ret = u64::from(result);
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
         "OpenThread" => {
             // DWORD/BOOL arguments consume only the low 32 bits on Win64.
             let desired_access = emu.read_reg(RegisterX86::RCX)? as u32;
@@ -921,6 +967,11 @@ mod tests {
     const IMPORT_RVA: u32 = 0x2000;
     const DATA_RVA: u32 = 0x3000;
     const IMAGE_SIZE: u32 = 0x4000;
+    const CURRENT_DIRECTORY_W_BYTES: [u8; 8] = [0x43, 0, 0x3a, 0, 0x5c, 0, 0, 0];
+
+    fn wide_buffer_address() -> u64 {
+        u64::from(u32::MAX) + 1 + u64::from(PAGE_SIZE)
+    }
 
     fn test_image() -> PeImage {
         PeImage {
@@ -1043,6 +1094,33 @@ mod tests {
         };
         assert_eq!(name, "OpenThread");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn call_get_current_directory_w(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        capacity: u64,
+        buffer: u64,
+        rsp: u64,
+        return_address: u64,
+    ) -> u64 {
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RCX, capacity).unwrap();
+        emu.write_reg(RegisterX86::RDX, buffer).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "GetCurrentDirectoryW").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected GetCurrentDirectoryW to be handled");
+        };
+        assert_eq!(name, "GetCurrentDirectoryW");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
         ret
@@ -1517,6 +1595,162 @@ mod tests {
     }
 
     #[test]
+    fn get_current_directory_w_zero_null_query_returns_required_size_without_buffer_access() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0;
+
+        let ret = call_get_current_directory_w(&mut env, &mut emu, 0, 0, rsp, return_address);
+
+        assert_eq!(ret, 4);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 4);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn get_current_directory_w_uses_low_capacity_bits_and_full_buffer_pointer() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let buffer = wide_buffer_address();
+        assert!(u32::try_from(buffer).is_err());
+        emu.map_zeroed_rw(buffer, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(buffer, &[0xa5; 16]).unwrap();
+
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0;
+        let ret = call_get_current_directory_w(
+            &mut env,
+            &mut emu,
+            0xa5a5_5a5a_0000_0004,
+            buffer,
+            rsp,
+            return_address,
+        );
+
+        assert_eq!(ret, 3);
+        assert_eq!(
+            emu.read_mem(buffer, CURRENT_DIRECTORY_W_BYTES.len())
+                .unwrap(),
+            CURRENT_DIRECTORY_W_BYTES
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 3);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn get_current_directory_w_handles_observed_heap_buffer_and_preserves_suffix() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let allocations = [0x1000, 0x10, 0x410, 0x10, 0x410].map(|requested_size| {
+            call_rtl_allocate_heap(
+                &mut env,
+                &mut emu,
+                process_heap,
+                u64::from(HEAP_ZERO_MEMORY),
+                requested_size,
+            )
+        });
+        let buffer = allocations[4];
+        assert_eq!(buffer, 0x0000_000f_4000_4000);
+
+        let sentinel = [0xa5; 0x410];
+        emu.write_mem(buffer, &sentinel).unwrap();
+
+        let ret = call_get_current_directory_w(
+            &mut env,
+            &mut emu,
+            0x208,
+            buffer,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+
+        assert_eq!(ret, 3);
+        let actual = emu.read_mem(buffer, sentinel.len()).unwrap();
+        assert_eq!(
+            &actual[..CURRENT_DIRECTORY_W_BYTES.len()],
+            &CURRENT_DIRECTORY_W_BYTES
+        );
+        assert_eq!(
+            &actual[CURRENT_DIRECTORY_W_BYTES.len()..],
+            &sentinel[CURRENT_DIRECTORY_W_BYTES.len()..]
+        );
+    }
+
+    #[test]
+    fn get_current_directory_w_undersized_capacities_preserve_entire_buffer() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let buffer = wide_buffer_address();
+        let sentinel = [0x5a; 32];
+        emu.map_zeroed_rw(buffer, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(buffer, &sentinel).unwrap();
+
+        for (index, capacity) in [1_u64, 2, 3].into_iter().enumerate() {
+            let rsp = crate::emu::STACK_BASE + 0x400 + index as u64 * 0x10;
+            let return_address = 0x1234_5678_9abc_def0 + index as u64;
+            let dirty_capacity = 0xffff_ffff_0000_0000 | capacity;
+            let ret = call_get_current_directory_w(
+                &mut env,
+                &mut emu,
+                dirty_capacity,
+                buffer,
+                rsp,
+                return_address,
+            );
+
+            assert_eq!(ret, 4);
+            assert_eq!(emu.read_mem(buffer, sentinel.len()).unwrap(), sentinel);
+        }
+    }
+
+    #[test]
+    fn get_current_directory_w_repeated_calls_are_stable() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first_buffer = wide_buffer_address();
+        let second_buffer = first_buffer + 0x100;
+        emu.map_zeroed_rw(first_buffer, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_mem(first_buffer, &[0xa5; 16]).unwrap();
+        emu.write_mem(second_buffer, &[0x5a; 16]).unwrap();
+
+        let first_ret = call_get_current_directory_w(
+            &mut env,
+            &mut emu,
+            4,
+            first_buffer,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        let second_ret = call_get_current_directory_w(
+            &mut env,
+            &mut emu,
+            4,
+            second_buffer,
+            crate::emu::STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+
+        assert_eq!(first_ret, 3);
+        assert_eq!(second_ret, first_ret);
+        assert_eq!(
+            emu.read_mem(first_buffer, CURRENT_DIRECTORY_W_BYTES.len())
+                .unwrap(),
+            CURRENT_DIRECTORY_W_BYTES
+        );
+        assert_eq!(
+            emu.read_mem(second_buffer, CURRENT_DIRECTORY_W_BYTES.len())
+                .unwrap(),
+            CURRENT_DIRECTORY_W_BYTES
+        );
+    }
+
+    #[test]
     fn open_thread_handles_observed_call_with_dirty_upper_halves() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -1922,6 +2156,56 @@ mod tests {
             image.entry_point_va() + 12
         );
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_get_current_directory_w_via_name_resolved_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("GetCurrentDirectoryW")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, kernel32_base, "GetCurrentDirectoryW")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+
+        let buffer = wide_buffer_address();
+        assert!(u32::try_from(buffer).is_err());
+        emu.map_zeroed_rw(buffer, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(buffer, &[0xa5; 16]).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&0xffff_ffff_0000_0004_u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xba]);
+        code.extend_from_slice(&buffer.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["GetCurrentDirectoryW".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 3);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(
+            emu.read_mem(buffer, CURRENT_DIRECTORY_W_BYTES.len())
+                .unwrap(),
+            CURRENT_DIRECTORY_W_BYTES
+        );
     }
 
     #[test]
