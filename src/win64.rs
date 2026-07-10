@@ -29,6 +29,12 @@ const EMULATED_CURRENT_THREAD_ID: u32 = 1;
 /// Host-independent current directory exposed by each emulated environment.
 const EMULATED_CURRENT_DIRECTORY: [u16; 3] = [0x43, 0x3a, 0x5c];
 
+/// Host-independent executable path exposed by each emulated environment:
+/// `C:\guest.exe`, stored without a trailing NUL.
+const EMULATED_EXECUTABLE_PATH: [u16; 12] = [
+    0x43, 0x3a, 0x5c, 0x67, 0x75, 0x65, 0x73, 0x74, 0x2e, 0x65, 0x78, 0x65,
+];
+
 /// Opaque process-heap handle in the gap between the fixed PEB and heap arena.
 /// The handle remains unmapped and distinct from the allocator backing.
 const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
@@ -63,6 +69,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "GetUserDefaultUILanguage",
     "GetCurrentThreadId",
     "GetCurrentDirectoryW",
+    "GetModuleFileNameW",
     "OpenThread",
 ];
 
@@ -297,6 +304,19 @@ fn write_ascii_z(image: &mut [u8], offset: usize, value: &str) {
     }
 }
 
+fn utf16le_with_nul(units: &[u16]) -> Result<Vec<u8>, EmuError> {
+    let byte_len = units
+        .len()
+        .checked_add(1)
+        .and_then(|units| units.checked_mul(std::mem::size_of::<u16>()))
+        .ok_or(EmuError::CodeTooLarge)?;
+    let mut bytes = Vec::with_capacity(byte_len);
+    for unit in units.iter().copied().chain(std::iter::once(0)) {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeapAllocation {
     requested_size: u64,
@@ -321,6 +341,7 @@ pub struct Win64Env {
     process_heap: u64,
     current_thread_id: u32,
     current_directory: [u16; 3],
+    executable_path: [u16; 12],
     next_kernel_handle: u64,
     kernel_handles: BTreeMap<u64, KernelHandle>,
     heap_cursor: u64,
@@ -339,6 +360,7 @@ impl Win64Env {
             process_heap: EMULATED_PROCESS_HEAP_HANDLE,
             current_thread_id: EMULATED_CURRENT_THREAD_ID,
             current_directory: EMULATED_CURRENT_DIRECTORY,
+            executable_path: EMULATED_EXECUTABLE_PATH,
             next_kernel_handle: KERNEL_HANDLE_BASE,
             kernel_handles: BTreeMap::new(),
             heap_cursor: HEAP_ARENA_BASE,
@@ -686,23 +708,48 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 // contents, so do not read or write the buffer in this case.
                 required
             } else {
-                let byte_len = env
-                    .current_directory
-                    .len()
-                    .checked_add(1)
-                    .and_then(|units| units.checked_mul(std::mem::size_of::<u16>()))
-                    .ok_or(EmuError::CodeTooLarge)?;
-                let mut bytes = Vec::with_capacity(byte_len);
-                for unit in env
-                    .current_directory
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(0))
-                {
-                    bytes.extend_from_slice(&unit.to_le_bytes());
-                }
+                let bytes = utf16le_with_nul(&env.current_directory)?;
                 emu.write_mem(buffer, &bytes)?;
                 path_len
+            };
+
+            let ret = u64::from(result);
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "GetModuleFileNameW" => {
+            // HMODULE and LPWSTR use their full register widths; nSize consumes
+            // only R8D and counts UTF-16 code units rather than bytes.
+            let module = emu.read_reg(RegisterX86::RCX)?;
+            let buffer = emu.read_reg(RegisterX86::RDX)?;
+            let capacity = emu.read_reg(RegisterX86::R8)? as u32;
+            let path_len =
+                u32::try_from(env.executable_path.len()).map_err(|_| EmuError::CodeTooLarge)?;
+
+            let result = if module != 0 || capacity == 0 {
+                // Bounded support policy: only the NULL module (the process
+                // executable) is modeled. A zero capacity is not a size query.
+                0
+            } else {
+                let copied_units = if capacity > path_len {
+                    path_len
+                } else {
+                    capacity - 1
+                };
+                let copied_units =
+                    usize::try_from(copied_units).map_err(|_| EmuError::CodeTooLarge)?;
+                let bytes = utf16le_with_nul(&env.executable_path[..copied_units])?;
+                emu.write_mem(buffer, &bytes)?;
+
+                if capacity > path_len {
+                    path_len
+                } else {
+                    capacity
+                }
             };
 
             let ret = u64::from(result);
@@ -968,6 +1015,10 @@ mod tests {
     const DATA_RVA: u32 = 0x3000;
     const IMAGE_SIZE: u32 = 0x4000;
     const CURRENT_DIRECTORY_W_BYTES: [u8; 8] = [0x43, 0, 0x3a, 0, 0x5c, 0, 0, 0];
+    const MODULE_FILE_NAME_W_BYTES: [u8; 26] = [
+        0x43, 0, 0x3a, 0, 0x5c, 0, 0x67, 0, 0x75, 0, 0x65, 0, 0x73, 0, 0x74, 0, 0x2e, 0, 0x65, 0,
+        0x78, 0, 0x65, 0, 0, 0,
+    ];
 
     fn wide_buffer_address() -> u64 {
         u64::from(u32::MAX) + 1 + u64::from(PAGE_SIZE)
@@ -1119,6 +1170,35 @@ mod tests {
             panic!("expected GetCurrentDirectoryW to be handled");
         };
         assert_eq!(name, "GetCurrentDirectoryW");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn call_get_module_file_name_w(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        module: u64,
+        buffer: u64,
+        capacity: u64,
+        rsp: u64,
+        return_address: u64,
+    ) -> u64 {
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RCX, module).unwrap();
+        emu.write_reg(RegisterX86::RDX, buffer).unwrap();
+        emu.write_reg(RegisterX86::R8, capacity).unwrap();
+        emu.write_reg(RegisterX86::RIP, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "GetModuleFileNameW").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected GetModuleFileNameW to be handled");
+        };
+        assert_eq!(name, "GetModuleFileNameW");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap() >> 32, 0);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
@@ -1747,6 +1827,260 @@ mod tests {
             emu.read_mem(second_buffer, CURRENT_DIRECTORY_W_BYTES.len())
                 .unwrap(),
             CURRENT_DIRECTORY_W_BYTES
+        );
+    }
+
+    #[test]
+    fn get_module_file_name_w_handles_exact_observed_heap_call() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let allocations = [0x1000, 0x10, 0x410].map(|requested_size| {
+            call_rtl_allocate_heap(
+                &mut env,
+                &mut emu,
+                process_heap,
+                u64::from(HEAP_ZERO_MEMORY),
+                requested_size,
+            )
+        });
+        let buffer = allocations[2];
+        assert_eq!(buffer, 0x0000_000f_4000_2000);
+        assert_eq!(
+            env.heap_allocations.get(&buffer),
+            Some(&HeapAllocation {
+                requested_size: 0x410,
+                mapped_size: u64::from(PAGE_SIZE),
+            })
+        );
+
+        let sentinel = [0xa5; 0x410];
+        emu.write_mem(buffer, &sentinel).unwrap();
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0;
+
+        let ret =
+            call_get_module_file_name_w(&mut env, &mut emu, 0, buffer, 0x208, rsp, return_address);
+
+        assert_eq!(ret, 12);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 12);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        let actual = emu.read_mem(buffer, sentinel.len()).unwrap();
+        assert_eq!(
+            &actual[..MODULE_FILE_NAME_W_BYTES.len()],
+            &MODULE_FILE_NAME_W_BYTES
+        );
+        assert_eq!(
+            &actual[MODULE_FILE_NAME_W_BYTES.len()..],
+            &sentinel[MODULE_FILE_NAME_W_BYTES.len()..]
+        );
+    }
+
+    #[test]
+    fn get_module_file_name_w_exact_fit_uses_abi_widths_and_is_stable() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let buffer = wide_buffer_address();
+        assert!(u32::try_from(buffer).is_err());
+        emu.map_zeroed_rw(buffer, u64::from(PAGE_SIZE)).unwrap();
+        let sentinel = [0x5a; 64];
+        emu.write_mem(buffer, &sentinel).unwrap();
+        let dirty_exact_fit = 0xa5a5_5a5a_0000_000d;
+
+        let first_ret = call_get_module_file_name_w(
+            &mut env,
+            &mut emu,
+            0,
+            buffer,
+            dirty_exact_fit,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        let first_actual = emu.read_mem(buffer, sentinel.len()).unwrap();
+
+        assert_eq!(first_ret, 12);
+        assert_eq!(
+            &first_actual[..MODULE_FILE_NAME_W_BYTES.len()],
+            &MODULE_FILE_NAME_W_BYTES
+        );
+        assert_eq!(
+            &first_actual[MODULE_FILE_NAME_W_BYTES.len()..],
+            &sentinel[MODULE_FILE_NAME_W_BYTES.len()..]
+        );
+
+        let second_ret = call_get_module_file_name_w(
+            &mut env,
+            &mut emu,
+            0,
+            buffer,
+            dirty_exact_fit,
+            crate::emu::STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+
+        assert_eq!(second_ret, first_ret);
+        assert_eq!(emu.read_mem(buffer, sentinel.len()).unwrap(), first_actual);
+    }
+
+    #[test]
+    fn get_module_file_name_w_modern_truncation_boundaries() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first_buffer = wide_buffer_address();
+        emu.map_zeroed_rw(first_buffer, u64::from(PAGE_SIZE))
+            .unwrap();
+        let sentinel = [0x5a; 32];
+
+        for (index, capacity) in [1_usize, 12].into_iter().enumerate() {
+            let buffer = first_buffer + index as u64 * 0x100;
+            emu.write_mem(buffer, &sentinel).unwrap();
+            let dirty_capacity = 0xffff_ffff_0000_0000 | capacity as u64;
+            let ret = call_get_module_file_name_w(
+                &mut env,
+                &mut emu,
+                0,
+                buffer,
+                dirty_capacity,
+                crate::emu::STACK_BASE + 0x400 + index as u64 * 0x100,
+                0x1234_5678_9abc_def0 + index as u64,
+            );
+
+            assert_eq!(ret, capacity as u64);
+            let written_len = capacity * std::mem::size_of::<u16>();
+            let copied_len = (capacity - 1) * std::mem::size_of::<u16>();
+            let mut expected = MODULE_FILE_NAME_W_BYTES[..copied_len].to_vec();
+            expected.extend_from_slice(&[0, 0]);
+            assert_eq!(expected.len(), written_len);
+
+            let actual = emu.read_mem(buffer, sentinel.len()).unwrap();
+            assert_eq!(&actual[..written_len], &expected);
+            assert_eq!(&actual[written_len..], &sentinel[written_len..]);
+        }
+    }
+
+    #[test]
+    fn get_module_file_name_w_zero_size_is_not_a_query_and_does_not_access_buffer() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let unmapped = 0x0000_0000_dead_0000;
+        assert!(emu.read_mem(unmapped, 1).is_err());
+
+        for (index, buffer) in [0, unmapped].into_iter().enumerate() {
+            let ret = call_get_module_file_name_w(
+                &mut env,
+                &mut emu,
+                0,
+                buffer,
+                0xffff_ffff_0000_0000,
+                crate::emu::STACK_BASE + 0x400 + index as u64 * 0x100,
+                0x1234_5678_9abc_def0 + index as u64,
+            );
+            assert_eq!(ret, 0);
+        }
+    }
+
+    #[test]
+    fn get_module_file_name_w_rejects_high_only_module_without_touching_buffer() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let buffer = wide_buffer_address();
+        emu.map_zeroed_rw(buffer, u64::from(PAGE_SIZE)).unwrap();
+        let sentinel = [0xa5; 64];
+        emu.write_mem(buffer, &sentinel).unwrap();
+
+        let ret = call_get_module_file_name_w(
+            &mut env,
+            &mut emu,
+            1_u64 << 32,
+            buffer,
+            13,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+
+        assert_eq!(ret, 0);
+        assert_eq!(emu.read_mem(buffer, sentinel.len()).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn get_module_file_name_w_invalid_sufficient_buffer_is_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let page = wide_buffer_address();
+        emu.map_zeroed_rw(page, u64::from(PAGE_SIZE)).unwrap();
+        let buffer = page + u64::from(PAGE_SIZE) - 24;
+        let sentinel = [0xa5; 24];
+        emu.write_mem(buffer, &sentinel).unwrap();
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        emu.write_mem(rsp, &0x1234_5678_9abc_def0_u64.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, 0).unwrap();
+        emu.write_reg(RegisterX86::RDX, buffer).unwrap();
+        emu.write_reg(RegisterX86::R8, 13).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "GetModuleFileNameW"),
+            Err(EmuError::WriteUnmapped { .. })
+        ));
+        assert_eq!(emu.read_mem(buffer, sentinel.len()).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn trap_dispatches_get_module_file_name_w_via_name_resolved_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let export_stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("GetModuleFileNameW")
+            .unwrap();
+        let stub = env
+            .resolve_proc(&mut emu, kernel32_base, "GetModuleFileNameW")
+            .unwrap();
+        assert_eq!(stub, export_stub);
+
+        let buffer = wide_buffer_address();
+        assert!(u32::try_from(buffer).is_err());
+        emu.map_zeroed_rw(buffer, u64::from(PAGE_SIZE)).unwrap();
+        let sentinel = [0xa5; 64];
+        emu.write_mem(buffer, &sentinel).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&0_u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xba]);
+        code.extend_from_slice(&buffer.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xb8]);
+        code.extend_from_slice(&0x208_u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["GetModuleFileNameW".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 12);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        let actual = emu.read_mem(buffer, sentinel.len()).unwrap();
+        assert_eq!(
+            &actual[..MODULE_FILE_NAME_W_BYTES.len()],
+            &MODULE_FILE_NAME_W_BYTES
+        );
+        assert_eq!(
+            &actual[MODULE_FILE_NAME_W_BYTES.len()..],
+            &sentinel[MODULE_FILE_NAME_W_BYTES.len()..]
         );
     }
 

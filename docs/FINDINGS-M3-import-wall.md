@@ -1234,3 +1234,147 @@ advances formal sample 1 through call 31. The cause of the later null handler
 has not yet been diagnosed, and no next API name is claimed. Sample 1 remains
 the formal artifact; samples 2 and 3 remain engineering corroboration until
 their provenance records are completed.
+
+## GetModuleFileNameW is the causal post-current-directory gap
+
+The diagnosis in this section started from exact merged `GetCurrentDirectoryW`
+commit `1a4f5ca81f16d029e342c882b1af116fe4303a28`.
+
+A temporary broad-name diagnostic added the 1,664 kernel32 export names parsed
+from the authorized `samples/kernel32.dll`. With a `600000000` per-leg
+instruction cap it retained formal sample 1's exact first 31 calls and changed
+the later null handler into an unhandled `GetModuleFileNameW` call 32. The
+broad-table stub RVA `0xf9b0` was a property of that temporary name-sorted
+synthetic layout, not a production constant.
+
+The decisive sample-1 A/B added only `GetModuleFileNameW` to the production
+kernel32 seed and completed under the normal `60000000` cap. After manually
+dispatching call 31, both legs execute 3,880 instructions and reach the same
+dispatcher at `0x14005caf5`, with `RBP = 0x14006f9e0`. Context cell
+`0x14006fa68` leads to the same handler slot `0x1400f8ee5`. Its last writer in
+both legs is `0x1400accf7` (`mov [r9],rbx`) during the leg after call 6, at
+bytecode cursor `0x140245e4f` with words `[0x88, 0, 0x13c]`. Destination
+selector `0x88`, source selector `0`, and the source address at `RBP` are
+unchanged. At baseline the source, `RBX`, and stored value are zero. With only
+the new export name present, all three become the name-resolved stub
+`0x00007fff00001030` (one-name RVA `0x1030`), and the same dispatcher reads
+that address before the trap reports `GetModuleFileNameW` as call 32.
+
+These addresses are sample-1 and synthetic-layout evidence, not production
+constants. The broad table, one-name patch, trace instrumentation, and raw logs
+were temporary and uncommitted, so the A/B is a captured investigation result
+rather than a repository-reproducible artifact. The committed tests and
+production replay below independently reproduce the resulting call.
+
+Stopping before formal sample-1 call 32 with `max_calls = 31` preserves:
+
+```text
+RCX = 0x0000000000000000
+RDX = 0x0000000f40002000
+R8  = 0x0000000000000208
+R9  = 0x0000000000000000
+RIP = 0x00007fff00001030
+[RSP-8] = 0x00007fff00001030
+```
+
+Thus the observed call is
+`GetModuleFileNameW(NULL, 0x0000000f40002000, 0x208)`. The output pointer is
+the third modeled heap allocation, requested as `0x410` bytes after earlier
+`0x1000`- and `0x10`-byte requests. Its capacity is 520 `WCHAR`s. Sample 2
+corroborates the same API as call 32. Sample 3 reaches it as call 30 after its
+separate path; neither sample is formal milestone evidence until its provenance
+record is completed.
+
+The documented signature is
+`DWORD GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename, DWORD nSize)`.
+On Win64, dispatch consumes the full widths of `RCX` and `RDX` and only the low
+32 bits of `R8` for `nSize`. For a filename containing `L` UTF-16 units, a
+capacity of at least `L + 1` receives the name plus a NUL and returns `L`.
+Current Windows truncates a smaller nonzero buffer to `nSize` total units,
+including a final NUL, returns `nSize`, and sets last error to
+`ERROR_INSUFFICIENT_BUFFER` (`122`). A zero capacity returns zero and is not a
+required-size query. Windows XP's different truncation behavior is not modeled.
+The Microsoft contract is recorded at
+<https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulefilenamew>;
+error code 122 is recorded at
+<https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499->.
+
+The bounded environment policy exposes `C:\guest.exe`, stored as 12 UTF-16
+units without a trailing NUL. The required capacity is therefore 13 units, or
+26 bytes including the terminator. `hModule == NULL` selects this path.
+Capacities at least 13 atomically write the full path and NUL and return `12`;
+capacities 1-12 write the first `capacity - 1` units plus a NUL and return the
+capacity. Capacity zero returns zero without reading or writing the output
+pointer. Nonzero module handles are outside this slice and return zero without
+accessing the buffer.
+
+The model does not consult the host executable path or filesystem. It does not
+track filenames for arbitrary loaded modules, expose `GetModuleFileNameA`,
+translate guest-memory failures into Windows errors, or maintain last-error
+state. Modern truncation therefore omits the documented last-error side effect.
+A sufficient request with an invalid guest range propagates the emulator memory
+error without a partial write. Full `RAX` zero-extension is deterministic Midas
+policy rather than a claim about undefined high return bits on Windows.
+
+The seven focused tests cover:
+
+- the exact observed call using the third genuine modeled heap allocation;
+- exact-fit capacity 13, full-width pointers, low-32-bit capacity, suffix
+  preservation, and repeat stability;
+- modern truncation boundaries at capacities 1 and 12, including final NULs;
+- capacity zero with both null and unmapped output pointers;
+- a high-only nonzero `HMODULE`, proving full-width handle interpretation and
+  no buffer write under the bounded unsupported-module policy;
+- an invalid sufficient output range, asserting an atomic `WriteUnmapped`
+  failure; and
+- a call through the name-resolved synthetic kernel32 export stub without a
+  fixed RVA.
+
+All successful direct calls assert deterministic full `RAX` plus exact `RIP`
+and `RSP` return effects. The shared UTF-16 encoder also replaces the equivalent
+`GetCurrentDirectoryW` encoding loop; the full test suite covers that existing
+behavior.
+
+Reproduce the production path with:
+
+```text
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 31
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 31
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 29
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+The exact formal sample-1 production suffix is:
+
+```text
+  031: GetCurrentDirectoryW
+  032: GetModuleFileNameW
+stop: ReachedUntil
+```
+
+All three paths later reach another trampoline return through zero:
+
+| Sample | Calls | API position | Stop | `RAX` | `RIP` | `[RSP-8]` |
+|---|---:|---:|---|---:|---:|---:|
+| 1 | 32 | 32 | `Other("ReachedUntil")` | `0x18` | `0x0` | `0x0` |
+| 2 | 32 | 32 | `Other("ReachedUntil")` | `0x18` | `0x0` | `0x0` |
+| 3 | 30 | 30 | `Other("ReachedUntil")` | `0x18` | `0x0` | `0x0` |
+
+The full post-mortem `RAX = 0x18` is later guest state after it consumes the
+filename, not the API return capture. The direct tests establish the modeled
+return `12` and exact return-register effects for the observed sufficient
+capacity.
+
+### New frontier
+
+`GetModuleFileNameW` fixes the specific post-`GetCurrentDirectoryW` null
+propagation and advances formal sample 1 through call 32. The cause of the later
+null handler has not yet been diagnosed, and no next API name is claimed.
+Sample 1 remains the formal artifact; samples 2 and 3 remain engineering
+corroboration until their provenance records are completed.
