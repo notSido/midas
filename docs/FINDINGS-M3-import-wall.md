@@ -1378,3 +1378,142 @@ propagation and advances formal sample 1 through call 32. The cause of the later
 null handler has not yet been diagnosed, and no next API name is claimed.
 Sample 1 remains the formal artifact; samples 2 and 3 remain engineering
 corroboration until their provenance records are completed.
+
+## SetCurrentDirectoryW is the causal post-module-filename gap
+
+The diagnosis in this section started from exact merged `GetModuleFileNameW`
+commit `b30bacbdda974e305be5fb6325df219e0bba6c9b`.
+
+A temporary broad-name diagnostic added the 1,664 kernel32 export names parsed
+from the authorized `samples/kernel32.dll`. With a `600000000` per-leg
+instruction cap it retained formal sample 1's exact first 32 production calls
+and changed the later null handler into an unhandled `SetCurrentDirectoryW`
+call 33. The broad-table stub RVA `0x123f0` was a property of that temporary
+name-sorted synthetic layout, not a production constant.
+
+The decisive sample-1 A/B added only `SetCurrentDirectoryW` to the production
+kernel32 seed and completed under the normal `60000000` cap. After manually
+dispatching call 32, both legs execute the same 19,616 instructions, with FNV-64
+trace digest `0xed9761b2cc4a09b8`, and reach the same final dispatcher at
+`0x14005caf5`. With `RBP = 0x14006f9e0`, context cell `0x14006fa68` leads to the
+same handler slot `0x14007c222`. Its last eight-byte writer in both legs is
+`0x1400accf7` (`mov [r9],rbx`) during the leg after call 6, at bytecode cursor
+`0x14024ba8b` with words `[0x88, 0, 0x13c]`. The destination and source
+selectors, destination, and source address remain unchanged. At baseline the
+source, `RBX`, and stored value are zero. With only the new name present, they
+become the name-resolved stub `0x00007fff000010c0`, which the unchanged final
+dispatcher reads before the trap reports `SetCurrentDirectoryW` as call 33.
+
+These addresses are sample-1 and synthetic-layout evidence, not production
+constants. The broad table, one-name patch, trace instrumentation, and raw logs
+were temporary and uncommitted. The committed tests and production replay below
+independently reproduce the resulting call.
+
+Stopping before formal sample-1 call 33 with `max_calls = 32` preserves:
+
+```text
+RCX = 0x0000000f40002000
+RIP = 0x00007fff000010c0
+[RSP-8] = 0x00007fff000010c0
+```
+
+The input is the third modeled heap allocation, originally requested as
+`0x410` bytes. Its leading UTF-16 units are
+`43 00 3a 00 00 00 67 00 75 00 ...`: `L"C:"` followed by the stale
+`guest.exe` suffix left by the preceding `GetModuleFileNameW` call. The first
+NUL terminates the input, so those later units are not part of the path. Sample
+2 corroborates the same API and pointer as call 33. Sample 3 reaches the same
+input as call 31 on its separate path; neither sample is formal milestone
+evidence until its provenance record is completed.
+
+The documented signature is
+`BOOL SetCurrentDirectoryW(LPCWSTR lpPathName)`. Windows accepts a relative or
+full path, calculates and stores the resulting full current directory, and
+ensures a trailing backslash. A drive designator without a following backslash
+is drive-relative: `C:` selects the current directory retained for drive C and
+does not intrinsically mean the root. Because the Midas environment has only
+one modeled C-drive directory, already `C:\`, the observed `C:` resolves
+idempotently to that canonical state. The Microsoft contracts are recorded at
+<https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setcurrentdirectory>
+and <https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>.
+
+The bounded environment policy reads raw little-endian UTF-16 units through the
+full 64-bit `RCX` pointer. It stops at the first NUL and scans at most 260 units,
+including any terminator, so stale suffix data is ignored and an unterminated
+guest range is bounded. Exact terminated selectors `C:` and `c:` set the
+process directory to `C:\`, return zero-extended `BOOL` 1 in `RAX`, and perform
+the normal x64 return. Other terminated paths and cap exhaustion return zero
+normally without changing directory state. NULL, unmapped, page-crossing, and
+overflowing pointers propagate their emulator memory/range errors before
+directory, result-register, or control-register mutation.
+
+This policy does not consult the host filesystem. It does not accept general
+`C:\` paths, arbitrary relative paths, other drives, per-drive directory
+history, UNC/device/extended namespaces, dot components, long-path opt-in, ANSI
+conversion, symlink or case resolution beyond the drive letter, concurrency,
+or last-error state. Invalid return-stack transactionality follows the existing
+dispatcher contract and is outside this slice.
+
+The seven focused tests cover:
+
+- the exact heap-derived `L"C:"` input with the post-NUL `guest.exe` suffix,
+  full-width pointer, stable input memory, success result, and coherent
+  `GetCurrentDirectoryW` output;
+- lowercase `c:` acceptance and canonical uppercase state;
+- terminated empty, other-drive, drive-relative-subdirectory, ordinary
+  relative, and UNC rejection with normal return and unchanged state/input;
+- exactly 260 nonzero units ending at a mapped page boundary, proving cap
+  exhaustion does not read the next page;
+- NULL, unmapped, and overflowing base-pointer errors before state/result/control
+  mutation;
+- a page-end `C:` whose required terminator is unmapped, with the same atomicity;
+  and
+- a call through the name-resolved synthetic kernel32 export stub without a
+  fixed RVA, followed by a coherent current-directory read.
+
+Reproduce the production path with:
+
+```text
+cargo build --locked --release --example run_loader --example trap_postmortem
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 32
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 32
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 30
+target/release/examples/run_loader samples/test_target_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target2_protected.exe 60000000 200
+target/release/examples/run_loader samples/test_target3_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target2_protected.exe 60000000 200
+target/release/examples/trap_postmortem samples/test_target3_protected.exe 60000000 200
+```
+
+The exact formal sample-1 production suffix is:
+
+```text
+  031: GetCurrentDirectoryW
+  032: GetModuleFileNameW
+  033: SetCurrentDirectoryW
+stop: unhandled API RtlAddVectoredExceptionHandler
+```
+
+The full replays distinguish the payload-dependent paths:
+
+| Sample | Calls | `SetCurrentDirectoryW` position | Stop | `RAX` | `RIP` |
+|---|---:|---:|---|---:|---:|
+| 1 | 33 | 33 | unhandled `RtlAddVectoredExceptionHandler` | `0x0` | `0x00007fff00301010` |
+| 2 | 33 | 33 | `Other("ReachedUntil")` | `0x0` | `0x0` |
+| 3 | 33 | 31 | unhandled `RtlAddVectoredExceptionHandler` after `GetCurrentThreadId`, `OpenThread` | `0x0` | `0x00007fff00301010` |
+
+The full-replay `RAX = 0` values are later guest state, not captures of the
+`SetCurrentDirectoryW` return. Direct and name-resolved-trap tests establish the
+modeled success return `1` and exact return-register/control effects.
+
+### New frontier
+
+`SetCurrentDirectoryW` fixes the specific post-`GetModuleFileNameW` null
+propagation and advances formal sample 1 through call 33. Formal sample 1 then
+directly calls the named, currently unhandled ntdll export
+`RtlAddVectoredExceptionHandler` with `RCX = 1` and
+`RDX = 0x000000014006aa83`; sample 3 corroborates that API with its own handler
+address after two additional calls. Sample 2 instead reaches a null return.
+`RtlAddVectoredExceptionHandler` is the formal next Win64 frontier and is not yet
+implemented.
