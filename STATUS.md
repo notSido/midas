@@ -23,6 +23,7 @@ here. If a capability is not listed, it is not implemented.
 | Parseable synthetic modules for every loaded DLL: a per-`Win64Env` registry of synthetic modules; `LoadLibraryA` now maps a parseable PE (DOS + NT headers + export directory) for any loaded DLL — kernel32 with its seeded exports, every other DLL with an **empty** export table for now — so the loader's `base+0x3c`/PE-header/export-directory parse succeeds; the export-call trap reverse-maps a faulting stub across all registered modules | `cargo test win64::` green: a synthetic module built with an empty export set is a parseable PE (MZ / `e_lfanew`=0x80 / `PE\0\0` / export dir with `NumberOfFunctions`=`NumberOfNames`=0); `LoadLibraryA` of a new DLL maps a module whose `base+0x3c` now reads back `0x80` (previously faulted). Captured CLI (`run_loader`, all three samples): after loading the five DLLs the loader parses them, then resolves and **calls** `GetProcAddress` from kernel32 (stub `rva=0x1030`), trapped by name — identical on all three. | M3 |
 | `GetProcAddress(hModule, lpProcName)`: resolves a named export to a **callable** stub — reusing the module's built-in synthetic export stub when present, otherwise synthesizing a read-only non-executable stub from a per-`Win64Env` dynamic arena, deduplicated by name; a later call to a resolved stub faults and dispatches by name via the trap. Ordinal requests (`lpProcName < 0x10000`) return `0` (not yet handled); the DLL/function names are read from guest memory (nothing hardcoded) | `cargo test win64::` green: resolving a name absent from the seeded exports returns a non-null readable arena stub (same address on repeat resolves); resolving a seeded name returns the module's built-in export stub; an ordinal request returns `0`; a call to a resolved arena stub is trapped and dispatched by name. Captured CLI (`run_loader`, all three samples): the loader resolves `GetProcAddress(kernel32, "SetLastError")` then `("GetLastError")` (arena stubs), then transfers control to address `0` — identical on all three. | M3 |
 | Module-specific ntdll bootstrap exports + `RtlInitializeCriticalSection`: loading `ntdll.dll` exposes exactly the eight initially observed ntdll names while other unseeded modules retain empty export tables; calling the resolved initialization stub zeroes the 40-byte x64 critical-section object, sets `LockCount = -1` at `+8`, returns `NTSTATUS 0`, and resumes the caller | `cargo test --all-targets` green: an explicit eight-name export-table oracle, a direct API effect test, and an end-to-end ntdll export-stub trap test assert the memory/register/return effects. Captured release `run_loader` CLI on sample 1 handles `RtlInitializeCriticalSection` as API 9 and advances to 15 handled calls; samples 2 and 3 show the same engineering result but are not formal milestone evidence until their provenance is completed. | M3 |
+| Observed kernel32 bootstrap export + `GetUserDefaultUILanguage`: the synthetic kernel32 seed exposes the observed name; the no-argument stub returns deterministic nonzero `LANGID 0x0409` (en-US) as the emulated environment's default UI-language policy and performs the normal x64 return | `cargo test --all-targets` green: a direct test asserts the `RAX`/`RIP`/`RSP` effects, and an end-to-end test calls the name-resolved synthetic export stub without relying on a fixed RVA. Captured release `run_loader` CLI on sample 1 handles `GetUserDefaultUILanguage` as API 16 and reaches the later `ReachedUntil`; samples 2 and 3 show the same engineering result but are not formal milestone evidence until their provenance is completed. | M3 |
 
 ## Not yet implemented
 
@@ -31,16 +32,15 @@ its VM-slot diagnosis, and the bounded in-image-stub experiment remain historica
 evidence in `docs/FINDINGS-M3-import-wall.md`; that experiment did not advance the
 observable frontier and did not prove candidate 1 causally false.
 
-The ntdll bootstrap result advances that earlier frontier: the module-specific
-ntdll export table exposes exactly the eight initially observed names, and
-`RtlInitializeCriticalSection` now has its verified initialization effect. All
-three on-disk samples handle the same 15-call prefix, including
-`RtlInitializeCriticalSection` as call 9, then stop at `ReachedUntil`. Samples 2
-and 3 show the same engineering result but are not formal milestone evidence
-until their provenance is completed. The next control-flow target has not yet
-been diagnosed by a committed production artifact. `examples/run_loader.rs`
-reproduces the current wall, and `docs/FINDINGS-M3-import-wall.md` records the
-full finding chain.
+The kernel32 UI-language result advances that earlier frontier. All three
+on-disk samples handle the same 16-call prefix, including
+`RtlInitializeCriticalSection` as call 9 and `GetUserDefaultUILanguage` as call
+16, then stop at a later `ReachedUntil`. Samples 2 and 3 show the same
+engineering result but are not formal milestone evidence until their provenance
+is completed. A separate broad-name diagnostic observed `GetProcessHeap` as the
+next selected and called kernel32 export; it is not seeded or dispatched, and no
+semantics are claimed for it. `examples/run_loader.rs` reproduces the current
+wall, and `docs/FINDINGS-M3-import-wall.md` records the full finding chain.
 
 Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
 detection, and the IR lifter. None has a passing acceptance artifact yet.

@@ -14,6 +14,9 @@ const PROC_STUB_BASE: u64 = 0x0000_7ffe_0000_0000;
 const PROC_STUB_STRIDE: u64 = 16;
 const PAGE_SIZE: u32 = 0x1000;
 
+/// Emulated-environment policy for the default user UI language: en-US.
+const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
+
 /// RVA of the synthetic module's IMAGE_EXPORT_DIRECTORY.
 pub const SYNTHETIC_EXPORT_DIR_RVA: u32 = 0x200;
 
@@ -32,6 +35,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "VirtualProtect",
     "VirtualFree",
     "ExitProcess",
+    "GetUserDefaultUILanguage",
 ];
 
 /// Seed ntdll export names observed during the bootstrap export walk; this is
@@ -507,6 +511,15 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                     env.resolve_proc(emu, module_base, &proc_name)?
                 }
             };
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "GetUserDefaultUILanguage" => {
+            let ret = u64::from(EMULATED_USER_DEFAULT_UI_LANGID);
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
             Ok(ApiOutcome::Handled {
@@ -1123,6 +1136,66 @@ mod tests {
         assert_eq!(normalize_module_name("ntdll.sys"), "ntdll.sys");
         assert_eq!(normalize_module_name("ntdll."), "ntdll.");
         assert_eq!(normalize_module_name(""), "");
+    }
+
+    #[test]
+    fn get_user_default_ui_language_returns_environment_policy() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address: u64 = 0x1234_5678_9abc_def0;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RDX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(&mut env, &mut emu, "GetUserDefaultUILanguage").unwrap();
+
+        let expected = u64::from(EMULATED_USER_DEFAULT_UI_LANGID);
+        assert_eq!(
+            outcome,
+            ApiOutcome::Handled {
+                name: "GetUserDefaultUILanguage".to_owned(),
+                ret: expected,
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), expected);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn trap_dispatches_get_user_default_ui_language_via_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let module = env.synthetic_modules.get("kernel32.dll").unwrap();
+        let stub =
+            kernel32_base + u64::from(*module.exports.get("GetUserDefaultUILanguage").unwrap());
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["GetUserDefaultUILanguage".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            u64::from(EMULATED_USER_DEFAULT_UI_LANGID)
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            image.entry_point_va() + 12
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
     }
 
     #[test]
