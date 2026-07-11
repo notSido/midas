@@ -50,6 +50,7 @@ implemented" section describe the latest production frontier.
 | Bounded names-only module controls and first-frontier diagnostic mode: a control can replace one not-yet-loaded synthetic module's export seed with at most 4,096 strictly sorted unique printable names. The environment records whether the override actually supplied the mapped module and the child diagnostic rejects an unconsumed treatment. `--frontier-only` prints the first child terminal and skips all later provenance replays. Registered WndProc, synthetic-module ranges, child-TEB accesses, and terminal stack qwords remain read-only observations. | Focused tests cover bounds, ordering, duplicate/preload rejection, applied-state projection, and the dedicated kernel32 mapping route that previously bypassed controls. The committed 19-name and 20-name kernel32 inputs differ only by `WideCharToMultiByte` and have SHA-256 values `ead2f345b2eebfeedfabbd1551e1029fd721678d0d068321b598948ade757234` and `dfd7ed5f8d57f01047b511334aa6e45c42362964b7b0baba56c74561bc2490db`. Their formal output artifacts reproduce the old null versus the advanced frontier. | M3 (groundwork) |
 | Observed kernel32 export + bounded `WideCharToMultiByte`: the seed now includes the causally identified name. Dispatch supports CP_ACP, flags zero, `cchWideChar=-1`, null default-character pointers, and null-terminated printable 7-bit ASCII within 260 UTF-16 units. The query form returns the derived byte count including null; the conversion form requires a distinct non-null output with exactly the derived size, writes the derived bytes and terminator without changing the suffix, and returns that count. General code pages, flags, explicit lengths, non-ASCII/cap-exhausted inputs, host locale/code-page state, and last-error behavior remain unmodeled. | `cargo test --all-targets` is green with 160 tests (146 library, 11 `trace_child_postmortem`, and 3 `trace_slot`). Six focused API tests cover repeated/fresh query identity, dirty upper halves, output/suffix behavior, non-ASCII/cap rejection, unmodeled no-input/no-return access, input/return/output failure atomicity, and name-resolved kernel32 dispatch. The formal one-name treatment changes the established cell from zero to the `WideCharToMultiByte` stub. Production handles size query `(0,0,L"guest.exe",-1,NULL,0,NULL,NULL)` and conversion `(0,0,L"guest.exe",-1,buffer,10,NULL,NULL)`, both returning 10; then reaches a distinct near-return null after 44,386 child RIPs (`0xed010b86a52a2ab2`) and 30,300 post-time RIPs (`0x3d2b90b3678f0d4e`). Restored main remains the exact 3,527-RIP Sleep leg (`0x7fce9fdb31fbfd70`). Incomplete-provenance sample 3 independently handles the same two forms and seven-API tail before its own near-return null; it remains engineering corroboration. | M3 |
 | Runtime-derived poll-release diagnostic: a persistent whole-run watch identifies the release producer as a child-thread byte-one store after a bounded nonzero return at the causally confirmed `CreateWindowExA` boundary; restored formal-sample main execution advances 64,695 instructions past the poll, while production scheduling/window semantics and OEP proof remain absent. | [Formal finding and reproducer](docs/FINDINGS-M3-import-wall.md#poll-release-producer-is-a-post-createwindowexa-child-store) | M3 (groundwork) |
+| Runtime-derived post-release null classification: the restored main's zero-target register call is the failed kernel32 export-walk result for `GetCommandLineA` (option b), so this evidence does not require fine-grained child/main interleaving. | [Formal finding and reproducer](docs/FINDINGS-M3-import-wall.md#post-release-null-is-missing-getcommandlinea-resolution) | M3 (groundwork) |
 
 ## Not yet implemented
 
@@ -96,13 +97,15 @@ The normal production path still never schedules the created child. In a
 bounded diagnostic replay, returning only a nonzero opaque HWND at the
 runtime-confirmed `CreateWindowExA` boundary lets existing child code store byte
 one into the runtime-derived poll cell. Restoring the saved main CPU context
-then produces 64,695 instructions past the formal poll before a later null
-control transfer; no OEP is claimed. The earlier scheduler-only negative
-control remains valid because its child stopped before this window boundary.
-The positive replay does not prove fine-grained interleaving is required: one
-child run through the persistent store releases the next main leg. A production
-scheduler remains necessary, but is not sufficient without bounded
-window-creation behavior. `RtlFreeHeap` is the next child API frontier.
+then produces 64,695 instructions past the formal poll before the kernel32
+export walk fails to find `GetCommandLineA` and calls zero; a one-name control
+exposes the same call as the named unhandled stub. No OEP is claimed. The
+earlier scheduler-only negative control remains valid because its child stopped
+before this window boundary. The positive replay does not require fine-grained
+interleaving: one child run through the persistent store releases the next main
+leg. A production scheduler remains necessary, but is not sufficient without
+bounded window-creation behavior. `RtlFreeHeap` is the next child API frontier,
+and `GetCommandLineA` is the post-release main frontier.
 
 Completing one extra serial main Sleep leg before child entry and returning
 fixed uptime 1 or 1,000 do not change their tested frontiers; changing the child
@@ -130,8 +133,8 @@ manifest/version-policy discovery and other version APIs are unmodeled.
 Vectored-handler callback invocation, removal, exception dispatch, lifetime,
 and concurrency also remain unmodeled. General current-directory mutation and
 fuller filesystem semantics, non-NULL module filename lookup, TEB `ClientId`,
-`RtlFreeHeap`, and `RtlReAllocateHeap` also remain unmodeled; no module/handle
-lifecycle or reallocation semantics are claimed.
+`GetCommandLineA`, `RtlFreeHeap`, and `RtlReAllocateHeap` also remain unmodeled;
+no module/handle lifecycle or reallocation semantics are claimed.
 `examples/trace_child_postmortem.rs` reproduces the current child wall, and
 `docs/FINDINGS-M3-import-wall.md` records the full finding chain.
 
