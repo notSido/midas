@@ -1,13 +1,14 @@
-# midas — project guide for Claude Code
+# midas — project guide for coding agents
 
 midas is a **clean-room Themida VM-analysis toolkit** in Rust, built on Unicorn
 CPU emulation. The spec of record is [`docs/CHARTER.md`](docs/CHARTER.md). This
-file is the durable working agreement and the resume protocol. Read it, then
-follow **Resuming work** below.
+file is the durable working agreement and the resume protocol for any coding
+agent. Read it, then follow **Resuming work** below.
 
-This file is auto-loaded every session in this repository. It intentionally
-points at the live sources of truth (STATUS.md, the findings docs, git history)
-rather than duplicating state that would go stale.
+This is the canonical project guide. Claude Code loads it directly; other agent
+environments should reach it through their repository entrypoint (for example,
+`AGENTS.md`). It intentionally points at the live sources of truth (`STATUS.md`,
+the findings docs, git history) rather than duplicating state that would go stale.
 
 ## Non-negotiable rules (see docs/CHARTER.md)
 
@@ -25,24 +26,39 @@ rather than duplicating state that would go stale.
 
 ## How we work (working agreement)
 
-- **Delegate implementation to `codex exec`**, one focused slice at a time; then
-  independently review the diff and re-run the tests yourself. Never trust a
-  self-report — your own `cargo test` / `cargo clippy` run is the verification.
-  Invocation: `codex exec --sandbox workspace-write -C <repo> -` (prompt on stdin;
-  `codex login status` must show logged in).
-- **Every PR gets two independent reviews before merge:** an **Opus** review
-  (max-rigor prompt) **and** a **GPT-5.5 at xhigh** review
-  (`codex exec -m gpt-5.5 -c model_reasoning_effort="xhigh" --sandbox read-only`),
-  run concurrently on the checked-out branch. Relay a side-by-side comparison and
-  address real findings (fix + re-verify). **The human merges PRs; the assistant
-  does not self-merge** — this holds for every PR, doc-only ones included.
-- **One slice per PR onto `main`.** Branch, implement, verify locally, open a PR.
-  For **code** PRs, CI (build, test, `clippy -D warnings`, no-hype gate) must be
-  green before merge. **Doc-only** PRs skip the CI wait — after the two reviews
-  above, do a local no-hype check over the changed docs
-  (`grep -rnE '🎉|✅|SUCCESS|BREAKTHROUGH|MAJOR|FINALLY' <changed .md files> |
-  grep -vF '🎉|✅|SUCCESS|BREAKTHROUGH|MAJOR|FINALLY'` returns nothing) — then it
-  is ready for the human to merge.
+- **Use subagents proactively.** Delegate independent, well-bounded research,
+  implementation, review, and diagnostic work whenever parallelism materially
+  improves speed or confidence. Prefer native subagent orchestration; delegation
+  is not tied to any particular CLI or subprocess. The lead agent may implement
+  tiny or tightly coupled work directly and always owns integration, final diff
+  review, and local verification.
+- **Choose models by task.** When model selection is available, prefer
+  `gpt-5.3-codex-spark` for contained implementation or diagnostic tasks with
+  explicit acceptance criteria. Keep cross-cutting architecture, ambiguous work,
+  integration, and final verification with the lead agent. This is a preference,
+  not a gate; model availability must not block progress.
+- **Keep changes coherent and reviewable.** Prefer focused branches and PRs, but
+  tightly coupled changes may ship together when splitting them would obscure the
+  objective or add ceremony without reducing risk.
+- **Match review depth to risk.** Every change gets a self-review and relevant
+  local verification. Seek an independent review for significant behavior
+  changes, security-sensitive work, or milestone-sized changes; use additional
+  reviewers when complexity warrants it or the human asks. The unavailability of
+  a particular model, tool, or reviewer is not by itself a blocker.
+- **Work locally without ceremony.** Creating a branch, editing, testing, and
+  making a focused local commit are normal implementation steps and do not need a
+  separate checkpoint.
+- **Publish and merge within granted authority.** Push, open or update PRs, and
+  merge when the human has authorized those external actions explicitly or through
+  a standing instruction. Before merging code, CI must be green, including build,
+  tests, `clippy -D warnings`, and the no-hype gate. For doc-only changes, run the
+  relevant local checks, including the no-hype gate; CI or extra review is needed
+  only when the change's risk justifies it.
+- **Keep moving with bounded assumptions.** Do not pause merely because several
+  reasonable next steps exist. Choose the smallest evidence-producing path and
+  state consequential assumptions. Ask the human only when a missing decision
+  would materially change scope, acceptance criteria, security, or external
+  effects, or when new authority is required.
 - **Anti-overfitting (important).** The *mechanism* must be sample-agnostic:
   detect at runtime, with zero hardcoded per-sample constants. Windows/API
   behaviour is implemented as *general* semantics and added ONLY when a sample
@@ -73,8 +89,9 @@ When asked to continue/resume midas, do this first — do not assume prior state
 2. Run `git log --oneline -20` and `gh pr list` for live state (what is merged vs
    an open PR awaiting review/merge).
 3. Continue the current milestone from the frontier described in the findings,
-   following the working agreement above. For large or ambiguous next steps,
-   confirm the plan with the human before building.
+   following the working agreement above. Proceed autonomously with bounded,
+   evidence-producing steps; ask only at the material decision points described
+   above.
 
 **Current state and frontier:** do not rely on this file for the current
 milestone — read `STATUS.md` (verified capabilities) and the newest
