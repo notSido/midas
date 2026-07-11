@@ -14,8 +14,9 @@ use iced_x86::{
 };
 use midas::{
     emu::{
-        Emu, PersistentWatchHit, RegisterX86, PEB_BASE, STACK_BASE, STACK_SIZE, TEB_BASE,
-        TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_SIZE, TEB_STACKBASE_OFFSET, TEB_STACKLIMIT_OFFSET,
+        Emu, EmuError, FrozenInstruction, PersistentWatchHit, RegisterX86, PEB_BASE, STACK_BASE,
+        STACK_SIZE, TEB_BASE, TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_SIZE, TEB_STACKBASE_OFFSET,
+        TEB_STACKLIMIT_OFFSET,
     },
     pe::PeImage,
     win64::{run_with_import_trap, RunnableUnscheduledThread, TrapRun, TrapStop, Win64Env},
@@ -23,12 +24,14 @@ use midas::{
 
 const DEFAULT_MAIN_PER_LEG_CAP: u64 = 60_000_000;
 const DEFAULT_CHILD_PER_LEG_CAP: u64 = 100_000;
-const MAX_CHILD_PER_LEG_CAP: u64 = 250_000;
+const MAX_CHILD_PER_LEG_CAP: u64 = 100_000;
 const DEFAULT_WATCH_HIT_CAP: usize = 4_096;
 const MAX_WATCH_HIT_CAP: usize = 16_384;
 const FROZEN_PATH_INSTRUCTION_CAP: usize = 4;
+const PRODUCER_WATCH_INSTRUCTION_WINDOW: u64 = 4_096;
 const MAIN_API_BOUND: usize = 128;
 const CHILD_PREFIX_API_BOUND: usize = 16;
+const CHILD_TAIL_API_BOUND: usize = 16;
 
 const CHILD_STACK_BASE: u64 = 0x0000_000f_5000_0000;
 const CHILD_STACK_SIZE: u64 = 0x0010_0000;
@@ -111,6 +114,19 @@ struct Config {
 enum ChildTerminal {
     NullControlTransfer,
     ReturnSentinel,
+    UnhandledApi { name: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalTransfer {
+    NearReturn {
+        instruction_address: u64,
+    },
+    IndirectCall {
+        instruction_address: u64,
+        pointer_cell: u64,
+        pushed_return_address: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +145,7 @@ enum WatchPhase {
 struct WatchSpec {
     ranges: Vec<(u64, u64)>,
     phase: WatchPhase,
+    global_instruction_range: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +171,31 @@ struct HandlerWriterSource {
     source_value: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceContextProducer {
+    writer_rip: u64,
+    writer_global_instruction_index: u64,
+    context_address: u64,
+    value: u64,
+    stack_cell: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StackCellProducer {
+    writer_rip: u64,
+    writer_global_instruction_index: u64,
+    destination_cell: u64,
+    value: u64,
+    source_cell: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RaxStackProducer {
+    path_start_rip: u64,
+    path_start_global_instruction_index: u64,
+    value: u64,
+}
+
 #[derive(Debug, Clone)]
 struct FormattedWatchHit {
     hit: PersistentWatchHit,
@@ -161,11 +203,23 @@ struct FormattedWatchHit {
     fallthrough: Vec<(u64, String)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FormattedInstruction {
     address: u64,
     instruction: String,
     writes_r13: Option<bool>,
+}
+
+struct SummaryEvidence<'a> {
+    terminal_watch: &'a PassEvidence,
+    handler_writer: HandlerWriterSource,
+    handler_watch: &'a PassEvidence,
+    source_watch: &'a PassEvidence,
+    source_producer: SourceContextProducer,
+    stack_watch: &'a PassEvidence,
+    stack_producer: StackCellProducer,
+    upstream_stack_watch: &'a PassEvidence,
+    rax_producer: RaxStackProducer,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +232,8 @@ struct PassEvidence {
     time_return_address: u64,
     child_tail_handled: Vec<String>,
     terminal: ChildTerminal,
+    terminal_transfer: TerminalTransfer,
+    terminal_registers: Vec<(RegisterX86, u64)>,
     terminal_cell: u64,
     terminal_value: u64,
     child_rips: Vec<u64>,
@@ -191,6 +247,14 @@ struct PassEvidence {
     main_cpu_restored: bool,
     main_sleep_handled: Vec<String>,
     main_sleep_rips: Vec<u64>,
+}
+
+impl PassEvidence {
+    fn release_replay_traces(&mut self) {
+        self.child_rips = Vec::new();
+        self.post_time_rips = Vec::new();
+        self.main_sleep_rips = Vec::new();
+    }
 }
 
 fn main() {
@@ -214,17 +278,41 @@ fn run() -> Result<(), String> {
             first.terminal_cell
         )
     })?;
-    let second = run_pass(
+    if matches!(
+        first.terminal_transfer,
+        TerminalTransfer::IndirectCall { .. }
+    ) {
+        let mut whole_run = run_pass(
+            &config,
+            &image,
+            &bytes,
+            Some(WatchSpec {
+                ranges: vec![(first.terminal_cell, watch_end)],
+                phase: WatchPhase::BeforeMain,
+                global_instruction_range: None,
+            }),
+        )?;
+        compare_passes(&first, &whole_run)?;
+        whole_run.release_replay_traces();
+        validate_watched_replay(&whole_run, config.watch_hit_cap)?;
+        let writer_index = validate_indirect_call_frontier(&whole_run)?;
+        print_indirect_call_frontier_summary(&config, &image, &first, &whole_run, writer_index);
+        return Ok(());
+    }
+
+    let mut second = run_pass(
         &config,
         &image,
         &bytes,
         Some(WatchSpec {
             ranges: vec![(first.terminal_cell, watch_end)],
             phase: WatchPhase::BeforeTime,
+            global_instruction_range: None,
         }),
     )?;
 
     compare_passes(&first, &second)?;
+    second.release_replay_traces();
     validate_watched_replay(&second, config.watch_hit_cap)?;
     let terminal_source = second.terminal_source.ok_or_else(|| {
         "terminal-cell replay did not expose the dispatcher source chain".to_owned()
@@ -235,16 +323,18 @@ fn run() -> Result<(), String> {
             terminal_source.handler_slot
         )
     })?;
-    let third = run_pass(
+    let mut third = run_pass(
         &config,
         &image,
         &bytes,
         Some(WatchSpec {
             ranges: vec![(terminal_source.handler_slot, handler_watch_end)],
             phase: WatchPhase::BeforeMain,
+            global_instruction_range: None,
         }),
     )?;
     compare_passes(&first, &third)?;
+    third.release_replay_traces();
     validate_watched_replay(&third, config.watch_hit_cap)?;
     validate_handler_slot_replay(&third, terminal_source)?;
     validate_terminal_register_path(&third, terminal_source)?;
@@ -260,7 +350,7 @@ fn run() -> Result<(), String> {
         .source_context_address
         .checked_add(8)
         .ok_or_else(|| "source-context watch range overflows".to_owned())?;
-    let fourth = run_pass(
+    let mut fourth = run_pass(
         &config,
         &image,
         &bytes,
@@ -282,20 +372,92 @@ fn run() -> Result<(), String> {
                 global_instruction_index: handler_writer_source.writer_global_instruction_index,
                 value: handler_writer_source.source_value,
             },
+            global_instruction_range: None,
         }),
     )?;
     compare_passes(&first, &fourth)?;
+    fourth.release_replay_traces();
     validate_watched_replay(&fourth, config.watch_hit_cap)?;
-    validated_source_edge_indices(&fourth, terminal_source, handler_writer_source)?;
-    print_summary(
+    let source_edge_indices =
+        validated_source_edge_indices(&fourth, terminal_source, handler_writer_source)?;
+    let source_producer =
+        derive_source_context_producer(&fourth, handler_writer_source, source_edge_indices[2])?;
+    let stack_watch_end = source_producer
+        .stack_cell
+        .checked_add(8)
+        .ok_or_else(|| "source stack-cell watch range overflows".to_owned())?;
+    let mut fifth = run_pass(
         &config,
         &image,
-        &first,
-        &second,
-        handler_writer_source,
-        &third,
-        &fourth,
-    );
+        &bytes,
+        Some(WatchSpec {
+            ranges: vec![
+                (source_producer.stack_cell, stack_watch_end),
+                (
+                    handler_writer_source.source_context_address,
+                    source_watch_end,
+                ),
+            ],
+            phase: WatchPhase::CaptureMainLegWriting {
+                address: source_producer.context_address,
+                writer_rip: source_producer.writer_rip,
+                global_instruction_index: source_producer.writer_global_instruction_index,
+                value: source_producer.value,
+            },
+            global_instruction_range: None,
+        }),
+    )?;
+    compare_passes(&first, &fifth)?;
+    fifth.release_replay_traces();
+    validate_watched_replay(&fifth, config.watch_hit_cap)?;
+    let stack_producer = validate_source_stack_edge(&fifth, source_producer)?;
+    let upstream_stack_watch_end = stack_producer
+        .source_cell
+        .checked_add(8)
+        .ok_or_else(|| "upstream stack-cell watch range overflows".to_owned())?;
+    let upstream_watch_global_end = stack_producer
+        .writer_global_instruction_index
+        .checked_add(1)
+        .ok_or_else(|| "upstream producer watch range overflows".to_owned())?;
+    let upstream_watch_global_start =
+        upstream_watch_global_end.saturating_sub(PRODUCER_WATCH_INSTRUCTION_WINDOW);
+    let mut sixth = run_pass(
+        &config,
+        &image,
+        &bytes,
+        Some(WatchSpec {
+            ranges: vec![
+                (stack_producer.source_cell, upstream_stack_watch_end),
+                (source_producer.stack_cell, stack_watch_end),
+            ],
+            phase: WatchPhase::CaptureMainLegWriting {
+                address: stack_producer.destination_cell,
+                writer_rip: stack_producer.writer_rip,
+                global_instruction_index: stack_producer.writer_global_instruction_index,
+                value: stack_producer.value,
+            },
+            global_instruction_range: Some((
+                upstream_watch_global_start,
+                upstream_watch_global_end,
+            )),
+        }),
+    )?;
+    compare_passes(&first, &sixth)?;
+    sixth.release_replay_traces();
+    validate_watched_replay(&sixth, config.watch_hit_cap)?;
+    let rax_producer = validate_stack_value_from_rax(&sixth.watch_hits, stack_producer)?;
+    let summary = SummaryEvidence {
+        terminal_watch: &second,
+        handler_writer: handler_writer_source,
+        handler_watch: &third,
+        source_watch: &fourth,
+        source_producer,
+        stack_watch: &fifth,
+        stack_producer,
+        upstream_stack_watch: &sixth,
+        rax_producer,
+    };
+    print_summary(&config, &image, &first, &summary);
     Ok(())
 }
 
@@ -360,6 +522,15 @@ fn validate_hit_cap(hit_cap: usize) -> Result<usize, String> {
     Ok(hit_cap)
 }
 
+fn arm_persistent_watch(emu: &mut Emu, spec: &WatchSpec, hit_cap: usize) -> Result<(), EmuError> {
+    match spec.global_instruction_range {
+        Some(global_range) => {
+            emu.configure_persistent_watch_in_global_range(&spec.ranges, hit_cap, global_range)
+        }
+        None => emu.configure_persistent_watch(&spec.ranges, hit_cap),
+    }
+}
+
 fn run_pass(
     config: &Config,
     image: &PeImage,
@@ -375,12 +546,12 @@ fn run_pass(
         .as_ref()
         .filter(|spec| spec.phase == WatchPhase::BeforeMain)
     {
-        emu.configure_persistent_watch(&spec.ranges, config.watch_hit_cap)
+        arm_persistent_watch(&mut emu, spec, config.watch_hit_cap)
             .map_err(|error| format!("failed to arm whole-run handler-slot watch: {error}"))?;
     }
 
     let mut frozen_main_watch_hits = None;
-    let main = if let Some((capture, ranges)) =
+    let main = if let Some((capture, ranges, global_range)) =
         watch_spec.as_ref().and_then(|spec| match spec.phase {
             WatchPhase::CaptureMainLegWriting {
                 address,
@@ -395,6 +566,7 @@ fn run_pass(
                     value,
                 },
                 spec.ranges.as_slice(),
+                spec.global_instruction_range,
             )),
             WatchPhase::BeforeMain | WatchPhase::BeforeTime => None,
         }) {
@@ -405,6 +577,7 @@ fn run_pass(
             image.entry_point_va(),
             "Sleep",
             ranges,
+            global_range,
             capture,
             config.main_per_leg_cap,
             MAIN_API_BOUND,
@@ -482,7 +655,7 @@ fn run_pass(
         .as_ref()
         .filter(|spec| spec.phase == WatchPhase::BeforeTime)
     {
-        emu.configure_persistent_watch(&spec.ranges, config.watch_hit_cap)
+        arm_persistent_watch(&mut emu, spec, config.watch_hit_cap)
             .map_err(|error| format!("failed to arm terminal-cell watch: {error}"))?;
     }
 
@@ -492,12 +665,12 @@ fn run_pass(
         image,
         child_prefix.pending_address,
         config.child_per_leg_cap,
-        1,
+        CHILD_TAIL_API_BOUND,
     )
     .map_err(|error| format!("failed to run child timeGetTime suffix: {error}"))?;
-    if child_tail.handled != ["timeGetTime"] {
+    if child_tail.handled.first().map(String::as_str) != Some("timeGetTime") {
         return Err(format!(
-            "expected one timeGetTime dispatch, got {:?}",
+            "expected the child suffix to begin with timeGetTime, got {:?}",
             child_tail.handled
         ));
     }
@@ -513,15 +686,29 @@ fn run_pass(
     let final_rsp = emu
         .read_reg(RegisterX86::RSP)
         .map_err(|error| format!("failed to read child final RSP: {error}"))?;
-    require_terminal_ret(&emu, &post_time_rips)?;
-    let terminal_cell = terminal_cell(final_rsp)?;
+    let terminal_registers = read_cpu_state(&emu)?;
+    let frozen_tail = emu.recent_instructions();
+    let (terminal_transfer, terminal_cell) = derive_terminal_transfer(
+        &emu,
+        &post_time_rips,
+        final_rsp,
+        &terminal_registers,
+        &frozen_tail,
+    )?;
     let terminal_value = read_u64(&emu, terminal_cell)?;
     let terminal = classify_terminal(&child_tail, final_rip, terminal_value)?;
-    let tail_instructions = format_tail(&emu, &post_time_rips, 64);
+    let tail_instructions = format_tail(&frozen_tail, &post_time_rips, 64)?;
 
-    let watch_hits = frozen_main_watch_hits
-        .unwrap_or_else(|| format_watch_hits(&emu, emu.persistent_watch_hits()));
-    let terminal_source = derive_terminal_source(&emu, terminal_cell, terminal_value, &watch_hits)?;
+    let watch_hits = match frozen_main_watch_hits {
+        Some(hits) => hits,
+        None => format_watch_hits(emu.persistent_watch_hits())?,
+    };
+    let terminal_source = match terminal_transfer {
+        TerminalTransfer::NearReturn { .. } => {
+            derive_terminal_source(&emu, terminal_cell, terminal_value, &watch_hits)?
+        }
+        TerminalTransfer::IndirectCall { .. } => None,
+    };
 
     let main_stack_after = emu
         .read_mem(STACK_BASE, main_stack_before.len())
@@ -572,6 +759,8 @@ fn run_pass(
         time_return_address,
         child_tail_handled: child_tail.handled,
         terminal,
+        terminal_transfer,
+        terminal_registers,
         terminal_cell,
         terminal_value,
         child_rips,
@@ -660,6 +849,7 @@ fn run_until_writer_leg(
     begin: u64,
     target: &str,
     watch_ranges: &[(u64, u64)],
+    watch_global_range: Option<(u64, u64)>,
     capture: WriterCapture,
     per_leg_cap: u64,
     handled_bound: usize,
@@ -682,8 +872,15 @@ fn run_until_writer_leg(
             ));
         }
 
-        emu.configure_persistent_watch(watch_ranges, watch_hit_cap)
-            .map_err(|error| format!("failed to re-arm source watch for one API leg: {error}"))?;
+        match watch_global_range {
+            Some(global_range) => emu.configure_persistent_watch_in_global_range(
+                watch_ranges,
+                watch_hit_cap,
+                global_range,
+            ),
+            None => emu.configure_persistent_watch(watch_ranges, watch_hit_cap),
+        }
+        .map_err(|error| format!("failed to re-arm source watch for one API leg: {error}"))?;
         let leg = run_with_import_trap(env, emu, image, next, per_leg_cap, 1)
             .map_err(|error| format!("re-armed trap leg before {target} failed: {error}"))?;
         if leg.handled.len() != 1 || !is_call_bound_stop(&leg.stop) {
@@ -716,7 +913,7 @@ fn run_until_writer_leg(
                 && hit.global_instruction_index == capture.global_instruction_index
                 && hit.value == Some(capture.value)
         }) {
-            let formatted = format_watch_hits(emu, hits);
+            let formatted = format_watch_hits(hits)?;
             return Ok((
                 PendingApiRun {
                     handled,
@@ -900,12 +1097,100 @@ fn classify_terminal(
         {
             Ok(ChildTerminal::ReturnSentinel)
         }
+        TrapStop::UnhandledApi { name, .. }
+            if final_rip == terminal_value && terminal_value != 0 =>
+        {
+            Ok(ChildTerminal::UnhandledApi { name: name.clone() })
+        }
         other => Err(format!(
             "child terminal transfer is outside the bounded classifier: stop={other:?}, RIP=0x{final_rip:016x}, consumed=0x{terminal_value:016x}"
         )),
     }
 }
 
+fn derive_terminal_transfer(
+    emu: &Emu,
+    post_time_rips: &[u64],
+    final_rsp: u64,
+    final_registers: &[(RegisterX86, u64)],
+    frozen_tail: &[FrozenInstruction],
+) -> Result<(TerminalTransfer, u64), String> {
+    let last = post_time_rips
+        .last()
+        .copied()
+        .ok_or_else(|| "post-time trace is empty".to_owned())?;
+    let frozen = frozen_tail
+        .last()
+        .filter(|instruction| instruction.address == last)
+        .ok_or_else(|| "terminal instruction has no matching hook-time snapshot".to_owned())?;
+    let mut decoder = Decoder::with_ip(64, &frozen.bytes, last, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() || instruction.len() != frozen.bytes.len() {
+        return Err("terminal hook-time bytes do not decode as one exact instruction".to_owned());
+    }
+    let encoded = frozen.bytes.as_slice();
+
+    if matches!(instruction.code(), Code::Retnq | Code::Retnq_imm16) {
+        validate_terminal_ret_instruction(&instruction, encoded, last)?;
+        return Ok((
+            TerminalTransfer::NearReturn {
+                instruction_address: last,
+            },
+            terminal_cell(final_rsp)?,
+        ));
+    }
+
+    if instruction.code() != Code::Call_rm64
+        || instruction.memory_base() != Register::RDI
+        || instruction.memory_index() != Register::None
+        // Iced reports an encoded disp32 as an 8-byte effective displacement
+        // in 64-bit address size; disp8 remains 1 and is rejected here.
+        || instruction.memory_displ_size() != 8
+        || instruction.has_segment_prefix()
+        || instruction.stack_pointer_increment() != -8
+        || has_operand_size_override_prefix(encoded)
+    {
+        return Err(format!(
+            "terminal-source derivation supports only a bounded qword RET or unsegmented call qword [rdi+disp], found {} at 0x{last:016x}",
+            format_instruction(&instruction)
+        ));
+    }
+
+    let rdi = register_value(final_registers, RegisterX86::RDI)
+        .ok_or_else(|| "indirect-call terminal snapshot is missing RDI".to_owned())?;
+    if register_value(final_registers, RegisterX86::RSP) != Some(final_rsp) {
+        return Err("indirect-call terminal snapshot RSP disagrees with the final RSP".to_owned());
+    }
+    let displacement = instruction.memory_displacement64();
+    if displacement == 0 || displacement > i32::MAX as u64 {
+        return Err(format!(
+            "indirect-call displacement is outside the bounded positive disp32 form: 0x{displacement:x}"
+        ));
+    }
+    let pointer_cell = rdi.checked_add(displacement).ok_or_else(|| {
+        format!(
+            "indirect-call pointer cell overflows: RDI=0x{rdi:016x}, displacement=0x{displacement:x}"
+        )
+    })?;
+    let pushed_return_address = read_u64(emu, final_rsp)?;
+    if pushed_return_address != instruction.next_ip() {
+        return Err(format!(
+            "indirect call did not leave its fallthrough on the final stack: expected 0x{:016x}, got 0x{pushed_return_address:016x}",
+            instruction.next_ip()
+        ));
+    }
+
+    Ok((
+        TerminalTransfer::IndirectCall {
+            instruction_address: last,
+            pointer_cell,
+            pushed_return_address,
+        },
+        pointer_cell,
+    ))
+}
+
+#[cfg(test)]
 fn require_terminal_ret(emu: &Emu, post_time_rips: &[u64]) -> Result<(), String> {
     let last = post_time_rips
         .last()
@@ -916,17 +1201,25 @@ fn require_terminal_ret(emu: &Emu, post_time_rips: &[u64]) -> Result<(), String>
         .map_err(|error| format!("failed to read final instruction at 0x{last:016x}: {error}"))?;
     let mut decoder = Decoder::with_ip(64, &bytes, last, DecoderOptions::NONE);
     let instruction = decoder.decode();
-    let is_qword_near_return = matches!(instruction.code(), Code::Retnq | Code::Retnq_imm16);
     let encoded = bytes
         .get(..instruction.len())
         .ok_or_else(|| "decoded terminal instruction exceeds its read window".to_owned())?;
+    validate_terminal_ret_instruction(&instruction, encoded, last)
+}
+
+fn validate_terminal_ret_instruction(
+    instruction: &iced_x86::Instruction,
+    encoded: &[u8],
+    address: u64,
+) -> Result<(), String> {
+    let is_qword_near_return = matches!(instruction.code(), Code::Retnq | Code::Retnq_imm16);
     if !is_qword_near_return
         || instruction.stack_pointer_increment() != 8
         || has_operand_size_override_prefix(encoded)
     {
         return Err(format!(
-            "terminal-cell derivation requires a qword near RET with zero extra stack adjustment and no operand-size override, found {} at 0x{last:016x}",
-            format_instruction(&instruction)
+            "terminal-cell derivation requires a qword near RET with zero extra stack adjustment and no operand-size override, found {} at 0x{address:016x}",
+            format_instruction(instruction)
         ));
     }
     Ok(())
@@ -955,32 +1248,55 @@ fn read_cpu_state(emu: &Emu) -> Result<Vec<(RegisterX86, u64)>, String> {
         .collect()
 }
 
-fn format_tail(emu: &Emu, rips: &[u64], count: usize) -> Vec<FormattedInstruction> {
-    let start = rips.len().saturating_sub(count);
-    rips[start..]
+fn format_tail(
+    frozen: &[FrozenInstruction],
+    rips: &[u64],
+    count: usize,
+) -> Result<Vec<FormattedInstruction>, String> {
+    let retained = rips.len().min(count);
+    if frozen.len() < retained {
+        return Err(format!(
+            "hook-time instruction tail retained {} entries, expected {retained}",
+            frozen.len()
+        ));
+    }
+    let expected = &rips[rips.len() - retained..];
+    let frozen = &frozen[frozen.len() - retained..];
+    expected
         .iter()
-        .map(|&rip| format_instruction_observation_at(emu, rip))
+        .zip(frozen)
+        .map(|(&expected_address, instruction)| {
+            if instruction.address != expected_address {
+                return Err(format!(
+                    "hook-time instruction tail diverges: expected 0x{expected_address:016x}, got 0x{:016x}",
+                    instruction.address
+                ));
+            }
+            format_frozen_instruction(instruction)
+        })
         .collect()
 }
 
-fn format_instruction_observation_at(emu: &Emu, address: u64) -> FormattedInstruction {
-    match emu.read_mem(address, 16) {
-        Ok(bytes) => {
-            let mut decoder = Decoder::with_ip(64, &bytes, address, DecoderOptions::NONE);
-            let instruction = decoder.decode();
-            FormattedInstruction {
-                address,
-                instruction: format_instruction(&instruction),
-                writes_r13: (!instruction.is_invalid())
-                    .then(|| instruction_writes_r13(&instruction)),
-            }
-        }
-        Err(error) => FormattedInstruction {
-            address,
-            instruction: format!("<unreadable: {error}>"),
-            writes_r13: None,
-        },
+fn format_frozen_instruction(frozen: &FrozenInstruction) -> Result<FormattedInstruction, String> {
+    if frozen.bytes.is_empty() {
+        return Err(format!(
+            "instruction at 0x{:016x} has no hook-time bytes",
+            frozen.address
+        ));
     }
+    let mut decoder = Decoder::with_ip(64, &frozen.bytes, frozen.address, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() || instruction.len() != frozen.bytes.len() {
+        return Err(format!(
+            "hook-time bytes at 0x{:016x} do not decode as one exact instruction",
+            frozen.address
+        ));
+    }
+    Ok(FormattedInstruction {
+        address: frozen.address,
+        instruction: format_instruction(&instruction),
+        writes_r13: Some(instruction_writes_r13(&instruction)),
+    })
 }
 
 fn instruction_writes_r13(instruction: &iced_x86::Instruction) -> bool {
@@ -1001,17 +1317,6 @@ fn instruction_writes_r13(instruction: &iced_x86::Instruction) -> bool {
         })
 }
 
-fn format_instruction_at(emu: &Emu, address: u64) -> String {
-    match emu.read_mem(address, 16) {
-        Ok(bytes) => {
-            let mut decoder = Decoder::with_ip(64, &bytes, address, DecoderOptions::NONE);
-            let instruction = decoder.decode();
-            format_instruction(&instruction)
-        }
-        Err(error) => format!("<unreadable: {error}>"),
-    }
-}
-
 fn format_instruction(instruction: &iced_x86::Instruction) -> String {
     let mut formatter = NasmFormatter::new();
     let mut output = String::new();
@@ -1019,36 +1324,36 @@ fn format_instruction(instruction: &iced_x86::Instruction) -> String {
     output
 }
 
-fn format_watch_hits(emu: &Emu, hits: Vec<PersistentWatchHit>) -> Vec<FormattedWatchHit> {
+fn format_watch_hits(hits: Vec<PersistentWatchHit>) -> Result<Vec<FormattedWatchHit>, String> {
     hits.into_iter()
         .map(|hit| {
             let fallthrough =
-                format_instruction_window_at(emu, hit.rip, FROZEN_PATH_INSTRUCTION_CAP);
+                format_instruction_window(&hit.code_window, hit.rip, FROZEN_PATH_INSTRUCTION_CAP);
             let instruction = fallthrough
                 .first()
+                .filter(|(address, _instruction)| *address == hit.rip)
                 .map(|(_address, instruction)| instruction.clone())
-                .unwrap_or_else(|| format_instruction_at(emu, hit.rip));
-            FormattedWatchHit {
+                .ok_or_else(|| {
+                    format!(
+                        "persistent watch hit at 0x{:016x} has no hook-time instruction bytes",
+                        hit.rip
+                    )
+                })?;
+            Ok(FormattedWatchHit {
                 hit,
                 instruction,
                 fallthrough,
-            }
+            })
         })
         .collect()
 }
 
-fn format_instruction_window_at(
-    emu: &Emu,
+fn format_instruction_window(
+    bytes: &[u8],
     address: u64,
     instruction_cap: usize,
 ) -> Vec<(u64, String)> {
-    let bytes = [64usize, 16]
-        .into_iter()
-        .find_map(|size| emu.read_mem(address, size).ok());
-    let Some(bytes) = bytes else {
-        return Vec::new();
-    };
-    let mut decoder = Decoder::with_ip(64, &bytes, address, DecoderOptions::NONE);
+    let mut decoder = Decoder::with_ip(64, bytes, address, DecoderOptions::NONE);
     let mut instructions = Vec::new();
     while decoder.can_decode() && instructions.len() < instruction_cap {
         let instruction = decoder.decode();
@@ -1069,10 +1374,13 @@ fn compare_passes(first: &PassEvidence, second: &PassEvidence) -> Result<(), Str
         && first.time_return_address == second.time_return_address
         && first.child_tail_handled == second.child_tail_handled
         && first.terminal == second.terminal
+        && first.terminal_transfer == second.terminal_transfer
+        && first.terminal_registers == second.terminal_registers
         && first.terminal_cell == second.terminal_cell
         && first.terminal_value == second.terminal_value
         && first.child_rips == second.child_rips
         && first.post_time_rips == second.post_time_rips
+        && first.tail_instructions == second.tail_instructions
         && first.main_sleep_handled == second.main_sleep_handled
         && first.main_sleep_rips == second.main_sleep_rips;
     if !same {
@@ -1113,7 +1421,119 @@ fn validate_watched_replay(pass: &PassEvidence, hit_cap: usize) -> Result<(), St
     }) {
         return Err("persistent watch retained an access outside its configured range".to_owned());
     }
+    if let Some((start, end)) = spec.global_instruction_range {
+        if end <= start {
+            return Err("watched replay has an empty global instruction range".to_owned());
+        }
+        if pass
+            .watch_hits
+            .iter()
+            .any(|entry| !(start..end).contains(&entry.hit.global_instruction_index))
+        {
+            return Err(
+                "persistent watch retained an access outside its global instruction range"
+                    .to_owned(),
+            );
+        }
+    }
     Ok(())
+}
+
+struct IndirectCallObservation<'a> {
+    transfer: TerminalTransfer,
+    terminal: &'a ChildTerminal,
+    terminal_cell: u64,
+    terminal_value: u64,
+    terminal_source: Option<TerminalSource>,
+    watch_phase: Option<WatchPhase>,
+    watch_hits: &'a [FormattedWatchHit],
+    terminal_registers: &'a [(RegisterX86, u64)],
+}
+
+fn validate_indirect_call_frontier(pass: &PassEvidence) -> Result<Option<usize>, String> {
+    validate_indirect_call_observation(IndirectCallObservation {
+        transfer: pass.terminal_transfer,
+        terminal: &pass.terminal,
+        terminal_cell: pass.terminal_cell,
+        terminal_value: pass.terminal_value,
+        terminal_source: pass.terminal_source,
+        watch_phase: pass.watch_spec.as_ref().map(|spec| spec.phase),
+        watch_hits: &pass.watch_hits,
+        terminal_registers: &pass.terminal_registers,
+    })
+}
+
+fn validate_indirect_call_observation(
+    observation: IndirectCallObservation<'_>,
+) -> Result<Option<usize>, String> {
+    let TerminalTransfer::IndirectCall {
+        instruction_address,
+        pointer_cell,
+        pushed_return_address,
+    } = observation.transfer
+    else {
+        return Err("call frontier is not an indirect call".to_owned());
+    };
+    if *observation.terminal != ChildTerminal::NullControlTransfer
+        || observation.terminal_cell != pointer_cell
+        || observation.terminal_value != 0
+        || observation.terminal_source.is_some()
+    {
+        return Err("indirect-call null frontier has inconsistent terminal evidence".to_owned());
+    }
+    if observation.watch_phase != Some(WatchPhase::BeforeMain) {
+        return Err("indirect-call pointer watch was not active for the whole run".to_owned());
+    }
+    let matching_read_indices = observation
+        .watch_hits
+        .iter()
+        .enumerate()
+        .filter(|entry| {
+            let entry = entry.1;
+            !entry.hit.is_write
+                && entry.hit.address == pointer_cell
+                && entry.hit.size == 8
+                && entry.hit.value == Some(0)
+                && entry.hit.rip == instruction_address
+                && entry.instruction.starts_with("call qword [rdi+")
+        })
+        .map(|(index, _entry)| index)
+        .collect::<Vec<_>>();
+    if matching_read_indices.len() != 1
+        || matching_read_indices[0].checked_add(1) != Some(observation.watch_hits.len())
+    {
+        return Err(format!(
+            "whole-run watch did not isolate exactly one final indirect-call read: {matching_read_indices:?}"
+        ));
+    }
+    let call_read_index = matching_read_indices[0];
+    let call_read = &observation.watch_hits[call_read_index];
+    let final_rsp = register_value(observation.terminal_registers, RegisterX86::RSP)
+        .ok_or_else(|| "indirect-call terminal snapshot is missing RSP".to_owned())?;
+    let expected_pre_call_rsp = final_rsp
+        .checked_add(8)
+        .ok_or_else(|| "indirect-call pre-call RSP overflows".to_owned())?;
+    if register_value(&call_read.hit.registers, RegisterX86::RSP) != Some(expected_pre_call_rsp)
+        || register_value(&call_read.hit.registers, RegisterX86::RDI)
+            != register_value(observation.terminal_registers, RegisterX86::RDI)
+        || pushed_return_address == 0
+    {
+        return Err(
+            "indirect-call watch snapshot does not match the final call transition".to_owned(),
+        );
+    }
+    let writer_index = observation.watch_hits[..call_read_index]
+        .iter()
+        .rposition(|entry| entry.hit.is_write);
+    if let Some(writer_index) = writer_index {
+        if observation.watch_hits[writer_index + 1..call_read_index]
+            .iter()
+            .any(|entry| entry.hit.is_write)
+        {
+            return Err("a later pointer-cell write follows the selected writer".to_owned());
+        }
+    }
+    Ok(writer_index)
 }
 
 fn validate_handler_slot_replay(pass: &PassEvidence, source: TerminalSource) -> Result<(), String> {
@@ -1240,6 +1660,364 @@ fn derive_handler_writer_source(
         source_context_address,
         source_value,
     }))
+}
+
+fn derive_source_context_producer(
+    pass: &PassEvidence,
+    source: HandlerWriterSource,
+    source_read_index: usize,
+) -> Result<SourceContextProducer, String> {
+    let writer = pass.watch_hits[..source_read_index]
+        .iter()
+        .rfind(|entry| {
+            entry.hit.is_write
+                && access_overlaps(
+                    entry.hit.address,
+                    entry.hit.size,
+                    source.source_context_address,
+                    8,
+                )
+        })
+        .ok_or_else(|| {
+            "source-context watch captured no writer before its selected read".to_owned()
+        })?;
+    if writer.hit.address != source.source_context_address
+        || writer.hit.size != 8
+        || writer.hit.value != Some(source.source_value)
+        || writer.instruction != "mov [rcx],r15"
+        || register_value(&writer.hit.registers, RegisterX86::RCX)
+            != Some(source.source_context_address)
+        || register_value(&writer.hit.registers, RegisterX86::R15) != Some(source.source_value)
+    {
+        return Err(format!(
+            "source context's last writer has an unmodeled shape: {writer:?}"
+        ));
+    }
+    let rsp = register_value(&writer.hit.registers, RegisterX86::RSP)
+        .ok_or_else(|| "source-context writer snapshot is missing RSP".to_owned())?;
+    let stack_cell = rsp.checked_sub(8).ok_or_else(|| {
+        format!("source-context writer RSP cannot identify a prior pop: 0x{rsp:016x}")
+    })?;
+    Ok(SourceContextProducer {
+        writer_rip: writer.hit.rip,
+        writer_global_instruction_index: writer.hit.global_instruction_index,
+        context_address: source.source_context_address,
+        value: source.source_value,
+        stack_cell,
+    })
+}
+
+fn validate_source_stack_edge(
+    pass: &PassEvidence,
+    source: SourceContextProducer,
+) -> Result<StackCellProducer, String> {
+    let context_writer_index = pass.watch_hits.iter().rposition(|entry| {
+        entry.hit.is_write
+            && entry.hit.address == source.context_address
+            && entry.hit.size == 8
+            && entry.hit.value == Some(source.value)
+            && entry.hit.rip == source.writer_rip
+            && entry.hit.global_instruction_index == source.writer_global_instruction_index
+            && entry.instruction == "mov [rcx],r15"
+            && register_value(&entry.hit.registers, RegisterX86::RCX)
+                == Some(source.context_address)
+            && register_value(&entry.hit.registers, RegisterX86::R15) == Some(source.value)
+    });
+    let Some(context_writer_index) = context_writer_index else {
+        return Err("source stack replay did not capture the context writer".to_owned());
+    };
+    let pop_index = pass.watch_hits[..context_writer_index]
+        .iter()
+        .rposition(|entry| {
+            !entry.hit.is_write
+                && entry.hit.address == source.stack_cell
+                && entry.hit.size == 8
+                && entry.hit.value == Some(source.value)
+                && entry.instruction == "pop r15"
+                && register_value(&entry.hit.registers, RegisterX86::RSP) == Some(source.stack_cell)
+        });
+    let Some(pop_index) = pop_index else {
+        return Err("source stack replay did not capture the pop into R15".to_owned());
+    };
+    let pop = &pass.watch_hits[pop_index];
+    let context_writer = &pass.watch_hits[context_writer_index];
+    if pop.hit.global_instruction_index.checked_add(1)
+        != Some(context_writer.hit.global_instruction_index)
+        || pop
+            .fallthrough
+            .get(1)
+            .map(|(address, instruction)| (*address, instruction.as_str()))
+            != Some((context_writer.hit.rip, context_writer.instruction.as_str()))
+    {
+        return Err("pop into R15 does not flow directly into the context writer".to_owned());
+    }
+    let expected_writer_rsp = source
+        .stack_cell
+        .checked_add(8)
+        .ok_or_else(|| "source stack-cell pop overflows RSP".to_owned())?;
+    if register_value(&context_writer.hit.registers, RegisterX86::RSP) != Some(expected_writer_rsp)
+    {
+        return Err("source context writer RSP does not reflect one consumed qword".to_owned());
+    }
+
+    let stack_writer = pass.watch_hits[..pop_index]
+        .iter()
+        .rfind(|entry| {
+            entry.hit.is_write
+                && access_overlaps(entry.hit.address, entry.hit.size, source.stack_cell, 8)
+        })
+        .ok_or_else(|| "source stack replay captured no prior stack-cell writer".to_owned())?;
+    if stack_writer.hit.address != source.stack_cell
+        || stack_writer.hit.size != 8
+        || stack_writer.hit.value != Some(source.value)
+        || stack_writer.instruction != "pop qword [rsp+80h]"
+    {
+        return Err(format!(
+            "source stack cell's last writer has an unmodeled shape: {stack_writer:?}"
+        ));
+    }
+    let source_cell = register_value(&stack_writer.hit.registers, RegisterX86::RSP)
+        .ok_or_else(|| "stack-cell writer snapshot is missing RSP".to_owned())?;
+    Ok(StackCellProducer {
+        writer_rip: stack_writer.hit.rip,
+        writer_global_instruction_index: stack_writer.hit.global_instruction_index,
+        destination_cell: source.stack_cell,
+        value: source.value,
+        source_cell,
+    })
+}
+
+fn validate_stack_value_from_rax(
+    hits: &[FormattedWatchHit],
+    producer: StackCellProducer,
+) -> Result<RaxStackProducer, String> {
+    let global = producer.writer_global_instruction_index;
+    let final_read_index = hits.iter().position(|entry| {
+        !entry.hit.is_write
+            && entry.hit.global_instruction_index == global
+            && entry.hit.rip == producer.writer_rip
+            && entry.hit.address == producer.source_cell
+            && entry.hit.size == 8
+            && entry.hit.value == Some(producer.value)
+    });
+    let Some(final_read_index) = final_read_index else {
+        return Err("upstream replay did not capture the selected stack-transfer read".to_owned());
+    };
+    let final_write_index = hits.iter().position(|entry| {
+        entry.hit.is_write
+            && entry.hit.global_instruction_index == global
+            && entry.hit.rip == producer.writer_rip
+            && entry.hit.address == producer.destination_cell
+            && entry.hit.size == 8
+            && entry.hit.value == Some(producer.value)
+    });
+    let Some(final_write_index) = final_write_index else {
+        return Err("upstream replay did not capture the selected stack-transfer write".to_owned());
+    };
+    if final_read_index >= final_write_index {
+        return Err("stack-transfer write was not observed after its source read".to_owned());
+    }
+    let final_read = &hits[final_read_index];
+    let final_write = &hits[final_write_index];
+    if final_read.instruction != final_write.instruction
+        || final_read.hit.registers != final_write.hit.registers
+    {
+        return Err("stack-transfer read/write halves have divergent instruction state".to_owned());
+    }
+    let displacement = parse_pop_rsp_displacement(&final_read.instruction).ok_or_else(|| {
+        format!(
+            "stack transfer is not a modeled qword pop through RSP: {}",
+            final_read.instruction
+        )
+    })?;
+    let expected_destination = producer
+        .source_cell
+        .checked_add(8)
+        .and_then(|rsp_after_pop| rsp_after_pop.checked_add(displacement))
+        .ok_or_else(|| "stack-transfer destination arithmetic overflows".to_owned())?;
+    if expected_destination != producer.destination_cell {
+        return Err(format!(
+            "stack-transfer destination does not match post-pop RSP plus displacement: expected 0x{expected_destination:016x}, got 0x{:016x}",
+            producer.destination_cell
+        ));
+    }
+    for register in [RegisterX86::RAX, RegisterX86::R8] {
+        if register_value(&final_read.hit.registers, register) != Some(producer.value) {
+            return Err(format!(
+                "stack-transfer snapshot does not carry the selected value in {register:?}"
+            ));
+        }
+    }
+    if register_value(&final_read.hit.registers, RegisterX86::RSP) != Some(producer.source_cell) {
+        return Err("stack-transfer snapshot RSP does not identify its source cell".to_owned());
+    }
+
+    let source_write_index = hits[..final_read_index]
+        .iter()
+        .rposition(|entry| {
+            entry.hit.is_write
+                && access_overlaps(entry.hit.address, entry.hit.size, producer.source_cell, 8)
+        })
+        .ok_or_else(|| "upstream replay captured no write to the transfer source".to_owned())?;
+    let source_write = &hits[source_write_index];
+    if source_write.hit.global_instruction_index.checked_add(1) != Some(global)
+        || source_write.hit.address != producer.source_cell
+        || source_write.hit.size != 8
+        || source_write.hit.value != Some(producer.value)
+        || source_write.instruction != "mov [rsp],r8"
+        || register_value(&source_write.hit.registers, RegisterX86::RSP)
+            != Some(producer.source_cell)
+        || register_value(&source_write.hit.registers, RegisterX86::RAX) != Some(producer.value)
+        || register_value(&source_write.hit.registers, RegisterX86::R8) != Some(producer.value)
+        || source_write
+            .fallthrough
+            .get(1)
+            .map(|(rip, instruction)| (*rip, instruction.as_str()))
+            != Some((producer.writer_rip, final_read.instruction.as_str()))
+    {
+        return Err(format!(
+            "stack-transfer source writer has an unmodeled shape: {source_write:?}"
+        ));
+    }
+
+    let immediate_push_index = hits[..source_write_index]
+        .iter()
+        .rposition(|entry| {
+            entry.hit.is_write
+                && access_overlaps(entry.hit.address, entry.hit.size, producer.source_cell, 8)
+        })
+        .ok_or_else(|| {
+            "upstream replay captured no scaffolding push before the source writer".to_owned()
+        })?;
+    let immediate_push = &hits[immediate_push_index];
+    let pre_push_rsp = producer
+        .source_cell
+        .checked_add(8)
+        .ok_or_else(|| "scaffolding push RSP overflows".to_owned())?;
+    if immediate_push.hit.global_instruction_index.checked_add(2) != Some(global)
+        || immediate_push.hit.address != producer.source_cell
+        || immediate_push.hit.size != 8
+        || !immediate_push.instruction.starts_with("push ")
+        || immediate_push.instruction == "push r8"
+        || register_value(&immediate_push.hit.registers, RegisterX86::RSP) != Some(pre_push_rsp)
+        || register_value(&immediate_push.hit.registers, RegisterX86::RAX) != Some(producer.value)
+        || register_value(&immediate_push.hit.registers, RegisterX86::R8) != Some(producer.value)
+    {
+        return Err(format!(
+            "stack-transfer scaffolding push has an unmodeled shape: {immediate_push:?}"
+        ));
+    }
+    let immediate_path = immediate_push
+        .fallthrough
+        .get(..3)
+        .ok_or_else(|| "scaffolding push has an incomplete frozen fallthrough".to_owned())?;
+    if immediate_path[0].0 != immediate_push.hit.rip
+        || immediate_path[0].1 != immediate_push.instruction
+        || immediate_path[1] != (source_write.hit.rip, source_write.instruction.clone())
+        || immediate_path[2] != (producer.writer_rip, final_read.instruction.clone())
+    {
+        return Err(
+            "scaffolding push does not flow through the selected stack transfer".to_owned(),
+        );
+    }
+
+    let preserve_read_index = hits[..immediate_push_index]
+        .iter()
+        .rposition(|entry| {
+            !entry.hit.is_write
+                && access_overlaps(entry.hit.address, entry.hit.size, producer.source_cell, 8)
+        })
+        .ok_or_else(|| "upstream replay captured no R8-preservation pop".to_owned())?;
+    let preserve_read = &hits[preserve_read_index];
+    let preserve_write_index = hits[..preserve_read_index]
+        .iter()
+        .rposition(|entry| {
+            entry.hit.is_write
+                && access_overlaps(entry.hit.address, entry.hit.size, producer.source_cell, 8)
+        })
+        .ok_or_else(|| "upstream replay captured no R8-preservation push".to_owned())?;
+    let preserve_write = &hits[preserve_write_index];
+    if preserve_write.hit.global_instruction_index.checked_add(5) != Some(global)
+        || preserve_read.hit.global_instruction_index.checked_add(4) != Some(global)
+        || preserve_write.hit.address != producer.source_cell
+        || preserve_write.hit.size != 8
+        || preserve_write.instruction != "push r8"
+        || register_value(&preserve_write.hit.registers, RegisterX86::RSP) != Some(pre_push_rsp)
+        || register_value(&preserve_write.hit.registers, RegisterX86::RAX) != Some(producer.value)
+        || preserve_write.hit.value
+            != register_value(&preserve_write.hit.registers, RegisterX86::R8)
+        || preserve_read.hit.address != producer.source_cell
+        || preserve_read.hit.size != 8
+        || preserve_read.instruction != "pop qword [rsp]"
+        || preserve_read.hit.value != preserve_write.hit.value
+        || register_value(&preserve_read.hit.registers, RegisterX86::RSP)
+            != Some(producer.source_cell)
+        || register_value(&preserve_read.hit.registers, RegisterX86::RAX) != Some(producer.value)
+    {
+        return Err("R8 preservation around the RAX transfer has an unmodeled shape".to_owned());
+    }
+    let preserve_path = preserve_write
+        .fallthrough
+        .get(..4)
+        .ok_or_else(|| "R8-preservation push has an incomplete frozen fallthrough".to_owned())?;
+    if preserve_path[0] != (preserve_write.hit.rip, "push r8".to_owned())
+        || preserve_path[1] != (preserve_read.hit.rip, "pop qword [rsp]".to_owned())
+        || preserve_path[2].1 != "mov r8,rax"
+        || preserve_path[3].0 != immediate_push.hit.rip
+        || preserve_path[3].1 != immediate_push.instruction
+    {
+        return Err("frozen path does not carry RAX through R8 into the stack transfer".to_owned());
+    }
+
+    let expected_writes = [
+        (
+            preserve_write.hit.global_instruction_index,
+            producer.source_cell,
+        ),
+        (
+            immediate_push.hit.global_instruction_index,
+            producer.source_cell,
+        ),
+        (
+            source_write.hit.global_instruction_index,
+            producer.source_cell,
+        ),
+        (global, producer.destination_cell),
+    ];
+    let observed_writes = hits
+        .iter()
+        .filter(|entry| {
+            entry.hit.is_write
+                && (preserve_write.hit.global_instruction_index..=global)
+                    .contains(&entry.hit.global_instruction_index)
+                && (access_overlaps(entry.hit.address, entry.hit.size, producer.source_cell, 8)
+                    || access_overlaps(
+                        entry.hit.address,
+                        entry.hit.size,
+                        producer.destination_cell,
+                        8,
+                    ))
+        })
+        .map(|entry| (entry.hit.global_instruction_index, entry.hit.address))
+        .collect::<Vec<_>>();
+    if observed_writes != expected_writes {
+        return Err(format!(
+            "stack-transfer path contains conflicting watched writes: {observed_writes:?}"
+        ));
+    }
+
+    Ok(RaxStackProducer {
+        path_start_rip: preserve_write.hit.rip,
+        path_start_global_instruction_index: preserve_write.hit.global_instruction_index,
+        value: producer.value,
+    })
+}
+
+fn parse_pop_rsp_displacement(instruction: &str) -> Option<u64> {
+    let digits = instruction
+        .strip_prefix("pop qword [rsp+")?
+        .strip_suffix("h]")?;
+    u64::from_str_radix(digits, 16).ok()
 }
 
 fn validated_source_edge_indices(
@@ -1471,16 +2249,127 @@ fn fnv1a_update(mut digest: u64, bytes: &[u8]) -> u64 {
     digest
 }
 
+fn print_indirect_call_frontier_summary(
+    config: &Config,
+    image: &PeImage,
+    first: &PassEvidence,
+    whole_run: &PassEvidence,
+    writer_index: Option<usize>,
+) {
+    let TerminalTransfer::IndirectCall {
+        instruction_address,
+        pointer_cell,
+        pushed_return_address,
+    } = first.terminal_transfer
+    else {
+        unreachable!("indirect-call summary requires an indirect-call terminal");
+    };
+    println!("image:                 {:?}", config.path);
+    println!("image_base:            0x{:016x}", image.image_base);
+    println!("entry_va:              0x{:016x}", image.entry_point_va());
+    println!("main_per_leg_cap:      {}", config.main_per_leg_cap);
+    println!("child_per_leg_cap:     {}", config.child_per_leg_cap);
+    println!("watch_hit_cap:         {}", config.watch_hit_cap);
+    println!("main_prefix_calls:     {}", first.main_handled.len());
+    println!("main_pending_api:      Sleep");
+    println!("thread_id:             {}", first.thread_id);
+    println!(
+        "thread_start:          0x{:016x}",
+        first.thread.start_address
+    );
+    println!("thread_parameter:      0x{:016x}", first.thread.parameter);
+    println!("child_entry_rsp:       0x{:016x}", first.entry_rsp);
+    println!("child_prefix_apis:     {:?}", first.child_prefix_handled);
+    println!("child_tail_apis:       {:?}", first.child_tail_handled);
+    println!("child_terminal:        {:?}", first.terminal);
+    println!("terminal_transfer:     indirect qword call");
+    println!("terminal_instruction:  0x{instruction_address:016x}");
+    println!("terminal_pointer_cell: 0x{pointer_cell:016x}");
+    println!("terminal_value:        0x{:016x}", first.terminal_value);
+    println!("pushed_return_address: 0x{pushed_return_address:016x}");
+    for (label, register) in [
+        ("terminal_rax", RegisterX86::RAX),
+        ("terminal_rcx", RegisterX86::RCX),
+        ("terminal_rdx", RegisterX86::RDX),
+        ("terminal_r8", RegisterX86::R8),
+        ("terminal_r9", RegisterX86::R9),
+        ("terminal_rdi", RegisterX86::RDI),
+        ("terminal_rsp", RegisterX86::RSP),
+        ("terminal_rip", RegisterX86::RIP),
+    ] {
+        if let Some(value) = register_value(&first.terminal_registers, register) {
+            println!("{label:<22} 0x{value:016x}");
+        }
+    }
+    println!("child_rips:            {}", first.child_rips.len());
+    println!(
+        "child_digest:          0x{:016x}",
+        trace_digest(&first.child_rips)
+    );
+    println!("post_time_rips:        {}", first.post_time_rips.len());
+    println!(
+        "post_time_digest:      0x{:016x}",
+        trace_digest(&first.post_time_rips)
+    );
+    println!("main_stack_unchanged:  {}", first.main_stack_unchanged);
+    println!("main_teb_unchanged:    {}", first.main_teb_unchanged);
+    println!("main_cpu_restored:     {}", first.main_cpu_restored);
+    println!("main_sleep_rips:       {}", first.main_sleep_rips.len());
+    println!(
+        "main_sleep_digest:     0x{:016x}",
+        trace_digest(&first.main_sleep_rips)
+    );
+    println!("terminal tail:");
+    for entry in &first.tail_instructions {
+        println!("  0x{:016x}: {}", entry.address, entry.instruction);
+    }
+    print_watch_hits(
+        "whole-run indirect-call pointer watch hits",
+        &whole_run.watch_hits,
+    );
+    match writer_index.map(|index| &whole_run.watch_hits[index]) {
+        Some(writer) => {
+            println!("last_guest_writer:     0x{:016x}", writer.hit.rip);
+            println!(
+                "last_writer_global:     {}",
+                writer.hit.global_instruction_index
+            );
+            println!(
+                "last_writer_value:      {}",
+                format_optional_value(writer.hit.value)
+            );
+            println!("last_writer_insn:       {}", writer.instruction);
+        }
+        None => println!("last_guest_writer:     <none observed after watch arming>"),
+    }
+    println!(
+        "pointer_cell_writes:   {}",
+        whole_run
+            .watch_hits
+            .iter()
+            .filter(|entry| entry.hit.is_write)
+            .count()
+    );
+    println!(
+        "pointer_cell_reads:    {}",
+        whole_run
+            .watch_hits
+            .iter()
+            .filter(|entry| !entry.hit.is_write)
+            .count()
+    );
+    println!("whole_run_watch:       true");
+    println!("replays_identical:     true");
+}
+
 fn print_summary(
     config: &Config,
     image: &PeImage,
     first: &PassEvidence,
-    terminal_watch: &PassEvidence,
-    handler_writer: HandlerWriterSource,
-    handler_watch: &PassEvidence,
-    source_watch: &PassEvidence,
+    evidence: &SummaryEvidence<'_>,
 ) {
-    let source = terminal_watch
+    let source = evidence
+        .terminal_watch
         .terminal_source
         .expect("terminal source was validated before summary output");
     println!("image:                 {:?}", config.path);
@@ -1506,6 +2395,20 @@ fn print_summary(
     );
     println!("child_tail_apis:       {:?}", first.child_tail_handled);
     println!("child_terminal:        {:?}", first.terminal);
+    println!("terminal_transfer:     {:?}", first.terminal_transfer);
+    for (label, register) in [
+        ("terminal_rax", RegisterX86::RAX),
+        ("terminal_rcx", RegisterX86::RCX),
+        ("terminal_rdx", RegisterX86::RDX),
+        ("terminal_r8", RegisterX86::R8),
+        ("terminal_r9", RegisterX86::R9),
+        ("terminal_rsp", RegisterX86::RSP),
+        ("terminal_rip", RegisterX86::RIP),
+    ] {
+        if let Some(value) = register_value(&first.terminal_registers, register) {
+            println!("{label:<22} 0x{value:016x}");
+        }
+    }
     println!("terminal_cell:         0x{:016x}", first.terminal_cell);
     println!("terminal_value:        0x{:016x}", first.terminal_value);
     println!("terminal_writer:       0x{:016x}", source.writer_rip);
@@ -1517,23 +2420,59 @@ fn print_summary(
     println!("handler_value:         0x{:016x}", source.handler_value);
     println!(
         "handler_last_writer:   0x{:016x}",
-        handler_writer.writer_rip
+        evidence.handler_writer.writer_rip
     );
     println!(
         "handler_writer_global: {}",
-        handler_writer.writer_global_instruction_index
+        evidence.handler_writer.writer_global_instruction_index
     );
     println!(
         "source_selector:       0x{:04x}",
-        handler_writer.source_selector
+        evidence.handler_writer.source_selector
     );
     println!(
         "source_context:        0x{:016x}",
-        handler_writer.source_context_address
+        evidence.handler_writer.source_context_address
     );
     println!(
         "source_value:          0x{:016x}",
-        handler_writer.source_value
+        evidence.handler_writer.source_value
+    );
+    println!(
+        "source_last_writer:    0x{:016x}",
+        evidence.source_producer.writer_rip
+    );
+    println!(
+        "source_writer_global:  {}",
+        evidence.source_producer.writer_global_instruction_index
+    );
+    println!(
+        "source_stack_cell:     0x{:016x}",
+        evidence.source_producer.stack_cell
+    );
+    println!(
+        "stack_last_writer:     0x{:016x}",
+        evidence.stack_producer.writer_rip
+    );
+    println!(
+        "stack_writer_global:   {}",
+        evidence.stack_producer.writer_global_instruction_index
+    );
+    println!(
+        "upstream_stack_cell:   0x{:016x}",
+        evidence.stack_producer.source_cell
+    );
+    println!(
+        "rax_path_start:        0x{:016x}",
+        evidence.rax_producer.path_start_rip
+    );
+    println!(
+        "rax_path_global:       {}",
+        evidence.rax_producer.path_start_global_instruction_index
+    );
+    println!(
+        "rax_path_value:        0x{:016x}",
+        evidence.rax_producer.value
     );
     println!("child_rips:            {}", first.child_rips.len());
     println!(
@@ -1559,13 +2498,18 @@ fn print_summary(
         println!("  0x{:016x}: {}", entry.address, entry.instruction);
     }
 
-    print_watch_hits("terminal-cell watch hits", &terminal_watch.watch_hits);
-    let terminal_writes = terminal_watch
+    print_watch_hits(
+        "terminal-cell watch hits",
+        &evidence.terminal_watch.watch_hits,
+    );
+    let terminal_writes = evidence
+        .terminal_watch
         .watch_hits
         .iter()
         .filter(|entry| entry.hit.is_write)
         .count();
-    let terminal_reads = terminal_watch
+    let terminal_reads = evidence
+        .terminal_watch
         .watch_hits
         .iter()
         .filter(|entry| !entry.hit.is_write)
@@ -1575,21 +2519,23 @@ fn print_summary(
 
     print_watch_hits(
         "handler-slot whole-run watch hits",
-        &handler_watch.watch_hits,
+        &evidence.handler_watch.watch_hits,
     );
-    let handler_writes = handler_watch
+    let handler_writes = evidence
+        .handler_watch
         .watch_hits
         .iter()
         .filter(|entry| entry.hit.is_write)
         .count();
-    let handler_reads = handler_watch
+    let handler_reads = evidence
+        .handler_watch
         .watch_hits
         .iter()
         .filter(|entry| !entry.hit.is_write)
         .count();
     println!("handler_slot_writes:   {handler_writes}");
     println!("handler_slot_reads:    {handler_reads}");
-    if let Some(writer) = last_write_before_terminal_read(handler_watch, source) {
+    if let Some(writer) = last_write_before_terminal_read(evidence.handler_watch, source) {
         println!("handler_watch_writer:  0x{:016x}", writer.hit.rip);
         println!(
             "handler_watch_value:   {}",
@@ -1598,17 +2544,112 @@ fn print_summary(
     } else {
         println!("handler_watch_writer:  <none observed>");
     }
-    let source_edge_indices = validated_source_edge_indices(source_watch, source, handler_writer)
-        .expect("source edge was validated before summary output");
+    let source_edge_indices =
+        validated_source_edge_indices(evidence.source_watch, source, evidence.handler_writer)
+            .expect("source edge was validated before summary output");
     let source_edge_hits = source_edge_indices
         .into_iter()
-        .map(|index| source_watch.watch_hits[index].clone())
+        .map(|index| evidence.source_watch.watch_hits[index].clone())
         .collect::<Vec<_>>();
     print_watch_hits(
         "source-edge dynamically rearmed watch hits",
         &source_edge_hits,
     );
-    println!("source_watch_retained:  {}", source_watch.watch_hits.len());
+    let stack_edge_hits = evidence
+        .stack_watch
+        .watch_hits
+        .iter()
+        .filter(|entry| {
+            entry.hit.global_instruction_index
+                >= evidence
+                    .source_producer
+                    .writer_global_instruction_index
+                    .saturating_sub(16)
+                && entry.hit.global_instruction_index
+                    <= evidence.source_producer.writer_global_instruction_index
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    print_watch_hits("source stack-edge watch hits", &stack_edge_hits);
+    let source_pop_index = evidence.stack_watch.watch_hits.iter().rposition(|entry| {
+        !entry.hit.is_write
+            && entry.hit.address == evidence.source_producer.stack_cell
+            && entry.hit.size == 8
+            && entry.hit.value == Some(evidence.source_producer.value)
+            && entry.instruction == "pop r15"
+            && entry.hit.global_instruction_index + 1
+                == evidence.source_producer.writer_global_instruction_index
+    });
+    if let Some(source_pop_index) = source_pop_index {
+        let stack_cell_writer = evidence.stack_watch.watch_hits[..source_pop_index]
+            .iter()
+            .rfind(|entry| {
+                entry.hit.is_write
+                    && access_overlaps(
+                        entry.hit.address,
+                        entry.hit.size,
+                        evidence.source_producer.stack_cell,
+                        8,
+                    )
+            })
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        print_watch_hits("source stack-cell last writer", &stack_cell_writer);
+    }
+    println!(
+        "stack_watch_retained:   {}",
+        evidence.stack_watch.watch_hits.len()
+    );
+    let upstream_edge_hits = evidence
+        .upstream_stack_watch
+        .watch_hits
+        .iter()
+        .filter(|entry| {
+            entry.hit.global_instruction_index
+                == evidence.stack_producer.writer_global_instruction_index
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    print_watch_hits("upstream stack-edge watch hits", &upstream_edge_hits);
+    if let Some(source_read_index) =
+        evidence
+            .upstream_stack_watch
+            .watch_hits
+            .iter()
+            .rposition(|entry| {
+                !entry.hit.is_write
+                    && entry.hit.address == evidence.stack_producer.source_cell
+                    && entry.hit.size == 8
+                    && entry.hit.value == Some(evidence.stack_producer.value)
+                    && entry.hit.global_instruction_index
+                        == evidence.stack_producer.writer_global_instruction_index
+            })
+    {
+        let upstream_writer = evidence.upstream_stack_watch.watch_hits[..source_read_index]
+            .iter()
+            .rfind(|entry| {
+                entry.hit.is_write
+                    && access_overlaps(
+                        entry.hit.address,
+                        entry.hit.size,
+                        evidence.stack_producer.source_cell,
+                        8,
+                    )
+            })
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        print_watch_hits("upstream stack-cell last writer", &upstream_writer);
+    }
+    println!(
+        "upstream_watch_retained: {}",
+        evidence.upstream_stack_watch.watch_hits.len()
+    );
+    println!(
+        "source_watch_retained:  {}",
+        evidence.source_watch.watch_hits.len()
+    );
     println!("replays_identical:     true");
 }
 
@@ -1710,6 +2751,30 @@ mod tests {
     }
 
     #[test]
+    fn watch_hit_formatting_requires_hook_time_code_bytes() {
+        let hit = PersistentWatchHit {
+            global_instruction_index: 7,
+            is_write: true,
+            address: 0x2000,
+            size: 8,
+            rip: 0x1000,
+            value: Some(0),
+            registers: Vec::new(),
+            code_window: vec![0x90, 0xc3],
+        };
+        let formatted = format_watch_hits(vec![hit.clone()]).unwrap();
+        assert_eq!(formatted[0].instruction, "nop");
+        assert_eq!(
+            formatted[0].fallthrough,
+            vec![(0x1000, "nop".to_owned()), (0x1001, "ret".to_owned())]
+        );
+
+        let mut missing = hit;
+        missing.code_window.clear();
+        assert!(format_watch_hits(vec![missing]).is_err());
+    }
+
+    #[test]
     fn plain_ret_reaches_sentinel_and_nonzero_cleanup_is_rejected() {
         const RET_BASE: u64 = 0x0000_0000_0100_0000;
         const RET_GUARD_BASE: u64 = RET_BASE + 0x1000;
@@ -1749,12 +2814,43 @@ mod tests {
         require_terminal_ret(&emu, &rips).unwrap();
 
         let consumed_cell = terminal_cell(final_rsp).unwrap();
+        assert_eq!(
+            derive_terminal_transfer(
+                &emu,
+                &rips,
+                final_rsp,
+                &read_cpu_state(&emu).unwrap(),
+                &emu.recent_instructions(),
+            )
+            .unwrap(),
+            (
+                TerminalTransfer::NearReturn {
+                    instruction_address: RET_BASE,
+                },
+                consumed_cell,
+            )
+        );
         assert_eq!(consumed_cell, rsp);
         let consumed_value = read_u64(&emu, consumed_cell).unwrap();
         assert_eq!(consumed_value, CHILD_RETURN_SENTINEL);
         assert_eq!(
             classify_terminal(&result, final_rip, consumed_value).unwrap(),
             ChildTerminal::ReturnSentinel
+        );
+
+        let named_stub = 0x0000_7fff_0010_1000;
+        let named = TrapRun {
+            handled: vec!["timeGetTime".to_owned()],
+            stop: TrapStop::UnhandledApi {
+                name: "ObservedName".to_owned(),
+                rva: 0x1000,
+            },
+        };
+        assert_eq!(
+            classify_terminal(&named, named_stub, named_stub).unwrap(),
+            ChildTerminal::UnhandledApi {
+                name: "ObservedName".to_owned(),
+            }
         );
 
         let mut return_guards = Emu::new().unwrap();
@@ -1788,6 +2884,241 @@ mod tests {
     }
 
     #[test]
+    fn indirect_call_terminal_derives_pointer_and_pushed_return() {
+        const CALL_BASE: u64 = 0x0000_0000_0102_0000;
+        const CALL_DISPLACEMENT: u64 = 0x108;
+        let rdi = STACK_BASE + 0x6000;
+        let pointer_cell = rdi + CALL_DISPLACEMENT;
+        let initial_rsp = STACK_BASE + 0x8000;
+        let image = PeImage {
+            image_base: CALL_BASE,
+            entry_point_rva: 0,
+            size_of_headers: 0,
+            size_of_image: 0x1000,
+            subsystem: 3,
+            sections: Vec::new(),
+        };
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(
+            CALL_BASE,
+            &[
+                0xff, 0x97, 0x08, 0x01, 0x00, 0x00, // call qword [rdi+108h]
+            ],
+        )
+        .unwrap();
+        emu.write_mem(pointer_cell, &0u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RDI, rdi).unwrap();
+        emu.write_reg(RegisterX86::RSP, initial_rsp).unwrap();
+        emu.configure_persistent_watch(&[(pointer_cell, pointer_cell + 8)], 8)
+            .unwrap();
+        emu.install_code_trace_hook().unwrap();
+
+        let mut env = Win64Env::new(CALL_BASE);
+        let result = run_with_import_trap(&mut env, &mut emu, &image, CALL_BASE, 16, 1).unwrap();
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
+        let final_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        assert_eq!(final_rsp, initial_rsp - 8);
+        assert_eq!(read_u64(&emu, final_rsp).unwrap(), CALL_BASE + 6);
+        let rips = emu.executed_addresses();
+        let terminal_registers = read_cpu_state(&emu).unwrap();
+        let frozen_tail = emu.recent_instructions();
+        let (transfer, source_cell) =
+            derive_terminal_transfer(&emu, &rips, final_rsp, &terminal_registers, &frozen_tail)
+                .unwrap();
+        assert_eq!(
+            transfer,
+            TerminalTransfer::IndirectCall {
+                instruction_address: CALL_BASE,
+                pointer_cell,
+                pushed_return_address: CALL_BASE + 6,
+            }
+        );
+        assert_eq!(source_cell, pointer_cell);
+        assert_eq!(
+            classify_terminal(&result, 0, read_u64(&emu, source_cell).unwrap()).unwrap(),
+            ChildTerminal::NullControlTransfer
+        );
+        let hits = emu.persistent_watch_hits();
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].is_write);
+        assert_eq!(hits[0].address, pointer_cell);
+        assert_eq!(hits[0].size, 8);
+        assert_eq!(hits[0].value, Some(0));
+        assert_eq!(hits[0].rip, CALL_BASE);
+        assert_eq!(
+            register_value(&hits[0].registers, RegisterX86::RSP),
+            Some(initial_rsp)
+        );
+
+        emu.write_mem(final_rsp, &0u64.to_le_bytes()).unwrap();
+        assert!(derive_terminal_transfer(
+            &emu,
+            &rips,
+            final_rsp,
+            &terminal_registers,
+            &frozen_tail,
+        )
+        .is_err());
+
+        let register_call_base = CALL_BASE + 0x1000;
+        let mut register_call = Emu::new().unwrap();
+        register_call
+            .map_code(register_call_base, &[0xff, 0xd7])
+            .unwrap();
+        let register_frozen = [FrozenInstruction {
+            global_instruction_index: 1,
+            address: register_call_base,
+            bytes: vec![0xff, 0xd7],
+        }];
+        assert!(derive_terminal_transfer(
+            &register_call,
+            &[register_call_base],
+            initial_rsp,
+            &terminal_registers,
+            &register_frozen,
+        )
+        .is_err());
+
+        let disp8_call = [FrozenInstruction {
+            global_instruction_index: 1,
+            address: register_call_base,
+            bytes: vec![0xff, 0x57, 0x08],
+        }];
+        assert!(derive_terminal_transfer(
+            &register_call,
+            &[register_call_base],
+            initial_rsp,
+            &terminal_registers,
+            &disp8_call,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn indirect_call_frontier_validator_rejects_mutated_observations() {
+        const INSTRUCTION: u64 = 0x1000;
+        const POINTER_CELL: u64 = 0x2000;
+        const FINAL_RSP: u64 = 0x3000;
+        const RDI: u64 = 0x4000;
+        const RETURN_ADDRESS: u64 = INSTRUCTION + 6;
+
+        let writer = FormattedWatchHit {
+            hit: PersistentWatchHit {
+                global_instruction_index: 10,
+                is_write: true,
+                address: POINTER_CELL,
+                size: 8,
+                rip: 0x5000,
+                value: Some(0),
+                registers: Vec::new(),
+                code_window: Vec::new(),
+            },
+            instruction: "mov [r9],rbx".to_owned(),
+            fallthrough: Vec::new(),
+        };
+        let call_read = FormattedWatchHit {
+            hit: PersistentWatchHit {
+                global_instruction_index: 20,
+                is_write: false,
+                address: POINTER_CELL,
+                size: 8,
+                rip: INSTRUCTION,
+                value: Some(0),
+                registers: vec![(RegisterX86::RSP, FINAL_RSP + 8), (RegisterX86::RDI, RDI)],
+                code_window: vec![0xff, 0x97, 0x00, 0xe0, 0xff, 0xff],
+            },
+            instruction: "call qword [rdi+20108h]".to_owned(),
+            fallthrough: Vec::new(),
+        };
+        let terminal = ChildTerminal::NullControlTransfer;
+        let transfer = TerminalTransfer::IndirectCall {
+            instruction_address: INSTRUCTION,
+            pointer_cell: POINTER_CELL,
+            pushed_return_address: RETURN_ADDRESS,
+        };
+        let terminal_registers = vec![(RegisterX86::RSP, FINAL_RSP), (RegisterX86::RDI, RDI)];
+        let validate = |phase, hits: &[FormattedWatchHit], registers| {
+            validate_indirect_call_observation(IndirectCallObservation {
+                transfer,
+                terminal: &terminal,
+                terminal_cell: POINTER_CELL,
+                terminal_value: 0,
+                terminal_source: None,
+                watch_phase: phase,
+                watch_hits: hits,
+                terminal_registers: registers,
+            })
+        };
+
+        let hits = vec![writer.clone(), call_read.clone()];
+        assert_eq!(
+            validate(Some(WatchPhase::BeforeMain), &hits, &terminal_registers).unwrap(),
+            Some(0)
+        );
+        assert!(validate(Some(WatchPhase::BeforeTime), &hits, &terminal_registers).is_err());
+
+        let mut extra_final_access = hits.clone();
+        extra_final_access.push(writer.clone());
+        assert!(validate(
+            Some(WatchPhase::BeforeMain),
+            &extra_final_access,
+            &terminal_registers
+        )
+        .is_err());
+
+        let duplicate_read = vec![writer.clone(), call_read.clone(), call_read.clone()];
+        assert!(validate(
+            Some(WatchPhase::BeforeMain),
+            &duplicate_read,
+            &terminal_registers
+        )
+        .is_err());
+
+        let mut wrong_snapshot = hits.clone();
+        wrong_snapshot[1]
+            .hit
+            .registers
+            .iter_mut()
+            .find(|(register, _value)| *register == RegisterX86::RSP)
+            .unwrap()
+            .1 ^= 8;
+        assert!(validate(
+            Some(WatchPhase::BeforeMain),
+            &wrong_snapshot,
+            &terminal_registers
+        )
+        .is_err());
+
+        let later_writer = FormattedWatchHit {
+            hit: PersistentWatchHit {
+                global_instruction_index: 15,
+                ..writer.hit.clone()
+            },
+            ..writer.clone()
+        };
+        let two_writers = vec![writer, later_writer, call_read];
+        assert_eq!(
+            validate(
+                Some(WatchPhase::BeforeMain),
+                &two_writers,
+                &terminal_registers
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            validate(
+                Some(WatchPhase::BeforeMain),
+                &two_writers[2..],
+                &terminal_registers
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn source_register_path_rejects_unobserved_changes_and_dynamic_gaps() {
         let make_hit = |global_instruction_index, rip, instruction: &str| FormattedWatchHit {
             hit: PersistentWatchHit {
@@ -1798,6 +3129,7 @@ mod tests {
                 rip,
                 value: None,
                 registers: Vec::new(),
+                code_window: Vec::new(),
             },
             instruction: instruction.to_owned(),
             fallthrough: Vec::new(),
@@ -1825,5 +3157,208 @@ mod tests {
         assert!(instruction_writes_r13(&writes_decoder.decode()));
         let mut preserves_decoder = Decoder::new(64, &[0x90], DecoderOptions::NONE);
         assert!(!instruction_writes_r13(&preserves_decoder.decode()));
+    }
+
+    #[test]
+    fn rax_stack_path_validates_data_flow_and_rejects_mutations() {
+        const SOURCE: u64 = 0x1000;
+        const DESTINATION: u64 = SOURCE + 0x88;
+        const VALUE: u64 = 0x1234_5678_9abc_def0;
+        const SAVED_R8: u64 = 0x55aa;
+        const FINAL_GLOBAL: u64 = 105;
+        const FINAL_RIP: u64 = 0x2011;
+
+        let make_hit = |global_instruction_index: u64,
+                        is_write: bool,
+                        address: u64,
+                        rip: u64,
+                        value: u64,
+                        rsp: u64,
+                        rax: u64,
+                        r8: u64,
+                        instruction: &str,
+                        fallthrough: Vec<(u64, &str)>| {
+            FormattedWatchHit {
+                hit: PersistentWatchHit {
+                    global_instruction_index,
+                    is_write,
+                    address,
+                    size: 8,
+                    rip,
+                    value: Some(value),
+                    registers: vec![
+                        (RegisterX86::RSP, rsp),
+                        (RegisterX86::RAX, rax),
+                        (RegisterX86::R8, r8),
+                    ],
+                    code_window: Vec::new(),
+                },
+                instruction: instruction.to_owned(),
+                fallthrough: fallthrough
+                    .into_iter()
+                    .map(|(address, instruction)| (address, instruction.to_owned()))
+                    .collect(),
+            }
+        };
+
+        let hits = vec![
+            make_hit(
+                100,
+                true,
+                SOURCE,
+                0x2000,
+                SAVED_R8,
+                SOURCE + 8,
+                VALUE,
+                SAVED_R8,
+                "push r8",
+                vec![
+                    (0x2000, "push r8"),
+                    (0x2002, "pop qword [rsp]"),
+                    (0x2005, "mov r8,rax"),
+                    (0x2008, "push 12345678h"),
+                ],
+            ),
+            make_hit(
+                101,
+                false,
+                SOURCE,
+                0x2002,
+                SAVED_R8,
+                SOURCE,
+                VALUE,
+                SAVED_R8,
+                "pop qword [rsp]",
+                Vec::new(),
+            ),
+            make_hit(
+                103,
+                true,
+                SOURCE,
+                0x2008,
+                0x1234_5678,
+                SOURCE + 8,
+                VALUE,
+                VALUE,
+                "push 12345678h",
+                vec![
+                    (0x2008, "push 12345678h"),
+                    (0x200d, "mov [rsp],r8"),
+                    (FINAL_RIP, "pop qword [rsp+80h]"),
+                ],
+            ),
+            make_hit(
+                104,
+                true,
+                SOURCE,
+                0x200d,
+                VALUE,
+                SOURCE,
+                VALUE,
+                VALUE,
+                "mov [rsp],r8",
+                vec![(0x200d, "mov [rsp],r8"), (FINAL_RIP, "pop qword [rsp+80h]")],
+            ),
+            make_hit(
+                FINAL_GLOBAL,
+                false,
+                SOURCE,
+                FINAL_RIP,
+                VALUE,
+                SOURCE,
+                VALUE,
+                VALUE,
+                "pop qword [rsp+80h]",
+                vec![(FINAL_RIP, "pop qword [rsp+80h]")],
+            ),
+            make_hit(
+                FINAL_GLOBAL,
+                true,
+                DESTINATION,
+                FINAL_RIP,
+                VALUE,
+                SOURCE,
+                VALUE,
+                VALUE,
+                "pop qword [rsp+80h]",
+                vec![(FINAL_RIP, "pop qword [rsp+80h]")],
+            ),
+        ];
+        let producer = StackCellProducer {
+            writer_rip: FINAL_RIP,
+            writer_global_instruction_index: FINAL_GLOBAL,
+            destination_cell: DESTINATION,
+            value: VALUE,
+            source_cell: SOURCE,
+        };
+
+        assert_eq!(
+            validate_stack_value_from_rax(&hits, producer).unwrap(),
+            RaxStackProducer {
+                path_start_rip: 0x2000,
+                path_start_global_instruction_index: 100,
+                value: VALUE,
+            }
+        );
+
+        let mut randomized_immediate = hits.clone();
+        randomized_immediate[0].fallthrough[3].1 = "push 7F743E4h".to_owned();
+        randomized_immediate[2].instruction = "push 7F743E4h".to_owned();
+        randomized_immediate[2].fallthrough[0].1 = "push 7F743E4h".to_owned();
+        validate_stack_value_from_rax(&randomized_immediate, producer).unwrap();
+
+        let mut wrong_rax = hits.clone();
+        wrong_rax[2]
+            .hit
+            .registers
+            .iter_mut()
+            .find(|(register, _)| *register == RegisterX86::RAX)
+            .unwrap()
+            .1 ^= 1;
+        assert!(validate_stack_value_from_rax(&wrong_rax, producer).is_err());
+
+        let mut wrong_pre_move_rax = hits.clone();
+        for index in [0, 1] {
+            wrong_pre_move_rax[index]
+                .hit
+                .registers
+                .iter_mut()
+                .find(|(register, _)| *register == RegisterX86::RAX)
+                .unwrap()
+                .1 ^= 1;
+        }
+        assert!(validate_stack_value_from_rax(&wrong_pre_move_rax, producer).is_err());
+
+        let mut dynamic_gap = hits.clone();
+        dynamic_gap[3].hit.global_instruction_index -= 1;
+        assert!(validate_stack_value_from_rax(&dynamic_gap, producer).is_err());
+
+        let mut divergent_halves = hits.clone();
+        divergent_halves[5]
+            .hit
+            .registers
+            .iter_mut()
+            .find(|(register, _)| *register == RegisterX86::R8)
+            .unwrap()
+            .1 ^= 1;
+        assert!(validate_stack_value_from_rax(&divergent_halves, producer).is_err());
+
+        let mut conflicting_write = hits.clone();
+        conflicting_write.insert(
+            4,
+            make_hit(
+                104,
+                true,
+                DESTINATION,
+                0x2010,
+                0,
+                SOURCE,
+                VALUE,
+                VALUE,
+                "mov [rsp+88h],rax",
+                Vec::new(),
+            ),
+        );
+        assert!(validate_stack_value_from_rax(&conflicting_write, producer).is_err());
     }
 }

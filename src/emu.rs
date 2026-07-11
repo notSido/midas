@@ -16,6 +16,8 @@ use unicorn_engine::{
 
 const PAGE_SIZE: u64 = 0x1000;
 const RECENT_RIPS_CAP: usize = 64;
+const PERSISTENT_WATCH_CODE_WINDOW_SIZE: usize = 64;
+const PERSISTENT_WATCH_CODE_WINDOW_FALLBACK: usize = 16;
 const REGISTER_SNAPSHOT_ORDER: [RegisterX86; 18] = [
     RegisterX86::RAX,
     RegisterX86::RBX,
@@ -157,6 +159,9 @@ pub enum EmuError {
     #[error("instruction cap {count} is too large for Unicorn's count parameter")]
     InstructionCapTooLarge { count: u64 },
 
+    #[error("global instruction watch range must be nonempty and ordered, got {start}..{end}")]
+    InvalidGlobalInstructionRange { start: u64, end: u64 },
+
     #[error("address range overflows: base 0x{base:016x}, size {size:#x}")]
     AddressRangeOverflow { base: u64, size: u64 },
 
@@ -235,6 +240,16 @@ pub struct WatchHit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenInstruction {
+    pub global_instruction_index: u64,
+    pub address: u64,
+    /// Exact instruction bytes read by the code hook before Unicorn executed
+    /// the instruction. An empty vector means that hook-time memory capture
+    /// failed and consumers must not reconstruct the instruction later.
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentWatchHit {
     pub global_instruction_index: u64,
     pub is_write: bool,
@@ -246,12 +261,18 @@ pub struct PersistentWatchHit {
     /// failed reads have no captured value.
     pub value: Option<u64>,
     pub registers: Vec<(RegisterX86, u64)>,
+    /// A bounded code window frozen at the memory-hook hit. Consumers may
+    /// decode the current instruction and immediate fallthrough from these
+    /// bytes, but must not substitute later guest memory if capture failed.
+    pub code_window: Vec<u8>,
 }
 
 #[derive(Default)]
 struct EmuData {
     executed_addresses: Vec<u64>,
     recent_rips: VecDeque<u64>,
+    recent_instructions: VecDeque<FrozenInstruction>,
+    freeze_recent_instructions: bool,
     instr_count: u64,
     total_instr_count: u64,
     last_fault: Option<MemFault>,
@@ -264,6 +285,7 @@ struct EmuData {
     persistent_watch_ranges: Vec<(u64, u64)>,
     persistent_watch_hits: Vec<PersistentWatchHit>,
     persistent_watch_hit_cap: usize,
+    persistent_watch_global_range: Option<(u64, u64)>,
 }
 
 /// An opaque, reusable snapshot of Unicorn CPU state owned by one [`Emu`].
@@ -651,6 +673,7 @@ impl Emu {
             data.instr_count = 0;
             data.last_fault = None;
             data.recent_rips.clear();
+            data.recent_instructions.clear();
         }
 
         let run_result = if max_instructions == 0 {
@@ -684,6 +707,36 @@ impl Emu {
         ranges: &[(u64, u64)],
         hit_cap: usize,
     ) -> Result<(), EmuError> {
+        self.configure_persistent_watch_inner(ranges, hit_cap, None)
+    }
+
+    /// Configure a persistent memory watch whose retention is additionally
+    /// restricted to a half-open global instruction-index range.
+    ///
+    /// The global index is the same monotonically increasing index recorded in
+    /// [`PersistentWatchHit`]. Reconfiguration replaces all ranges, the index
+    /// filter, and retained hits. The underlying hooks remain installed.
+    pub fn configure_persistent_watch_in_global_range(
+        &mut self,
+        ranges: &[(u64, u64)],
+        hit_cap: usize,
+        global_range: (u64, u64),
+    ) -> Result<(), EmuError> {
+        if global_range.1 <= global_range.0 {
+            return Err(EmuError::InvalidGlobalInstructionRange {
+                start: global_range.0,
+                end: global_range.1,
+            });
+        }
+        self.configure_persistent_watch_inner(ranges, hit_cap, Some(global_range))
+    }
+
+    fn configure_persistent_watch_inner(
+        &mut self,
+        ranges: &[(u64, u64)],
+        hit_cap: usize,
+        global_range: Option<(u64, u64)>,
+    ) -> Result<(), EmuError> {
         self.ensure_observation_hooks()?;
         self.ensure_persistent_watch_hook()?;
 
@@ -692,6 +745,7 @@ impl Emu {
         data.persistent_watch_ranges.extend_from_slice(ranges);
         data.persistent_watch_hits.clear();
         data.persistent_watch_hit_cap = hit_cap;
+        data.persistent_watch_global_range = global_range;
         Ok(())
     }
 
@@ -724,6 +778,7 @@ impl Emu {
             data.instr_count = 0;
             data.last_fault = None;
             data.recent_rips.clear();
+            data.recent_instructions.clear();
             data.watch_ranges.clear();
             data.watch_ranges.extend_from_slice(ranges);
             data.watch_hits.clear();
@@ -805,6 +860,7 @@ impl Emu {
             data.instr_count = 0;
             data.last_fault = None;
             data.recent_rips.clear();
+            data.recent_instructions.clear();
             data.trace_from = max_instructions.saturating_sub(trace_window);
             data.trace_events.clear();
             data.trace_active = false;
@@ -869,7 +925,9 @@ impl Emu {
                 uc.get_data_mut().executed_addresses.push(address);
             })
             .map(|_| ())
-            .map_err(EmuError::Hook)
+            .map_err(EmuError::Hook)?;
+        self.uc.get_data_mut().freeze_recent_instructions = true;
+        Ok(())
     }
 
     pub fn executed_addresses(&self) -> Vec<u64> {
@@ -878,6 +936,17 @@ impl Emu {
 
     pub fn recent_rips(&self) -> Vec<u64> {
         self.uc.get_data().recent_rips.iter().copied().collect()
+    }
+
+    /// Return the bounded tail of instructions frozen before execution after
+    /// [`Emu::install_code_trace_hook`] enabled instruction retention.
+    pub fn recent_instructions(&self) -> Vec<FrozenInstruction> {
+        self.uc
+            .get_data()
+            .recent_instructions
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn build_run_report(
@@ -926,13 +995,27 @@ impl Emu {
         }
 
         self.uc
-            .add_code_hook(0, u64::MAX, |uc, address, _size| {
+            .add_code_hook(0, u64::MAX, |uc, address, size| {
+                let frozen = uc
+                    .get_data()
+                    .freeze_recent_instructions
+                    .then(|| read_code_bytes(uc, address, size as usize));
                 let data = uc.get_data_mut();
                 data.instr_count += 1;
                 data.total_instr_count += 1;
                 data.recent_rips.push_back(address);
                 if data.recent_rips.len() > RECENT_RIPS_CAP {
                     data.recent_rips.pop_front();
+                }
+                if let Some(bytes) = frozen {
+                    data.recent_instructions.push_back(FrozenInstruction {
+                        global_instruction_index: data.total_instr_count,
+                        address,
+                        bytes,
+                    });
+                    if data.recent_instructions.len() > RECENT_RIPS_CAP {
+                        data.recent_instructions.pop_front();
+                    }
                 }
             })
             .map(|_| ())
@@ -978,6 +1061,11 @@ impl Emu {
                     let should_record = {
                         let data = uc.get_data();
                         data.persistent_watch_hits.len() < data.persistent_watch_hit_cap
+                            && data
+                                .persistent_watch_global_range
+                                .is_none_or(|(start, end)| {
+                                    start <= data.total_instr_count && data.total_instr_count < end
+                                })
                             && access_overlaps_ranges(address, size, &data.persistent_watch_ranges)
                     };
                     if !should_record {
@@ -991,6 +1079,7 @@ impl Emu {
                     };
                     let rip = uc.reg_read(RegisterX86::RIP).ok().map_or(0, |value| value);
                     let registers = snapshot_registers(uc);
+                    let code_window = read_code_window(uc, rip);
 
                     let data = uc.get_data_mut();
                     data.persistent_watch_hits.push(PersistentWatchHit {
@@ -1001,6 +1090,7 @@ impl Emu {
                         rip,
                         value,
                         registers,
+                        code_window,
                     });
                     false
                 },
@@ -1015,6 +1105,31 @@ impl Emu {
 
 fn read_hook_value(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> u64 {
     read_hook_value_opt(uc, address, size.min(8)).unwrap_or(0)
+}
+
+fn read_code_bytes(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> Vec<u8> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let mut bytes = vec![0; size];
+    if uc.mem_read(address, &mut bytes).is_ok() {
+        bytes
+    } else {
+        Vec::new()
+    }
+}
+
+fn read_code_window(uc: &Unicorn<'_, EmuData>, address: u64) -> Vec<u8> {
+    for size in [
+        PERSISTENT_WATCH_CODE_WINDOW_SIZE,
+        PERSISTENT_WATCH_CODE_WINDOW_FALLBACK,
+    ] {
+        let bytes = read_code_bytes(uc, address, size);
+        if !bytes.is_empty() {
+            return bytes;
+        }
+    }
+    Vec::new()
 }
 
 fn read_hook_value_opt(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> Option<u64> {
@@ -1862,6 +1977,7 @@ mod tests {
 
         let mut emu = Emu::new().unwrap();
         emu.map_code(CODE_BASE, &shellcode).unwrap();
+        emu.install_code_trace_hook().unwrap();
         let rsp = emu.read_reg(RegisterX86::RSP).unwrap();
         let zero_slot = rsp - 8;
         let value_slot = rsp - 16;
@@ -1911,6 +2027,17 @@ mod tests {
         assert!(all_hits
             .iter()
             .all(|hit| (CODE_BASE..CODE_BASE + shellcode.len() as u64).contains(&hit.rip)));
+        for hit in &all_hits {
+            let offset = usize::try_from(hit.rip - CODE_BASE).unwrap();
+            assert!(!hit.code_window.is_empty());
+            assert_eq!(hit.code_window[0], shellcode[offset]);
+        }
+        let recent_instructions = emu.recent_instructions();
+        assert_eq!(recent_instructions.len(), emu.recent_rips().len());
+        assert!(recent_instructions
+            .iter()
+            .zip(emu.recent_rips())
+            .all(|(instruction, rip)| instruction.address == rip && !instruction.bytes.is_empty()));
 
         emu.clear_persistent_watch_hits();
         assert!(emu.persistent_watch_hits().is_empty());
@@ -1935,6 +2062,55 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert!(hits[0].global_instruction_index < hits[1].global_instruction_index);
         assert!(hits[1].global_instruction_index < hits[2].global_instruction_index);
+    }
+
+    #[test]
+    fn persistent_watch_global_range_filters_across_resume_legs() {
+        let shellcode = persistent_watch_shellcode(0x99, 0x88);
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &shellcode).unwrap();
+        let rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        emu.configure_persistent_watch_in_global_range(&[(rsp - 16, rsp)], 8, (3, 6))
+            .unwrap();
+        let first = emu.resume(CODE_BASE, 3).unwrap();
+        assert_eq!(
+            emu.persistent_watch_hits()
+                .iter()
+                .map(|hit| hit.global_instruction_index)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        emu.resume(first.final_rip, 3).unwrap();
+        let hits = emu.persistent_watch_hits();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.global_instruction_index)
+                .collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+        assert!(hits
+            .iter()
+            .all(|hit| (3..6).contains(&hit.global_instruction_index)));
+
+        let before = hits;
+        let error = emu
+            .configure_persistent_watch_in_global_range(&[(rsp - 16, rsp)], 8, (6, 6))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EmuError::InvalidGlobalInstructionRange { start: 6, end: 6 }
+        ));
+        assert_eq!(emu.persistent_watch_hits(), before);
+
+        emu.configure_persistent_watch(&[(rsp - 16, rsp)], 8)
+            .unwrap();
+        emu.resume(first.final_rip, 3).unwrap();
+        assert!(emu
+            .persistent_watch_hits()
+            .iter()
+            .any(|hit| hit.global_instruction_index >= 6));
     }
 
     #[test]

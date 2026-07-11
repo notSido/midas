@@ -9,6 +9,8 @@ use crate::{
 
 const IMPORT_NAME_CAP: usize = 256;
 const SET_CURRENT_DIRECTORY_W_UNIT_CAP: usize = 260;
+const WINDOW_CLASS_NAME_BYTE_CAP: usize = 256;
+const WNDCLASSEXA_SIZE: usize = 80;
 const FAKE_MODULE_BASE_START: u64 = 0x0000_7fff_0000_0000;
 const FAKE_MODULE_BASE_STEP: u64 = 0x0010_0000;
 const PROC_STUB_BASE: u64 = 0x0000_7ffe_0000_0000;
@@ -63,6 +65,20 @@ const VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE: u64 = 0x10;
 const KERNEL_HANDLE_BASE: u64 = 0x0000_000f_3000_1000;
 const KERNEL_HANDLE_STRIDE: u64 = 0x10;
 
+/// Opaque handle for the sole modeled shared system cursor. It occupies the
+/// unmapped gap after the process-heap handle and before the kernel-handle
+/// namespace.
+const EMULATED_HAND_CURSOR_HANDLE: u64 = 0x0000_000f_3000_0010;
+
+/// `IDC_HAND`, encoded by Win32's `MAKEINTRESOURCE` convention.
+const PREDEFINED_HAND_CURSOR_ID: u64 = 32_649;
+
+/// First and one-past-last values in the deterministic local class-atom
+/// namespace. The `u32` cursor can represent exhaustion after allocating
+/// `0xffff` without wrapping back to zero.
+const WINDOW_CLASS_ATOM_BASE: u32 = 0xc000;
+const WINDOW_CLASS_ATOM_EXHAUSTED: u32 = 0x1_0000;
+
 /// Pre-Vista THREAD_ALL_ACCESS, including the legacy unnamed 0x4 access bit.
 const LEGACY_THREAD_ALL_ACCESS: u32 = 0x001f_03ff;
 
@@ -108,6 +124,8 @@ const NTDLL_EXPORTS: &[&str] = &[
     "RtlReAllocateHeap",
     "RtlFreeHeap",
 ];
+
+const USER32_EXPORTS: &[&str] = &["LoadCursorA", "RegisterClassExA"];
 
 #[derive(Debug, Clone)]
 pub struct SyntheticModule {
@@ -377,6 +395,78 @@ struct VectoredExceptionHandlerRegistration {
     handler: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WndClassExA {
+    cb_size: u32,
+    style: u32,
+    window_procedure: u64,
+    class_extra: i32,
+    window_extra: i32,
+    instance: u64,
+    icon: u64,
+    cursor: u64,
+    background: u64,
+    menu_name: u64,
+    class_name: u64,
+    icon_small: u64,
+}
+
+impl WndClassExA {
+    fn matches_observed_shape(&self, image_base: u64) -> bool {
+        self.style == 3
+            && self.window_procedure != 0
+            && self.class_extra == 0
+            && self.window_extra == 0
+            && self.instance == image_base
+            && self.icon == 0
+            && self.cursor == EMULATED_HAND_CURSOR_HANDLE
+            && self.background == 6
+            && self.menu_name == 0
+            && self.icon_small == 0
+    }
+}
+
+/// Environment-owned projection of the supported `WNDCLASSEXA` shape. Guest
+/// pointers are replaced by owned or scalar values so later lookups cannot
+/// observe guest-memory mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredWindowClassA {
+    atom: u16,
+    cb_size: u32,
+    style: u32,
+    window_procedure: u64,
+    class_extra: i32,
+    window_extra: i32,
+    instance: u64,
+    icon: u64,
+    cursor: u64,
+    background: u64,
+    menu_name: Option<String>,
+    class_name: String,
+    icon_small: u64,
+}
+
+impl RegisteredWindowClassA {
+    fn new(atom: u16, raw: WndClassExA, class_name: String) -> Self {
+        debug_assert_eq!(raw.menu_name, 0);
+        Self {
+            atom,
+            cb_size: raw.cb_size,
+            style: raw.style,
+            window_procedure: raw.window_procedure,
+            class_extra: raw.class_extra,
+            window_extra: raw.window_extra,
+            instance: raw.instance,
+            icon: raw.icon,
+            cursor: raw.cursor,
+            background: raw.background,
+            menu_name: None,
+            class_name,
+            icon_small: raw.icon_small,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Win64Env {
     image_base: u64,
@@ -397,6 +487,9 @@ pub struct Win64Env {
     synthetic_modules: BTreeMap<String, SyntheticModule>,
     proc_stubs: BTreeMap<String, u64>,
     proc_stub_mapped_end: u64,
+    next_window_class_atom: u32,
+    window_classes_by_atom: BTreeMap<u16, RegisteredWindowClassA>,
+    window_class_atoms_by_name: BTreeMap<(u64, String), u16>,
 }
 
 impl Win64Env {
@@ -420,6 +513,9 @@ impl Win64Env {
             synthetic_modules: BTreeMap::new(),
             proc_stubs: BTreeMap::new(),
             proc_stub_mapped_end: PROC_STUB_BASE,
+            next_window_class_atom: WINDOW_CLASS_ATOM_BASE,
+            window_classes_by_atom: BTreeMap::new(),
+            window_class_atoms_by_name: BTreeMap::new(),
         }
     }
 
@@ -500,6 +596,36 @@ impl Win64Env {
             return None;
         }
         Some((thread_id, next_thread_id))
+    }
+
+    fn window_class_atom_candidate(&self) -> Option<(u16, u32)> {
+        let cursor = self.next_window_class_atom;
+        if !(WINDOW_CLASS_ATOM_BASE..WINDOW_CLASS_ATOM_EXHAUSTED).contains(&cursor) {
+            return None;
+        }
+        let atom = u16::try_from(cursor).ok()?;
+        let next_atom = cursor.checked_add(1)?;
+        if next_atom > WINDOW_CLASS_ATOM_EXHAUSTED
+            || self.window_classes_by_atom.contains_key(&atom)
+        {
+            return None;
+        }
+        Some((atom, next_atom))
+    }
+
+    fn insert_window_class(
+        &mut self,
+        key: (u64, String),
+        atom: u16,
+        next_atom: u32,
+        registration: RegisteredWindowClassA,
+    ) {
+        debug_assert_eq!(registration.atom, atom);
+        let previous_class = self.window_classes_by_atom.insert(atom, registration);
+        let previous_atom = self.window_class_atoms_by_name.insert(key, atom);
+        debug_assert!(previous_class.is_none());
+        debug_assert!(previous_atom.is_none());
+        self.next_window_class_atom = next_atom;
     }
 
     fn insert_kernel_handle(&mut self, handle: u64, next_handle: u64, kernel_handle: KernelHandle) {
@@ -682,10 +808,12 @@ impl Win64Env {
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or(normalized.as_str());
-        let exports = if module_name.eq_ignore_ascii_case("kernel32.dll") {
+        let exports: &[&str] = if module_name.eq_ignore_ascii_case("kernel32.dll") {
             KERNEL32_EXPORTS
         } else if module_name.eq_ignore_ascii_case("ntdll.dll") {
             NTDLL_EXPORTS
+        } else if module_name.eq_ignore_ascii_case("user32.dll") {
+            USER32_EXPORTS
         } else {
             &[]
         };
@@ -812,6 +940,13 @@ enum RawUtf16Read {
     CapExhausted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RawAnsiClassNameRead {
+    Terminated(Vec<u8>),
+    CapExhausted,
+    NonPrintable,
+}
+
 pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutcome, EmuError> {
     match name {
         "GetModuleHandleA" => {
@@ -926,6 +1061,111 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             api_return(emu)?;
             Ok(ApiOutcome::HandledVoid {
                 name: name.to_owned(),
+            })
+        }
+        "LoadCursorA" => {
+            let instance = emu.read_reg(RegisterX86::RCX)?;
+            let cursor_name = emu.read_reg(RegisterX86::RDX)?;
+            if instance != 0 || cursor_name != PREDEFINED_HAND_CURSOR_ID {
+                // Module resources, string names, and other predefined cursors
+                // can be valid Windows inputs but are not modeled. Do not
+                // dereference a possible name pointer or consume a return frame.
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // Validate and consume the return frame before changing RAX so an
+            // invalid frame leaves every register and environment field intact.
+            api_return(emu)?;
+            emu.write_reg(RegisterX86::RAX, EMULATED_HAND_CURSOR_HANDLE)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: EMULATED_HAND_CURSOR_HANDLE,
+            })
+        }
+        "RegisterClassExA" => {
+            let class_description = emu.read_reg(RegisterX86::RCX)?;
+            let cb_size = read_u32_at(emu, class_description)?;
+
+            // The size field is independently readable and sufficient to
+            // reject the wrong structure form. Do not require the remaining
+            // 76 bytes to be mapped for this known failure.
+            if cb_size != WNDCLASSEXA_SIZE as u32 {
+                return handled_scalar_api_return(emu, name, 0);
+            }
+            let raw = read_wnd_class_ex_a(emu, class_description)?;
+            debug_assert_eq!(raw.cb_size, cb_size);
+
+            // These required pointer fields are known registration failures,
+            // distinct from valid Windows shapes that remain unmodeled.
+            if raw.window_procedure == 0 || raw.instance == 0 {
+                return handled_scalar_api_return(emu, name, 0);
+            }
+
+            // Any otherwise valid Windows class shape outside the one observed
+            // on the formal sample remains unmodeled. In particular, do not
+            // inspect a possible class-name pointer or return frame after this
+            // classifier rejects the scalar fields.
+            if !raw.matches_observed_shape(env.image_base) {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            if raw.class_name == 0 {
+                return handled_scalar_api_return(emu, name, 0);
+            }
+            if raw.class_name < 0x1_0000 {
+                // A low-word class atom is valid Win32 input, but registering
+                // by atom is outside this bounded ANSI-string model.
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let class_name_bytes =
+                match read_raw_ansi_class_name(emu, raw.class_name, WINDOW_CLASS_NAME_BYTE_CAP)? {
+                    RawAnsiClassNameRead::Terminated(bytes) if !bytes.is_empty() => bytes,
+                    RawAnsiClassNameRead::Terminated(_) | RawAnsiClassNameRead::CapExhausted => {
+                        return handled_scalar_api_return(emu, name, 0);
+                    }
+                    RawAnsiClassNameRead::NonPrintable => {
+                        return Ok(ApiOutcome::Unhandled {
+                            name: name.to_owned(),
+                        });
+                    }
+                };
+            let class_name = class_name_bytes
+                .into_iter()
+                .map(char::from)
+                .collect::<String>();
+            let class_key = (raw.instance, class_name.to_ascii_lowercase());
+
+            // Duplicate names, exhausted atoms, and atom collisions are
+            // modeled registration failures. Selection is read-only; all guest
+            // reads and the return-frame transition happen before insertion or
+            // RAX mutation.
+            let pending_registration = if env.window_class_atoms_by_name.contains_key(&class_key) {
+                None
+            } else {
+                env.window_class_atom_candidate().map(|(atom, next_atom)| {
+                    let registration = RegisteredWindowClassA::new(atom, raw, class_name);
+                    (class_key, atom, next_atom, registration)
+                })
+            };
+            let ret = pending_registration
+                .as_ref()
+                .map_or(0, |(_, atom, _, _)| u64::from(*atom));
+
+            api_return(emu)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            if let Some((key, atom, next_atom, registration)) = pending_registration {
+                env.insert_window_class(key, atom, next_atom, registration);
+            }
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
             })
         }
         "GetCurrentDirectoryW" => {
@@ -1149,6 +1389,68 @@ fn read_u64_at(emu: &Emu, address: u64) -> Result<u64, EmuError> {
     Ok(u64::from_le_bytes(value))
 }
 
+fn read_wnd_class_ex_a(emu: &Emu, address: u64) -> Result<WndClassExA, EmuError> {
+    let bytes = emu.read_mem(address, WNDCLASSEXA_SIZE)?;
+    Ok(WndClassExA {
+        cb_size: u32_from_bytes(&bytes, 0),
+        style: u32_from_bytes(&bytes, 4),
+        window_procedure: u64_from_bytes(&bytes, 8),
+        class_extra: i32_from_bytes(&bytes, 16),
+        window_extra: i32_from_bytes(&bytes, 20),
+        instance: u64_from_bytes(&bytes, 24),
+        icon: u64_from_bytes(&bytes, 32),
+        cursor: u64_from_bytes(&bytes, 40),
+        background: u64_from_bytes(&bytes, 48),
+        menu_name: u64_from_bytes(&bytes, 56),
+        class_name: u64_from_bytes(&bytes, 64),
+        icon_small: u64_from_bytes(&bytes, 72),
+    })
+}
+
+fn u32_from_bytes(bytes: &[u8], offset: usize) -> u32 {
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(value)
+}
+
+fn i32_from_bytes(bytes: &[u8], offset: usize) -> i32 {
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&bytes[offset..offset + 4]);
+    i32::from_le_bytes(value)
+}
+
+fn u64_from_bytes(bytes: &[u8], offset: usize) -> u64 {
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(value)
+}
+
+fn read_raw_ansi_class_name(
+    emu: &Emu,
+    address: u64,
+    byte_cap: usize,
+) -> Result<RawAnsiClassNameRead, EmuError> {
+    let mut bytes = Vec::with_capacity(byte_cap);
+    for offset in 0..byte_cap {
+        let offset = u64::try_from(offset).map_err(|_| EmuError::CodeTooLarge)?;
+        let byte_address = address
+            .checked_add(offset)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: address,
+                size: offset,
+            })?;
+        let byte = emu.read_mem(byte_address, 1)?[0];
+        if byte == 0 {
+            return Ok(RawAnsiClassNameRead::Terminated(bytes));
+        }
+        if !(0x20..=0x7e).contains(&byte) {
+            return Ok(RawAnsiClassNameRead::NonPrintable);
+        }
+        bytes.push(byte);
+    }
+    Ok(RawAnsiClassNameRead::CapExhausted)
+}
+
 fn read_arg_ascii_z(emu: &Emu, reg: RegisterX86) -> Result<String, EmuError> {
     let address = emu.read_reg(reg)?;
     read_ascii_z_at(emu, address)
@@ -1225,6 +1527,15 @@ fn read_ascii_z_at(emu: &Emu, address: u64) -> Result<String, EmuError> {
         }
     }
     Ok(value)
+}
+
+fn handled_scalar_api_return(emu: &mut Emu, name: &str, ret: u64) -> Result<ApiOutcome, EmuError> {
+    api_return(emu)?;
+    emu.write_reg(RegisterX86::RAX, ret)?;
+    Ok(ApiOutcome::Handled {
+        name: name.to_owned(),
+        ret,
+    })
 }
 
 fn api_return(emu: &mut Emu) -> Result<(), EmuError> {
@@ -1549,6 +1860,95 @@ mod tests {
 
     fn sleep_environment_state(env: &Win64Env) -> String {
         format!("{env:#?}")
+    }
+
+    const WINDOW_CLASS_STRUCT_ADDRESS: u64 = crate::emu::STACK_BASE + 0x4000;
+    const WINDOW_CLASS_NAME_ADDRESS: u64 = WINDOW_CLASS_STRUCT_ADDRESS + 0x100;
+    const WINDOW_PROCEDURE_SENTINEL: u64 = 0x0000_0001_5000_1230;
+    const ALTERNATE_WINDOW_PROCEDURE_SENTINEL: u64 = 0x0000_0001_5000_1240;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RegisterClassExAArgs {
+        cb_size: u32,
+        style: u32,
+        window_procedure: u64,
+        class_extra: i32,
+        window_extra: i32,
+        instance: u64,
+        icon: u64,
+        cursor: u64,
+        background: u64,
+        menu_name: u64,
+        class_name: u64,
+        icon_small: u64,
+    }
+
+    impl RegisterClassExAArgs {
+        fn observed(class_name: u64) -> Self {
+            Self {
+                cb_size: WNDCLASSEXA_SIZE as u32,
+                style: 3,
+                window_procedure: WINDOW_PROCEDURE_SENTINEL,
+                class_extra: 0,
+                window_extra: 0,
+                instance: IMAGE_BASE,
+                icon: 0,
+                cursor: EMULATED_HAND_CURSOR_HANDLE,
+                background: 6,
+                menu_name: 0,
+                class_name,
+                icon_small: 0,
+            }
+        }
+
+        fn as_bytes(self) -> [u8; WNDCLASSEXA_SIZE] {
+            let mut bytes = [0u8; WNDCLASSEXA_SIZE];
+            write_u32(&mut bytes, 0, self.cb_size);
+            write_u32(&mut bytes, 4, self.style);
+            write_u64(&mut bytes, 8, self.window_procedure);
+            write_bytes(&mut bytes, 16, &self.class_extra.to_le_bytes());
+            write_bytes(&mut bytes, 20, &self.window_extra.to_le_bytes());
+            write_u64(&mut bytes, 24, self.instance);
+            write_u64(&mut bytes, 32, self.icon);
+            write_u64(&mut bytes, 40, self.cursor);
+            write_u64(&mut bytes, 48, self.background);
+            write_u64(&mut bytes, 56, self.menu_name);
+            write_u64(&mut bytes, 64, self.class_name);
+            write_u64(&mut bytes, 72, self.icon_small);
+            bytes
+        }
+    }
+
+    fn prepare_register_class_ex_a_call(
+        emu: &mut Emu,
+        args: RegisterClassExAArgs,
+        rsp: u64,
+        return_address: u64,
+    ) {
+        emu.write_mem(WINDOW_CLASS_STRUCT_ADDRESS, &args.as_bytes())
+            .unwrap();
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        seed_sleep_machine_state(emu, WINDOW_CLASS_STRUCT_ADDRESS, rsp, 0x1111_2222_3333_4444);
+    }
+
+    fn call_register_class_ex_a(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        args: RegisterClassExAArgs,
+        name: &[u8],
+        rsp: u64,
+        return_address: u64,
+    ) -> u64 {
+        if !name.is_empty() {
+            emu.write_mem(args.class_name, name).unwrap();
+        }
+        prepare_register_class_ex_a_call(emu, args, rsp, return_address);
+        let outcome = dispatch(env, emu, "RegisterClassExA").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected RegisterClassExA to be handled");
+        };
+        assert_eq!(name, "RegisterClassExA");
+        ret
     }
 
     fn call_rtl_allocate_heap(
@@ -2430,6 +2830,672 @@ mod tests {
             assert_eq!(sleep_machine_state(&emu), machine_before);
             assert_eq!(sleep_environment_state(&env), environment_before);
         }
+    }
+
+    #[test]
+    fn load_cursor_a_observed_idc_hand_returns_stable_opaque_handle() {
+        let call_and_assert = |env: &mut Win64Env, emu: &mut Emu, rsp: u64, return_address: u64| {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(emu, 0, rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, PREDEFINED_HAND_CURSOR_ID)
+                .unwrap();
+            let machine_before = sleep_machine_state(emu);
+            let environment_before = sleep_environment_state(env);
+            let return_frame_before = emu.read_mem(rsp, 8).unwrap();
+
+            let outcome = dispatch(env, emu, "LoadCursorA").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Handled {
+                    name: "LoadCursorA".to_owned(),
+                    ret: EMULATED_HAND_CURSOR_HANDLE,
+                }
+            );
+            for (register, value) in machine_before {
+                let expected = match register {
+                    RegisterX86::RAX => EMULATED_HAND_CURSOR_HANDLE,
+                    RegisterX86::RIP => return_address,
+                    RegisterX86::RSP => value + 8,
+                    _ => value,
+                };
+                assert_eq!(
+                    emu.read_reg(register).unwrap(),
+                    expected,
+                    "unexpected {register:?} change"
+                );
+            }
+            assert_eq!(emu.read_mem(rsp, 8).unwrap(), return_frame_before);
+            assert_eq!(sleep_environment_state(env), environment_before);
+            assert!(emu.read_mem(EMULATED_HAND_CURSOR_HANDLE, 1).is_err());
+            EMULATED_HAND_CURSOR_HANDLE
+        };
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first = call_and_assert(
+            &mut env,
+            &mut emu,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        let second = call_and_assert(
+            &mut env,
+            &mut emu,
+            crate::emu::STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+
+        let mut fresh_emu = Emu::new().unwrap();
+        let mut fresh_env = Win64Env::new(IMAGE_BASE);
+        let fresh = call_and_assert(
+            &mut fresh_env,
+            &mut fresh_emu,
+            crate::emu::STACK_BASE + 0x600,
+            0x1357_2468_ace0_bdf1,
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(second, fresh);
+        assert_ne!(first, 0);
+        assert_ne!(first, EMULATED_PROCESS_HEAP_HANDLE);
+        assert!((EMULATED_PROCESS_HEAP_HANDLE..KERNEL_HANDLE_BASE).contains(&first));
+    }
+
+    #[test]
+    fn load_cursor_a_unmodeled_inputs_do_not_access_pointer_or_stack() {
+        for (instance, cursor_name, rsp) in [
+            (0x0000_0001_0000_0000, PREDEFINED_HAND_CURSOR_ID, u64::MAX),
+            (0, 0x0000_0001_0000_7f89, 0x0000_0000_dead_0000),
+            (0, 0x7f00, u64::MAX),
+            (0, 0x0000_0000_dead_0000, 0x0000_0000_dead_1000),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            assert!(emu.read_mem(rsp, 8).is_err());
+            seed_sleep_machine_state(&mut emu, instance, rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, cursor_name).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "LoadCursorA").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Unhandled {
+                    name: "LoadCursorA".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn load_cursor_a_invalid_return_frame_is_failure_atomic() {
+        for rsp in [0x0000_0000_dead_0000, u64::MAX] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            assert!(emu.read_mem(rsp, 8).is_err());
+            seed_sleep_machine_state(&mut emu, 0, rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, PREDEFINED_HAND_CURSOR_ID)
+                .unwrap();
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let error = dispatch(&mut env, &mut emu, "LoadCursorA").unwrap_err();
+
+            assert!(
+                matches!(error, EmuError::ReadMem { addr, size, .. } if addr == rsp && size == 8),
+                "unexpected return-frame error: {error:?}"
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn register_class_ex_a_observed_shape_owns_record_and_returns_stable_atom() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0;
+        let class_name = b"MidasTestClass\0";
+        let args = RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS);
+        assert!(u32::try_from(WINDOW_CLASS_STRUCT_ADDRESS).is_err());
+        assert!(u32::try_from(WINDOW_CLASS_NAME_ADDRESS).is_err());
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, class_name)
+            .unwrap();
+        prepare_register_class_ex_a_call(&mut emu, args, rsp, return_address);
+        let machine_before = sleep_machine_state(&emu);
+        let return_frame_before = emu.read_mem(rsp, 8).unwrap();
+
+        let outcome = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap();
+
+        assert_eq!(
+            outcome,
+            ApiOutcome::Handled {
+                name: "RegisterClassExA".to_owned(),
+                ret: u64::from(WINDOW_CLASS_ATOM_BASE),
+            }
+        );
+        for (register, value) in machine_before {
+            let expected = match register {
+                RegisterX86::RAX => u64::from(WINDOW_CLASS_ATOM_BASE),
+                RegisterX86::RIP => return_address,
+                RegisterX86::RSP => value + 8,
+                _ => value,
+            };
+            assert_eq!(
+                emu.read_reg(register).unwrap(),
+                expected,
+                "unexpected {register:?} change"
+            );
+        }
+        assert_eq!(emu.read_mem(rsp, 8).unwrap(), return_frame_before);
+        assert_eq!(env.next_window_class_atom, WINDOW_CLASS_ATOM_BASE + 1);
+        assert_eq!(
+            env.window_class_atoms_by_name
+                .get(&(IMAGE_BASE, "midastestclass".to_owned())),
+            Some(&(WINDOW_CLASS_ATOM_BASE as u16))
+        );
+        let registration = env
+            .window_classes_by_atom
+            .get(&(WINDOW_CLASS_ATOM_BASE as u16))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            registration,
+            RegisteredWindowClassA {
+                atom: WINDOW_CLASS_ATOM_BASE as u16,
+                cb_size: WNDCLASSEXA_SIZE as u32,
+                style: 3,
+                window_procedure: WINDOW_PROCEDURE_SENTINEL,
+                class_extra: 0,
+                window_extra: 0,
+                instance: IMAGE_BASE,
+                icon: 0,
+                cursor: EMULATED_HAND_CURSOR_HANDLE,
+                background: 6,
+                menu_name: None,
+                class_name: "MidasTestClass".to_owned(),
+                icon_small: 0,
+            }
+        );
+
+        // The environment record owns every retained value; guest mutations
+        // after return cannot rename or reshape it.
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"ChangedInGuest\0")
+            .unwrap();
+        emu.write_mem(WINDOW_CLASS_STRUCT_ADDRESS, &[0; WNDCLASSEXA_SIZE])
+            .unwrap();
+        assert_eq!(
+            env.window_classes_by_atom
+                .get(&(WINDOW_CLASS_ATOM_BASE as u16)),
+            Some(&registration)
+        );
+
+        let second_atom = call_register_class_ex_a(
+            &mut env,
+            &mut emu,
+            args,
+            b"SecondMidasClass\0",
+            crate::emu::STACK_BASE + 0x600,
+            0x2468_1357_bdf1_ace0,
+        );
+        assert_eq!(second_atom, u64::from(WINDOW_CLASS_ATOM_BASE + 1));
+        assert_eq!(
+            env.window_class_atoms_by_name
+                .get(&(IMAGE_BASE, "secondmidasclass".to_owned())),
+            Some(&((WINDOW_CLASS_ATOM_BASE + 1) as u16))
+        );
+
+        let mut fresh_emu = Emu::new().unwrap();
+        let mut fresh_env = Win64Env::new(IMAGE_BASE);
+        let fresh_atom = call_register_class_ex_a(
+            &mut fresh_env,
+            &mut fresh_emu,
+            args,
+            class_name,
+            crate::emu::STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+        assert_eq!(fresh_atom, u64::from(WINDOW_CLASS_ATOM_BASE));
+    }
+
+    #[test]
+    fn register_class_ex_a_duplicate_name_is_case_insensitive_and_nonmutating() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let args = RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS);
+        let first = call_register_class_ex_a(
+            &mut env,
+            &mut emu,
+            args,
+            b"MidasTestClass\0",
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        assert_eq!(first, u64::from(WINDOW_CLASS_ATOM_BASE));
+
+        let duplicate_args = RegisterClassExAArgs {
+            window_procedure: ALTERNATE_WINDOW_PROCEDURE_SENTINEL,
+            ..args
+        };
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"mIDaStEStcLASS\0")
+            .unwrap();
+        let rsp = crate::emu::STACK_BASE + 0x500;
+        let return_address = 0x0fed_cba9_8765_4321;
+        prepare_register_class_ex_a_call(&mut emu, duplicate_args, rsp, return_address);
+        let environment_before = sleep_environment_state(&env);
+        let machine_before = sleep_machine_state(&emu);
+
+        let outcome = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap();
+
+        assert_eq!(
+            outcome,
+            ApiOutcome::Handled {
+                name: "RegisterClassExA".to_owned(),
+                ret: 0,
+            }
+        );
+        for (register, value) in machine_before {
+            let expected = match register {
+                RegisterX86::RAX => 0,
+                RegisterX86::RIP => return_address,
+                RegisterX86::RSP => value + 8,
+                _ => value,
+            };
+            assert_eq!(emu.read_reg(register).unwrap(), expected);
+        }
+        assert_eq!(sleep_environment_state(&env), environment_before);
+        assert_eq!(env.next_window_class_atom, WINDOW_CLASS_ATOM_BASE + 1);
+        assert_eq!(env.window_classes_by_atom.len(), 1);
+    }
+
+    #[test]
+    fn register_class_ex_a_unmodeled_shapes_do_not_touch_name_or_return_frame() {
+        let base = RegisterClassExAArgs::observed(0x0000_0000_dead_0000);
+        let variations = [
+            RegisterClassExAArgs { style: 4, ..base },
+            RegisterClassExAArgs {
+                class_extra: 1,
+                ..base
+            },
+            RegisterClassExAArgs {
+                window_extra: 1,
+                ..base
+            },
+            RegisterClassExAArgs {
+                instance: IMAGE_BASE + (1 << 32),
+                ..base
+            },
+            RegisterClassExAArgs { icon: 1, ..base },
+            RegisterClassExAArgs { cursor: 0, ..base },
+            RegisterClassExAArgs {
+                background: 7,
+                ..base
+            },
+            RegisterClassExAArgs {
+                menu_name: 0x0000_0000_dead_1000,
+                ..base
+            },
+            RegisterClassExAArgs {
+                icon_small: 1,
+                ..base
+            },
+        ];
+        for args in variations {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.write_mem(WINDOW_CLASS_STRUCT_ADDRESS, &args.as_bytes())
+                .unwrap();
+            seed_sleep_machine_state(
+                &mut emu,
+                WINDOW_CLASS_STRUCT_ADDRESS,
+                u64::MAX,
+                0x1111_2222_3333_4444,
+            );
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Unhandled {
+                    name: "RegisterClassExA".to_owned(),
+                },
+                "unexpected classification for {args:?}"
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+
+        for (class_name, bytes) in [
+            (PREDEFINED_HAND_CURSOR_ID, Vec::new()),
+            (WINDOW_CLASS_NAME_ADDRESS, vec![b'A', 0x80, 0]),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let args = RegisterClassExAArgs::observed(class_name);
+            if !bytes.is_empty() {
+                emu.write_mem(class_name, &bytes).unwrap();
+            }
+            emu.write_mem(WINDOW_CLASS_STRUCT_ADDRESS, &args.as_bytes())
+                .unwrap();
+            seed_sleep_machine_state(
+                &mut emu,
+                WINDOW_CLASS_STRUCT_ADDRESS,
+                u64::MAX,
+                0x1111_2222_3333_4444,
+            );
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Unhandled {
+                    name: "RegisterClassExA".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn register_class_ex_a_known_invalid_inputs_return_zero() {
+        // A wrong cbSize is conclusive from the first DWORD alone. Place it at
+        // the end of the mapped stack to prove the remaining 76 bytes are not
+        // required.
+        {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let short_structure = crate::emu::STACK_BASE + crate::emu::STACK_SIZE - 4;
+            emu.write_mem(
+                short_structure,
+                &((WNDCLASSEXA_SIZE - 1) as u32).to_le_bytes(),
+            )
+            .unwrap();
+            assert!(emu.read_mem(short_structure, WNDCLASSEXA_SIZE).is_err());
+            let rsp = crate::emu::STACK_BASE + 0x400;
+            let return_address = 0x0123_4567_89ab_cdef_u64;
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(&mut emu, short_structure, rsp, 0x1111_2222_3333_4444);
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Handled {
+                    name: "RegisterClassExA".to_owned(),
+                    ret: 0,
+                }
+            );
+            for (register, value) in machine_before {
+                let expected = match register {
+                    RegisterX86::RAX => 0,
+                    RegisterX86::RIP => return_address,
+                    RegisterX86::RSP => value + 8,
+                    _ => value,
+                };
+                assert_eq!(emu.read_reg(register).unwrap(), expected);
+            }
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+
+        let cases = [
+            (
+                RegisterClassExAArgs {
+                    cb_size: (WNDCLASSEXA_SIZE - 1) as u32,
+                    class_name: 0x0000_0000_dead_0000,
+                    ..RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS)
+                },
+                Vec::new(),
+            ),
+            (
+                RegisterClassExAArgs {
+                    window_procedure: 0,
+                    ..RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS)
+                },
+                Vec::new(),
+            ),
+            (
+                RegisterClassExAArgs {
+                    instance: 0,
+                    ..RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS)
+                },
+                Vec::new(),
+            ),
+            (RegisterClassExAArgs::observed(0), Vec::new()),
+            (
+                RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+                vec![0],
+            ),
+            (
+                RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+                vec![b'A'; WINDOW_CLASS_NAME_BYTE_CAP],
+            ),
+        ];
+
+        for (index, (args, class_name)) in cases.into_iter().enumerate() {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            if !class_name.is_empty() {
+                emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, &class_name)
+                    .unwrap();
+            }
+            let rsp = crate::emu::STACK_BASE + 0x400 + index as u64 * 0x20;
+            let return_address = 0x1234_5678_9abc_def0 + index as u64;
+            prepare_register_class_ex_a_call(&mut emu, args, rsp, return_address);
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Handled {
+                    name: "RegisterClassExA".to_owned(),
+                    ret: 0,
+                }
+            );
+            for (register, value) in machine_before {
+                let expected = match register {
+                    RegisterX86::RAX => 0,
+                    RegisterX86::RIP => return_address,
+                    RegisterX86::RSP => value + 8,
+                    _ => value,
+                };
+                assert_eq!(emu.read_reg(register).unwrap(), expected);
+            }
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn register_class_ex_a_memory_and_return_failures_are_atomic() {
+        // Invalid structure pointer: the cbSize pre-read fails before the
+        // return frame or environment is touched.
+        {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            seed_sleep_machine_state(
+                &mut emu,
+                0x0000_0000_dead_0000,
+                crate::emu::STACK_BASE + 0x400,
+                0x1111_2222_3333_4444,
+            );
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let error = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap_err();
+
+            assert!(
+                matches!(error, EmuError::ReadMem { addr, size: 4, .. } if addr == 0x0000_0000_dead_0000)
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+
+        // Supported scalar shape with an invalid full-width class pointer.
+        {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let args = RegisterClassExAArgs::observed(0x0000_0001_dead_0000);
+            emu.write_mem(WINDOW_CLASS_STRUCT_ADDRESS, &args.as_bytes())
+                .unwrap();
+            seed_sleep_machine_state(
+                &mut emu,
+                WINDOW_CLASS_STRUCT_ADDRESS,
+                crate::emu::STACK_BASE + 0x400,
+                0x1111_2222_3333_4444,
+            );
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let error = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap_err();
+
+            assert!(
+                matches!(error, EmuError::ReadMem { addr, size: 1, .. } if addr == args.class_name)
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+
+        // All guest inputs are accepted, but the return-frame preflight fails.
+        for args in [
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            RegisterClassExAArgs {
+                cb_size: 0,
+                ..RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS)
+            },
+            RegisterClassExAArgs {
+                window_procedure: 0,
+                ..RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS)
+            },
+            RegisterClassExAArgs {
+                instance: 0,
+                ..RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS)
+            },
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"AtomicClass\0")
+                .unwrap();
+            emu.write_mem(WINDOW_CLASS_STRUCT_ADDRESS, &args.as_bytes())
+                .unwrap();
+            seed_sleep_machine_state(
+                &mut emu,
+                WINDOW_CLASS_STRUCT_ADDRESS,
+                u64::MAX,
+                0x1111_2222_3333_4444,
+            );
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let error = dispatch(&mut env, &mut emu, "RegisterClassExA").unwrap_err();
+
+            assert!(matches!(error, EmuError::ReadMem { addr, size: 8, .. } if addr == u64::MAX));
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn register_class_ex_a_enforces_name_and_atom_bounds() {
+        let mut maximum_name = vec![b'A'; WINDOW_CLASS_NAME_BYTE_CAP - 1];
+        maximum_name.push(0);
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let atom = call_register_class_ex_a(
+            &mut env,
+            &mut emu,
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            &maximum_name,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        assert_eq!(atom, u64::from(WINDOW_CLASS_ATOM_BASE));
+        assert_eq!(
+            env.window_classes_by_atom
+                .get(&(WINDOW_CLASS_ATOM_BASE as u16))
+                .unwrap()
+                .class_name
+                .len(),
+            WINDOW_CLASS_NAME_BYTE_CAP - 1
+        );
+
+        let mut unterminated_emu = Emu::new().unwrap();
+        let mut unterminated_env = Win64Env::new(IMAGE_BASE);
+        let ret = call_register_class_ex_a(
+            &mut unterminated_env,
+            &mut unterminated_emu,
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            &vec![b'B'; WINDOW_CLASS_NAME_BYTE_CAP],
+            crate::emu::STACK_BASE + 0x400,
+            0x0fed_cba9_8765_4321,
+        );
+        assert_eq!(ret, 0);
+        assert_eq!(
+            unterminated_env.next_window_class_atom,
+            WINDOW_CLASS_ATOM_BASE
+        );
+        assert!(unterminated_env.window_classes_by_atom.is_empty());
+
+        let mut last_emu = Emu::new().unwrap();
+        let mut last_env = Win64Env::new(IMAGE_BASE);
+        last_env.next_window_class_atom = u32::from(u16::MAX);
+        let last = call_register_class_ex_a(
+            &mut last_env,
+            &mut last_emu,
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            b"LastClass\0",
+            crate::emu::STACK_BASE + 0x400,
+            0x1111_2222_3333_4444,
+        );
+        assert_eq!(last, u64::from(u16::MAX));
+        assert_eq!(last_env.next_window_class_atom, WINDOW_CLASS_ATOM_EXHAUSTED);
+        let exhausted_before = sleep_environment_state(&last_env);
+        let exhausted = call_register_class_ex_a(
+            &mut last_env,
+            &mut last_emu,
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            b"BeyondClass\0",
+            crate::emu::STACK_BASE + 0x500,
+            0x2222_3333_4444_5555,
+        );
+        assert_eq!(exhausted, 0);
+        assert_eq!(sleep_environment_state(&last_env), exhausted_before);
+
+        let mut collision_emu = Emu::new().unwrap();
+        let mut collision_env = Win64Env::new(IMAGE_BASE);
+        let first = call_register_class_ex_a(
+            &mut collision_env,
+            &mut collision_emu,
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            b"FirstClass\0",
+            crate::emu::STACK_BASE + 0x400,
+            0x3333_4444_5555_6666,
+        );
+        assert_eq!(first, u64::from(WINDOW_CLASS_ATOM_BASE));
+        collision_env.next_window_class_atom = WINDOW_CLASS_ATOM_BASE;
+        let collision_before = sleep_environment_state(&collision_env);
+        let collision = call_register_class_ex_a(
+            &mut collision_env,
+            &mut collision_emu,
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            b"SecondClass\0",
+            crate::emu::STACK_BASE + 0x500,
+            0x4444_5555_6666_7777,
+        );
+        assert_eq!(collision, 0);
+        assert_eq!(sleep_environment_state(&collision_env), collision_before);
     }
 
     #[test]
@@ -4491,6 +5557,133 @@ mod tests {
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
         assert_eq!(sleep_environment_state(&env), environment_before);
+    }
+
+    #[test]
+    fn synthetic_user32_export_traps_load_cursor_a() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let user32_base = env.ensure_loaded_module(&mut emu, "user32.dll").unwrap();
+        let module = env.synthetic_modules.get("user32.dll").unwrap();
+        assert_eq!(
+            module
+                .exports
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["LoadCursorA", "RegisterClassExA"]
+        );
+        let stub = module.export_stub("LoadCursorA").unwrap();
+        assert_eq!(
+            env.callable_stub_name_at(stub).as_deref(),
+            Some("LoadCursorA")
+        );
+        assert_eq!(
+            env.resolve_proc(&mut emu, user32_base, "LoadCursorA")
+                .unwrap(),
+            stub
+        );
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        // Reserve the Win64 caller shadow area and balance it after the call.
+        code.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]);
+        code.extend_from_slice(&[0x31, 0xc9]);
+        code.push(0xba);
+        code.extend_from_slice(&(PREDEFINED_HAND_CURSOR_ID as u32).to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xbb]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xff, 0xd3]);
+        code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x20]);
+        code.extend_from_slice(&[0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["LoadCursorA".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            EMULATED_HAND_CURSOR_HANDLE
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RDX).unwrap(),
+            PREDEFINED_HAND_CURSOR_ID
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn synthetic_user32_export_traps_register_class_ex_a() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let user32_base = env.ensure_loaded_module(&mut emu, "user32.dll").unwrap();
+        let module = env.synthetic_modules.get("user32.dll").unwrap();
+        let stub = module.export_stub("RegisterClassExA").unwrap();
+        assert_eq!(
+            env.callable_stub_name_at(stub).as_deref(),
+            Some("RegisterClassExA")
+        );
+        assert_eq!(
+            env.resolve_proc(&mut emu, user32_base, "RegisterClassExA")
+                .unwrap(),
+            stub
+        );
+
+        let args = RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS);
+        emu.write_mem(WINDOW_CLASS_STRUCT_ADDRESS, &args.as_bytes())
+            .unwrap();
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"MidasTestClass\0")
+            .unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        // Reserve the Win64 caller shadow area and balance it after the call.
+        code.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]);
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&WINDOW_CLASS_STRUCT_ADDRESS.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xbb]);
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xff, 0xd3]);
+        code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x20]);
+        code.extend_from_slice(&[0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["RegisterClassExA".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            u64::from(WINDOW_CLASS_ATOM_BASE)
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RCX).unwrap(),
+            WINDOW_CLASS_STRUCT_ADDRESS
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        let registration = env
+            .window_classes_by_atom
+            .get(&(WINDOW_CLASS_ATOM_BASE as u16))
+            .unwrap();
+        assert_eq!(registration.class_name, "MidasTestClass");
+        assert_eq!(registration.instance, IMAGE_BASE);
+        assert_eq!(
+            env.window_class_atoms_by_name
+                .get(&(IMAGE_BASE, "midastestclass".to_owned())),
+            Some(&(WINDOW_CLASS_ATOM_BASE as u16))
+        );
     }
 
     #[test]

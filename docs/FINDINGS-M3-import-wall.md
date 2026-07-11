@@ -2622,3 +2622,291 @@ to read the restored `RIP` and pass it to resume. Context switches are intended
 at stopped or trapped boundaries, not from inside a running Unicorn hook. The
 child's unresolved zero-target edge still cannot be labeled a normal thread
 exit, and no result in this slice identifies an OEP.
+
+## Six-pass reconstruction identifies the prior RET-zero producer path
+
+The preceding four-pass checkpoint stopped at a specific question: what wrote
+zero to source context qword `0x000000014006f9e0` before selector zero copied it
+through historical RET handler slot `0x0000000140066c04`. Before changing the
+USER32 export seed, the bounded diagnostic added two more fresh production
+replays and answered that question to the live `RAX` value that entered the
+VM's stack choreography.
+
+The fifth pass derives the source context's last writer rather than fixing its
+address or instruction index. On the formal checkpoint trace, the selected
+source-context read occurs at global instruction 29,778,111. The last write to
+that qword before the read is:
+
+```text
+global instruction 29,777,862
+0x00000001400996fc: mov [rcx],r15
+RCX = 0x000000014006f9e0
+R15 = 0
+```
+
+The immediately preceding global instruction 29,777,861 is `pop r15`. Runtime
+stack state derives its source as `0x0000000fffffefe0`; it is not selected by a
+fixed sample stack address. Watching that cell and the context qword together
+shows that the last writer to the cell before the pop is not the much earlier
+stack traffic that a first broad search suggested. The exact writer is:
+
+```text
+global instruction 29,776,566
+0x00000001400d5438: pop qword [rsp+80h]
+destination = 0x0000000fffffefe0
+source      = 0x0000000fffffef58
+value       = 0
+```
+
+Global instruction 29,776,565 immediately before it is `mov [rsp],r8`, with
+`RAX = R8 = 0`. The sixth pass watches the runtime-derived upstream cell only
+inside a checked global-instruction interval around that producer. The frozen
+fallthrough validates this exact six-instruction data path:
+
+```text
+push r8
+pop qword [rsp]
+mov r8,rax
+push imm
+mov [rsp],r8
+pop qword [rsp+80h]
+```
+
+After hook-time instruction freezing was added to persistent watch hits, a
+disposable empty-USER32 control reran all six passes. It reproduced the same
+addresses, global instruction numbers, 158 retained upstream hits, and all
+three trace digests while decoding the relevant windows from bytes frozen at
+each watch hit rather than from later writable guest memory.
+
+The validator checks the paired stack read/write, equal snapshots, the
+runtime-decoded `rsp+80h` displacement, the derived destination/source
+relationship, preservation of the value through `R8`, the relative global
+instruction numbers, and absence of conflicting writes in the selected
+interval. Its synthetic mutation test requires rejection for a wrong `RAX`
+value, a global-index gap, divergent read/write snapshots, and a conflicting
+write, while accepting a changed irrelevant immediate. The corresponding
+emulator test proves that a persistent watch's
+half-open global-instruction filter survives resume legs, rejects invalid
+ranges atomically, and is cleared by ordinary unfiltered reconfiguration. The
+formal sixth pass retains 158 watched hits under the 4,096-hit bound.
+
+The checkpoint chain is therefore:
+
+```text
+RAX = 0
+  -> R8
+  -> temporary stack cell 0x0000000fffffef58
+  -> future R15 cell 0x0000000fffffefe0
+  -> R15
+  -> source context qword 0x000000014006f9e0
+  -> selector-zero VM store
+  -> historical RET handler slot 0x0000000140066c04
+  -> terminal stack cell
+  -> ret to RIP 0
+```
+
+All six fresh replays preserve the checkpoint's 18,188 child RIPs and digest
+`0xce52695f00082b00`, 4,102 post-`timeGetTime` RIPs and digest
+`0xf71d13ef9b4673bc`, and restored-main 3,527-RIP Sleep leg and digest
+`0x7fce9fdb31fbfd70`. This reconstruction identifies the native register and
+stack path that produced the source-context zero. It does not establish why
+`RAX` was zero at the beginning of the frozen sequence, nor does it give that
+value Windows lifecycle meaning.
+
+## Names-only USER32 controls identify two bounded child APIs
+
+The prior source chain ends in the empty synthetic export-name table of
+`user32.dll`, loaded at `0x00007fff00100000` in the captured environment. A
+disposable broad control supplied USER32 export names from Wine's
+`dlls/user32/user32.spec` at pinned wine-mirror commit
+[`6eb2e4c32cc9e271856146df11ed3a5c2cf29234`](https://github.com/wine-mirror/wine/blob/6eb2e4c32cc9e271856146df11ed3a5c2cf29234/dlls/user32/user32.spec).
+The downloaded spec SHA-256 was
+`5f401185f736d82efb3ce1eb0bd36f2758a2c1bf92fd6573456213c93b1637af`.
+Parsing only named entries and excluding `-noname` declarations produced 841
+names; the newline-delimited list SHA-256 was
+`e9cc0d85cd14bb9c1b13df74a55ad13f46dad09536f941338a2fa8880efc4116`.
+The control used those names only. No Wine DLL or implementation code was
+mapped, linked, or executed, and the disposable absolute include was removed
+after diagnosis.
+
+The broad control preserves the formal 38-call main prefix, the checkpoint
+18,188 child RIPs, both checkpoint child digests, and the restored-main Sleep
+digest. It changes the selector-zero source, historical handler-slot value,
+and terminal target from zero to a synthetic USER32 stub whose trap resolves by
+name as `LoadCursorA`. The loader's fourth resolver block carried observed
+discriminator `0x8ea61819`; that number is not a decoded export-name hash and
+is not equated with `LoadCursorA`. A narrow control adding only `LoadCursorA`
+reproduces the named terminal under the ordinary 60,000,000-instruction leg
+cap, with exact arguments:
+
+```text
+LoadCursorA(NULL, MAKEINTRESOURCEA(32649))
+RCX = 0
+RDX = 0x0000000000007f89   # IDC_HAND
+```
+
+Microsoft documents `LoadCursorA` and the predefined cursor identifiers at
+<https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadcursora>
+and <https://learn.microsoft.com/en-us/windows/win32/menurc/about-cursors>.
+Production seeds the observed name into USER32 and accepts only the full-width
+`(NULL, 32649)` shape. It returns stable opaque unmapped handle
+`0x0000000f30000010`, after validating and consuming the return frame. Module
+resources, string-name pointers, and every other predefined identifier can be
+valid Windows requests but remain unmodeled; they return `Unhandled` before
+pointer or return-stack access. Direct tests cover repeat/fresh identity,
+unsupported-input no-access behavior, invalid-return failure atomicity, and a
+name-resolved call through the synthetic USER32 module.
+
+With that handler active, the child executes 6,805 additional instructions and
+reaches a second zero terminal after 24,993 total child RIPs. A broad 841-name
+control changes this second terminal to a synthetic USER32 stub named
+`RegisterClassExA`; a narrow two-name seed (`LoadCursorA`,
+`RegisterClassExA`) reproduces the call at the ordinary leg cap. The exact
+callee state is:
+
+```text
+RCX = 0x0000000f500fef40
+RSP = 0x0000000f500feed8
+[RSP] = 0x0000000140203928
+```
+
+The 80-byte x64 `WNDCLASSEXA` at `RCX` decodes as:
+
+| Field | Observed value |
+|---|---:|
+| `cbSize` | `80` |
+| `style` | `3` |
+| `lpfnWndProc` | `0x000000014005c309` |
+| `cbClsExtra`, `cbWndExtra` | `0`, `0` |
+| `hInstance` | `0x0000000140000000` |
+| `hIcon` | `0` |
+| `hCursor` | `0x0000000f30000010` |
+| `hbrBackground` | `6` |
+| `lpszMenuName` | `0` |
+| `lpszClassName` | `0x00000001400e04b6` → `"SplashClassName"` |
+| `hIconSm` | `0` |
+
+Its exact raw bytes are:
+
+```text
+500000000300000009c305400100000000000000000000000000004001000000
+0000000000000000100000300f00000006000000000000000000000000000000
+b6040e40010000000000000000000000
+```
+
+Microsoft documents the registration contract and structure at
+<https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerclassexa>
+and <https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-wndclassexa>.
+The bounded handler parses exactly 80 bytes and supports only the observed
+scalar shape with a non-atom, printable 7-bit ASCII name supplied to the A API
+and terminated within a 256-byte scan. It owns the resulting record rather than
+retaining guest pointers. Local class atoms are allocated deterministically from
+`0xc000..=0xffff`; the lookup key is `(hInstance, ASCII-lowercase class name)`.
+A duplicate name, known-invalid required field, empty/unterminated name,
+collision, or exhaustion returns zero without committing a record. Plausibly
+valid but unmodeled scalar shapes, atom-name input, and non-printable names
+return `Unhandled` before unrelated memory or return-stack access. Reads and
+the return transition are preflighted before environment mutation. Focused
+tests exercise the observed scalar shape with neutral class-name and
+window-procedure fixtures, owned-record behavior, two ordinary distinct atoms,
+fresh environments, case-insensitive duplicates, the strict name and atom
+bounds, known-invalid and unmodeled cases, memory/return atomicity, and a
+name-resolved synthetic-USER32 trap. The production replay supplies the actual
+`SplashClassName` values shown above.
+
+This is registration state only. `CreateWindowExA`, callback invocation,
+window lifetime, message queues/dispatch, global versus local atom tables,
+unregistration, icons, menus, brushes, and general class semantics remain
+unmodeled.
+
+## Production reaches a distinct post-class indirect-zero frontier
+
+Reproduce the current formal diagnostic with the same bounded command:
+
+```text
+cargo run --locked --release --example trace_child_postmortem -- \
+  samples/test_target_protected.exe 60000000 100000 4096
+```
+
+The formal sample SHA-256 remains
+`8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf`.
+The current production replay preserves the main 38-call prefix and pending
+`Sleep`, derives the same ID 2/start/parameter, and reports:
+
+```text
+child prefix APIs          = [LoadLibraryA, GetProcAddress]
+handled child tail         = [timeGetTime, LoadCursorA, RegisterClassExA]
+terminal transfer          = indirect qword call
+terminal instruction       = 0x000000014019b098
+terminal pointer cell      = 0x000000014006f108
+terminal pointer value     = 0
+pushed return address      = 0x000000014019b09e
+child trace                = 28,135 RIPs, digest 0x6b27c3a47b61a00d
+post-time suffix           = 14,049 RIPs, digest 0x9aecc2c386795f99
+restored main Sleep leg    = 3,527 RIPs, digest 0x7fce9fdb31fbfd70
+```
+
+This terminal is not the prior trampoline `ret` and its pointer cell is not the
+prior VM handler slot. In particular, historical RET handler slot
+`0x0000000140066c04` belongs to the 18,188-RIP checkpoint chain above. Current
+cell `0x000000014006f108` is the runtime-derived memory operand of
+`0x000000014019b098: call qword [rdi+108h]`; the diagnostic calls it an indirect
+pointer cell and does not assign a handler-table role without evidence.
+
+A fresh whole-run watch on the runtime-derived current cell retains ten hits;
+its instruction windows and the terminal instruction tail are decoded only
+from hook-time snapshots, not from later writable guest memory.
+Initial unpacking writes its low four bytes separately at globals
+1,118,716/727/735/743 and its high four bytes with `rep movsb` at globals
+1,118,818 through 1,118,821. Those earlier byte initialization writes remain
+part of the chronology. The last observed guest write before the terminal read
+is instead the exact qword store:
+
+```text
+global instruction 28,615,712
+0x00000001400accf7: mov [r9],rbx
+R9  = 0x000000014006f108
+RBX = 0
+```
+
+No later watched write intervenes before the exact qword read at global
+35,149,409 by `0x000000014019b098`. A second production replay reproduces the
+same terminal and trace digests. Running the pinned 841-name USER32 control
+after handling `RegisterClassExA` does not change this null indirect call. The
+current stop is therefore not classified as another USER32 export gap. That
+negative control does not identify the pointer's semantic role or explain why
+the VM store selected zero.
+
+Incomplete-provenance sample 3 independently corroborates the bounded USER32
+behavior on a distinct binary. Its release diagnostic handles the same child
+tail `[timeGetTime, LoadCursorA, RegisterClassExA]`, then reaches an indirect
+zero call at `0x000000014010c05d` through pointer
+`0x00000001400a36c5`. It records 27,654 child RIPs with digest
+`0x25e21a892db20b71`, 13,799 post-time RIPs with digest
+`0x61641e351dfafbf0`, and a restored 3,523-RIP main Sleep leg with digest
+`0xe6f2315efb90611e`. The last watched guest writer is global 30,447,604 at
+`0x000000014008db11: mov [r12],r11`, storing zero. This is engineering
+corroboration only until the sample's provenance is complete. Sample 2 does not
+reach pending `Sleep` on its established separate path, so no child replay is
+claimed for it.
+
+The direct-entry constraints and scheduler limits remain unchanged. The
+expanded child does not release the formal main poll condition; main stack and
+TEB remain unchanged, and restoring the CPU context reproduces the next Sleep leg.
+The current indirect call is neither a clean thread return nor evidence of a
+Windows startup thunk, TLS initialization, exception dispatch, thread
+termination, or an OEP. The next bounded question is the semantic provenance
+of current indirect pointer cell `0x000000014006f108` and the zero selected by
+its last qword writer, without assuming that it is an export slot.
+
+The current verification commands are:
+
+```text
+cargo fmt --check
+cargo build --all-targets
+cargo test --all-targets              # 152 passed (139 library, 10 child diagnostic, 3 trace_slot)
+cargo clippy --all-targets -- -D warnings
+git diff --check
+cargo run --locked --release --example trace_child_postmortem -- \
+  samples/test_target_protected.exe 60000000 100000 4096
+```
