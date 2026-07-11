@@ -5114,10 +5114,11 @@ mod tests {
     }
 
     #[test]
-    fn cooperative_sleep_yield_runs_child_once_and_restores_main_cpu() {
+    fn cooperative_sleep_yield_selects_lowest_id_once_and_preserves_main_state() {
         const SHARED_BASE: u64 = 0x0000_0001_6000_0000;
         const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
         const PARAMETER: u64 = 0x0123_4567_89ab_cdef;
+        const SECOND_PARAMETER: u64 = 0xfedc_ba98_7654_3210;
         const MAIN_R15: u64 = 0xa1a2_a3a4_a5a6_a7a8;
 
         let image = test_image();
@@ -5163,10 +5164,22 @@ mod tests {
             .create_thread(&mut emu, 0, 0, CHILD_START, PARAMETER, 0, 0)
             .unwrap();
         assert_ne!(handle, 0);
+        let second_handle = env
+            .create_thread(&mut emu, 0, 0, CHILD_START, SECOND_PARAMETER, 0, 0)
+            .unwrap();
+        assert_ne!(second_handle, 0);
+        assert_ne!(second_handle, handle);
         let main_rsp = STACK_BASE + 0x20_000;
+        let main_stack_window = main_rsp - 0x80;
+        let main_stack_pattern = (0..0x200)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        emu.write_mem(main_stack_window, &main_stack_pattern)
+            .unwrap();
         emu.write_mem(main_rsp, &image.entry_point_va().to_le_bytes())
             .unwrap();
         emu.write_mem(main_rsp + 8, &0u64.to_le_bytes()).unwrap();
+        let main_stack_before = emu.read_mem(main_stack_window, 0x200).unwrap();
         emu.write_reg(RegisterX86::RCX, 1).unwrap();
         emu.write_reg(RegisterX86::RSP, main_rsp).unwrap();
         emu.write_reg(RegisterX86::RIP, sleep_stub).unwrap();
@@ -5231,6 +5244,11 @@ mod tests {
             yielded.entry_rsp
         );
         assert_eq!(emu.read_mem(marker, 1).unwrap(), vec![1]);
+        assert_eq!(
+            emu.read_mem(main_stack_window, main_stack_before.len())
+                .unwrap(),
+            main_stack_before
+        );
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
         assert_eq!(emu.read_reg(RegisterX86::R15).unwrap(), MAIN_R15);
         assert_eq!(
@@ -5238,8 +5256,14 @@ mod tests {
             crate::emu::TEB_BASE
         );
         assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
-        assert!(env.runnable_unscheduled_threads().next().is_none());
+        assert_eq!(
+            env.runnable_unscheduled_threads()
+                .map(|(thread_id, _)| thread_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
         assert!(env.scheduled_thread_ids.contains(&2));
+        assert!(!env.scheduled_thread_ids.contains(&3));
         let guard = emu.resume(yielded.teb_base, 1).unwrap();
         assert!(matches!(
             guard.stop_reason,
@@ -5248,6 +5272,99 @@ mod tests {
                 address
             }) if address == yielded.teb_base
         ));
+    }
+
+    #[test]
+    fn cooperative_return_guard_requires_consumed_entry_cell() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        // Load the dynamic guard from the entry cell, then jump to it without
+        // consuming that cell as a real `ret` would.
+        emu.map_code(CHILD_START, &[0x48, 0x8b, 0x04, 0x24, 0xff, 0xe0])
+            .unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+        let thread = *env.created_threads.get(&2).unwrap();
+        let runtime = configure_cooperative_runtime(&mut env, &mut emu, 2, thread).unwrap();
+
+        let (handled, stop, instructions_executed) = run_cooperative_child(
+            &mut env,
+            &mut emu,
+            &image,
+            CHILD_START,
+            runtime.return_guard,
+            runtime.entry_rsp,
+        )
+        .unwrap();
+
+        assert!(handled.is_empty());
+        assert!(instructions_executed > 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            runtime.return_guard
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), runtime.entry_rsp);
+        assert_eq!(
+            stop,
+            CooperativeThreadStop::Trap(TrapStop::UnexpectedFault {
+                address: runtime.return_guard,
+            })
+        );
+    }
+
+    #[test]
+    fn cooperative_child_hard_error_restores_main_cpu_and_thread_id() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        const BAD_RSP: u64 = 0x0000_0000_dead_0000;
+
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        assert!(emu.read_mem(BAD_RSP, 8).is_err());
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+        let thread_id_stub = env
+            .export_stub_by_base(kernel32, "GetCurrentThreadId")
+            .unwrap();
+        emu.map_code(image.entry_point_va(), &[0xc3]).unwrap();
+        let mut child_code = Vec::new();
+        child_code.extend_from_slice(&[0x48, 0xbc]); // mov rsp, BAD_RSP
+        child_code.extend_from_slice(&BAD_RSP.to_le_bytes());
+        child_code.extend_from_slice(&[0x48, 0xb8]); // mov rax, GetCurrentThreadId
+        child_code.extend_from_slice(&thread_id_stub.to_le_bytes());
+        child_code.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        emu.map_code(CHILD_START, &child_code).unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+
+        let main_rsp = STACK_BASE + 0x20_000;
+        let return_address = image.entry_point_va();
+        emu.write_mem(main_rsp, &return_address.to_le_bytes())
+            .unwrap();
+        seed_sleep_machine_state(&mut emu, 1, main_rsp, sleep_stub);
+        emu.write_reg(RegisterX86::FS_BASE, PEB_BASE).unwrap();
+        emu.write_reg(RegisterX86::GS_BASE, crate::emu::TEB_BASE)
+            .unwrap();
+        let main_before = sleep_machine_state(&emu);
+        let main_fs = emu.read_reg(RegisterX86::FS_BASE).unwrap();
+        let main_gs = emu.read_reg(RegisterX86::GS_BASE).unwrap();
+
+        let error =
+            run_with_cooperative_scheduler(&mut env, &mut emu, &image, sleep_stub, 1_000, 8)
+                .unwrap_err();
+
+        assert!(
+            matches!(error, EmuError::ReadMem { addr, size, .. } if addr == BAD_RSP && size == 8),
+            "unexpected child error: {error:?}"
+        );
+        assert_sleep_return_state(&emu, &main_before, return_address);
+        assert_eq!(emu.read_reg(RegisterX86::FS_BASE).unwrap(), main_fs);
+        assert_eq!(emu.read_reg(RegisterX86::GS_BASE).unwrap(), main_gs);
+        assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+        assert!(env.scheduled_thread_ids.contains(&2));
     }
 
     #[test]

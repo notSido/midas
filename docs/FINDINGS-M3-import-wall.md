@@ -3481,7 +3481,7 @@ version/configuration for samples 2 and 3, but their source and pre-protection
 binary hashes remain temporarily unavailable on the author's work notebook.
 
 Final-tree verification is green for `cargo fmt --all -- --check`,
-`cargo build --locked --all-targets`, `cargo test --locked --all-targets` (162
+`cargo build --locked --all-targets`, `cargo test --locked --all-targets` (164
 library, 17 child-diagnostic, and 3 `trace_slot` tests),
 `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`, and
 the repository no-hype gate. Two fresh production invocations for each of the
