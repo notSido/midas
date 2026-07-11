@@ -3250,3 +3250,134 @@ target/release/examples/trace_child_postmortem \
   samples/test_target_protected.exe 60000000 100000 4096 \
   --poll-window > /tmp/midas-poll-window-final.txt
 ```
+
+## Post-release null is missing `GetCommandLineA` resolution
+
+Slice A classifies the restored-main null as option **(b), another missing API
+or return boundary**. It is the result of the kernel32 export walk failing to
+find `GetCommandLineA`, not a second child-dependent wait and not an observed
+transfer into original code. This slice changes only the diagnostic example
+and names-only control data; it adds no production API handler, scheduler, or
+window behavior.
+
+### Baseline terminal and zero provenance
+
+`--poll-window` now retains a bounded main-stack watch only for the restored
+post-poll leg. From that watch and the hook-time instruction tail it derives the
+terminal register call, its pushed fallthrough, the stack cell supplying zero,
+and the last read/modify/write that changes that cell from nonzero to zero. The
+derivation assumes no address, instruction index, displacement, or register
+allocation. It selects a unique full-qword `push [base+disp]` read in the frozen
+tail, recomputes its effective address from the hook register snapshot, and
+requires the final zero writer to have a paired nonzero read at the same global
+instruction and RIP with no later overlapping write.
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---|---|
+| Instructions past the runtime-derived poll | 64,695 | 69,544 |
+| Restored-main trace | 66,682 RIPs, `0xca21a387d6e00ed4` | 71,516 RIPs, `0x8fe001a0013d9c96` |
+| Terminal | global 35,287,539, `0x000000014023c6d0: call rax`, target zero, fallthrough `0x000000014023c6d2` | global 37,046,898, `0x000000014017c609: call rax`, target zero, fallthrough `0x000000014017c60b` |
+| Frozen 64-RIP terminal-tail digest | `0xe54044308547f9f2` | `0x391bf765217440e5` |
+| Last target-cell transition | global 35,287,451, `add qword [rbp-2Ch],0FFFFFFFFA0462BF8h`, `0x5fb9d408 -> 0` | global 37,046,807, `add qword [rbp-2Ch],0FFFFFFFFC05024B9h`, `0x3fafdb47 -> 0` |
+| Derived zero consumer | global 35,287,499, cell `0x0000000fffffefac` | global 37,046,854, cell `0x0000000fffffefac` |
+
+The equal cell address is an emergent consequence of the common diagnostic
+main stack, not a classifier constant. The distinct instructions, globals, and
+protected code addresses show that the mechanism is not selecting a stored
+sample address. Both variants execute the pending `Sleep` return that begins
+the restored leg, read the already-released poll byte once, and reach the
+register call without another observed named wait or another poll comparison.
+
+The compact zero-chain validator does not symbolically execute every protected
+instruction between the derived stack read and `RAX`. That chain is supporting
+provenance. The causal classification instead comes from the applied broad and
+one-name export controls below, which preserve the exact 64-RIP terminal
+address sequence and call site while changing its target from zero to a
+reverse-mapped named stub.
+
+### Broad discovery and one-name causal control
+
+A local 1,416-name kernel32 control from the same pinned Wine kernel32 spec used
+for the earlier `WideCharToMultiByte` diagnosis was applied as export names
+only. Its SHA-256 is
+`2a05619eb0a3a41b0f400200d56a29dcdd3300afbe4dbb238e79f2572760a0be`.
+The large table exceeds the ordinary 60,000,000-instruction resolver leg, so the
+bounded discovery used a 200,000,000 main-leg cap. It advances 185,148
+instructions past the poll and stops at
+`UnhandledApi { name: "GetCommandLineA" }`. The terminal remains
+`0x000000014023c6d0: call rax`, its 64-RIP tail digest remains
+`0xe54044308547f9f2`, and `RAX` is the runtime synthetic stub
+`0x00007fff0000c7a0`. The output artifact SHA-256 is
+`b2495d093d4bd407e621751b8e8248ed744ea364c219bfe7a0aa3571bebd0f50`.
+
+The committed narrow control
+`docs/controls/kernel32-with-getcommandlinea.txt` is the current 20-name
+kernel32 seed plus exactly one sorted name. A unit test derives the production
+seed from `KERNEL32_EXPORTS` and rejects the control unless the sole addition is
+`GetCommandLineA`. The prior 20-name control and the new 21-name control have
+SHA-256 values
+`dfd7ed5f8d57f01047b511334aa6e45c42362964b7b0baba56c74561bc2490db`
+and
+`244487c6d6d693668111a3d5d13f19cf881eec9fef86fe7b8d919312fda45832`.
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---|---|
+| Baseline | zero-target register call at +64,695 | zero-target register call at +69,544 |
+| One-name treatment | `UnhandledApi { name: "GetCommandLineA" }` at +8,242; target stub `0x00007fff00001020` | same named boundary at +11,335; target stub `0x00007fff00001020` |
+| Treated restored-main trace | 10,229 RIPs, `0xbc793a51cd19c6c6` | 13,307 RIPs, `0x625ebc69fba1ecb5` |
+| Call site / fallthrough | unchanged `0x000000014023c6d0` / `0x000000014023c6d2` | unchanged `0x000000014017c609` / `0x000000014017c60b` |
+| Frozen terminal-tail digest | unchanged `0xe54044308547f9f2` | unchanged `0x391bf765217440e5` |
+| Baseline output SHA-256 | `cca7376149fafd7cde99b5c79949b4ad94e9abd1b919e3cd2287eddfdb35077` | `f2c982d07134fc22cb137637a4e55b0958de58bf734351fa735f4974e221bccd` |
+| Treated output SHA-256 | `dc5646046802539a776c387f354daab0daefe258eedf53e2b897b0cecb8b2715` | `ff9619bb9349feb9c84beb4f5c85a97ec7661eb7a3fddc4fa80211dbbb399d0b` |
+
+The treatment changes the synthetic export layout, so its shorter
+instructions-past-poll count and whole-trace digest are not expected to equal
+the baseline. The invariant is the 64-RIP protected tail address sequence,
+register-call site, and pushed fallthrough; only the runtime export-walk result
+changes from zero to the named synthetic stub.
+
+Reproduce the bounded baseline and one-name treatment locally:
+
+```text
+cargo build --locked --release --example trace_child_postmortem
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  --poll-window > /tmp/midas-slice-a-final-baseline-s1.txt
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-with-getcommandlinea.txt \
+  --poll-window > /tmp/midas-slice-a-final-getcommandlinea-s1.txt
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target3_protected.exe 60000000 100000 4096 \
+  --poll-window > /tmp/midas-slice-a-final-baseline-s3.txt
+target/release/examples/trace_child_postmortem \
+  samples/test_target3_protected.exe 60000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-with-getcommandlinea.txt \
+  --poll-window > /tmp/midas-slice-a-final-getcommandlinea-s3.txt
+
+sha256sum /tmp/midas-slice-a-final-{baseline,getcommandlinea}-s{1,3}.txt
+```
+
+The formal sample SHA-256 remains
+`8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf`.
+Sample 3 remains engineering corroboration because its source provenance is
+incomplete; its observed SHA-256 is
+`6c70e14c40fde8661b0b0121161deb1afd9edffd682f1f30f2b5916895f79585`.
+
+### Classification and Slice B consequence
+
+The post-release null is therefore **(b), missing `GetCommandLineA`
+resolution/semantics**. No second child-written condition is observed after the
+released poll, so Slice A provides no reason to require fine-grained main/child
+ping-pong. Slice B can use the planned coarse cooperative yield to run the
+child through the release store, while batching the observed `RtlFreeHeap` and
+`GetCommandLineA` frontiers with the window-creation boundary. This is an
+architecture result, not an implementation of those APIs.
+
+The controlled path still stops inside protected code at an unhandled named
+stub. It does not reach or prove original code or OEP, and no OEP criterion is
+claimed. Verification for this diagnostic slice is `cargo test --locked
+--all-targets` with 164 tests (146 library, 15 child diagnostic, and 3
+`trace_slot`), plus the full build and `clippy -D warnings`.

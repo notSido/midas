@@ -10,7 +10,7 @@ use std::{env, fs, process};
 
 use iced_x86::{
     Code, Decoder, DecoderOptions, Formatter, InstructionInfoFactory, NasmFormatter, OpAccess,
-    Register,
+    OpKind, Register,
 };
 use midas::{
     emu::{
@@ -19,7 +19,10 @@ use midas::{
         TEB_STACKLIMIT_OFFSET,
     },
     pe::PeImage,
-    win64::{run_with_import_trap, RunnableUnscheduledThread, TrapRun, TrapStop, Win64Env},
+    win64::{
+        run_with_import_trap, RunnableUnscheduledThread, TrapRun, TrapStop, Win64Env,
+        KERNEL32_EXPORTS,
+    },
 };
 
 const DEFAULT_MAIN_PER_LEG_CAP: u64 = 60_000_000;
@@ -33,6 +36,7 @@ const PRODUCER_WATCH_INSTRUCTION_WINDOW: u64 = 4_096;
 const MAIN_API_BOUND: usize = 128;
 const CHILD_PREFIX_API_BOUND: usize = 16;
 const CHILD_TAIL_API_BOUND: usize = 16;
+const POST_POLL_API_BOUND: usize = 16;
 
 const CHILD_STACK_BASE: u64 = 0x0000_000f_5000_0000;
 const CHILD_STACK_SIZE: u64 = 0x0010_0000;
@@ -246,6 +250,29 @@ struct CreateWindowExAObservation {
     parameter: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegisterCallTerminal {
+    global_instruction_index: u64,
+    instruction_address: u64,
+    target_register: Register,
+    target_value: u64,
+    pushed_return_cell: u64,
+    pushed_return_address: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZeroTargetProvenance {
+    source_cell: u64,
+    source_read_rip: u64,
+    source_read_global_instruction_index: u64,
+    source_value: u64,
+    zero_writer_rip: u64,
+    zero_writer_global_instruction_index: u64,
+    zero_writer_input: u64,
+    zero_writer_output: u64,
+    zero_writer_instruction: String,
+}
+
 #[derive(Debug, Clone)]
 struct PollWindowEvidence {
     poll: MainPollObservation,
@@ -264,9 +291,14 @@ struct PollWindowEvidence {
     release_writer_index: Option<usize>,
     poll_final: u8,
     main_stop: TrapStop,
+    main_handled: Vec<String>,
     main_pending_api: Option<String>,
     restored_main_cap: u64,
+    restored_main_watch_hit_cap: usize,
     main_rips: Vec<u64>,
+    main_tail_instructions: Vec<FormattedInstruction>,
+    main_terminal_call: Option<RegisterCallTerminal>,
+    zero_target_provenance: Option<ZeroTargetProvenance>,
     instructions_past_poll: usize,
 }
 
@@ -851,13 +883,27 @@ fn run_poll_window_return(
     bytes: &[u8],
     poll: MainPollObservation,
 ) -> Result<PollWindowEvidence, String> {
-    if config.export_name_control.is_some() {
-        return Err("--poll-window supplies its own narrow USER32 names-only treatment".to_owned());
+    if config
+        .export_name_control
+        .as_ref()
+        .is_some_and(|control| control.module_name.eq_ignore_ascii_case("user32.dll"))
+    {
+        return Err(
+            "--poll-window reserves USER32 for its narrow CreateWindowExA treatment".to_owned(),
+        );
     }
     let mut emu = Emu::new().map_err(|error| format!("failed to create emulator: {error}"))?;
     emu.map_image(image, bytes, image.image_base)
         .map_err(|error| format!("failed to map image: {error}"))?;
     let mut env = Win64Env::new(image.image_base);
+    if let Some(control) = &config.export_name_control {
+        if !env.configure_module_export_name_control(&control.module_name, &control.names) {
+            return Err(format!(
+                "rejected export-name control for {:?}",
+                control.module_name
+            ));
+        }
+    }
     let user32_names = [
         "CreateWindowExA".to_owned(),
         "LoadCursorA".to_owned(),
@@ -930,8 +976,8 @@ fn run_poll_window_return(
     .map_err(|error| format!("post-CreateWindowExA child treatment failed: {error}"))?;
     let post_create_hit_end = emu.persistent_watch_hits().len();
     let post_create_trace_end = emu.executed_addresses().len();
-    let raw_hits = emu.persistent_watch_hits();
-    if raw_hits.len() >= config.watch_hit_cap {
+    let pre_main_raw_hits = emu.persistent_watch_hits();
+    if pre_main_raw_hits.len() >= config.watch_hit_cap {
         return Err(format!(
             "post-CreateWindowExA poll watch reached its {}-hit cap",
             config.watch_hit_cap
@@ -945,28 +991,51 @@ fn run_poll_window_return(
 
     emu.restore_cpu_context(&main_cpu)
         .map_err(|error| format!("failed to restore post-CreateWindowExA main context: {error}"))?;
+    let main_stack_end = STACK_BASE
+        .checked_add(STACK_SIZE)
+        .ok_or_else(|| "restored-main stack watch range overflows".to_owned())?;
+    let restored_main_watch_ranges = if config.export_name_control.is_some() {
+        vec![(poll.address, watch_end)]
+    } else {
+        vec![(poll.address, watch_end), (STACK_BASE, main_stack_end)]
+    };
+    let restored_main_watch_hit_cap = if config.export_name_control.is_some() {
+        config.watch_hit_cap
+    } else {
+        MAX_WATCH_HIT_CAP
+    };
+    emu.configure_persistent_watch(&restored_main_watch_ranges, restored_main_watch_hit_cap)
+        .map_err(|error| format!("failed to arm restored-main watch: {error}"))?;
     let main_begin = emu
         .read_reg(RegisterX86::RIP)
         .map_err(|error| format!("failed to read restored main RIP: {error}"))?;
-    let main_hit_start = emu.persistent_watch_hits().len();
+    let main_hit_start = pre_main_raw_hits.len();
     let main_trace_start = emu.executed_addresses().len();
     let restored_main_cap = config.main_per_leg_cap.min(MAX_POLL_MAIN_TRACE_CAP);
-    let main_leg =
-        run_with_import_trap(&mut env, &mut emu, image, main_begin, restored_main_cap, 1)
-            .map_err(|error| format!("post-CreateWindowExA restored-main leg failed: {error}"))?;
-    let main_hit_end = emu.persistent_watch_hits().len();
+    let main_leg = run_with_import_trap(
+        &mut env,
+        &mut emu,
+        image,
+        main_begin,
+        restored_main_cap,
+        POST_POLL_API_BOUND,
+    )
+    .map_err(|error| format!("post-CreateWindowExA restored-main leg failed: {error}"))?;
+    let main_raw_hits = emu.persistent_watch_hits();
+    let main_hit_end = main_hit_start + main_raw_hits.len();
     let main_trace_end = emu.executed_addresses().len();
     let main_pending_rip = emu
         .read_reg(RegisterX86::RIP)
         .map_err(|error| format!("failed to read post-CreateWindowExA main stop RIP: {error}"))?;
     let main_pending_api = env.callable_stub_name_at(main_pending_rip);
-    let raw_hits = emu.persistent_watch_hits();
-    if raw_hits.len() >= config.watch_hit_cap {
+    if main_raw_hits.len() >= restored_main_watch_hit_cap {
         return Err(format!(
-            "post-CreateWindowExA poll watch reached its {}-hit cap",
-            config.watch_hit_cap
+            "restored-main watch reached its {}-hit cap",
+            restored_main_watch_hit_cap
         ));
     }
+    let mut raw_hits = pre_main_raw_hits;
+    raw_hits.extend(main_raw_hits);
     let release_writer_index =
         last_writer_before_releasing_compare(&raw_hits, poll, main_hit_start..main_hit_end);
     let main_rips = emu
@@ -974,7 +1043,25 @@ fn run_poll_window_return(
         .get(main_trace_start..main_trace_end)
         .ok_or_else(|| "post-CreateWindowExA main trace bounds are inconsistent".to_owned())?
         .to_vec();
-    let main_loop_repeated = main_leg.handled == ["Sleep"]
+    let main_terminal_registers = read_cpu_state(&emu)?;
+    let main_final_rsp = register_value(&main_terminal_registers, RegisterX86::RSP)
+        .ok_or_else(|| "restored-main terminal snapshot is missing RSP".to_owned())?;
+    let main_frozen_tail = emu.recent_instructions();
+    let main_terminal_call = derive_register_call_terminal(
+        &emu,
+        &main_rips,
+        main_final_rsp,
+        &main_terminal_registers,
+        &main_frozen_tail,
+    )?;
+    if matches!(&main_leg.stop, TrapStop::NullControlTransfer)
+        && main_terminal_call.is_none_or(|call| call.target_value != 0)
+    {
+        return Err("restored-main null is not a validated zero-target register call".to_owned());
+    }
+    let main_tail_instructions = format_tail(&main_frozen_tail, &main_rips, 64)?;
+    let main_loop_repeated = !main_leg.handled.is_empty()
+        && main_leg.handled.iter().all(|name| name == "Sleep")
         && is_call_bound_stop(&main_leg.stop)
         && main_pending_api.as_deref() == Some("Sleep");
     let instructions_past_poll = if main_loop_repeated {
@@ -994,6 +1081,43 @@ fn run_poll_window_return(
         ));
     }
     let hits = format_watch_hits(raw_hits)?;
+    let zero_target_provenance = match main_terminal_call {
+        Some(call) if call.target_value == 0 && config.export_name_control.is_none() => {
+            derive_zero_target_provenance(
+                hits.get(main_hit_start..main_hit_end)
+                    .ok_or_else(|| "restored-main watch-hit bounds are inconsistent".to_owned())?,
+                &main_tail_instructions,
+                call,
+            )?
+        }
+        _ => None,
+    };
+    if matches!(&main_leg.stop, TrapStop::NullControlTransfer)
+        && config.export_name_control.is_none()
+        && zero_target_provenance.is_none()
+    {
+        return Err("restored-main null has no bounded deliberate-zero provenance".to_owned());
+    }
+    if let Some(control) = &config.export_name_control {
+        if !env.module_export_name_control_was_applied(&control.module_name) {
+            return Err(format!(
+                "export-name control for {:?} was never applied",
+                control.module_name
+            ));
+        }
+        if let Some(added_name) = single_added_kernel32_name(control) {
+            let classified = matches!(
+                &main_leg.stop,
+                TrapStop::UnhandledApi { name, .. } if name == &added_name
+            ) && main_pending_api.as_deref() == Some(added_name.as_str())
+                && main_terminal_call.is_some_and(|call| call.target_value != 0);
+            if !classified {
+                return Err(format!(
+                    "single-name kernel32 control did not expose {added_name:?} as the nonzero post-poll boundary"
+                ));
+            }
+        }
+    }
     if !hits[..post_create_hit_start]
         .iter()
         .any(|entry| is_main_poll_compare(entry, poll))
@@ -1022,9 +1146,14 @@ fn run_poll_window_return(
         release_writer_index,
         poll_final,
         main_stop: main_leg.stop,
+        main_handled: main_leg.handled,
         main_pending_api,
         restored_main_cap,
+        restored_main_watch_hit_cap,
         main_rips,
+        main_tail_instructions,
+        main_terminal_call,
+        zero_target_provenance,
         instructions_past_poll,
     })
 }
@@ -1813,6 +1942,218 @@ fn derive_terminal_transfer(
         },
         pointer_cell,
     ))
+}
+
+fn derive_register_call_terminal(
+    emu: &Emu,
+    rips: &[u64],
+    final_rsp: u64,
+    final_registers: &[(RegisterX86, u64)],
+    frozen_tail: &[FrozenInstruction],
+) -> Result<Option<RegisterCallTerminal>, String> {
+    let Some(last) = rips.last().copied() else {
+        return Ok(None);
+    };
+    let frozen = frozen_tail
+        .last()
+        .filter(|instruction| instruction.address == last)
+        .ok_or_else(|| "restored-main terminal has no matching hook-time snapshot".to_owned())?;
+    let mut decoder = Decoder::with_ip(64, &frozen.bytes, last, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() || instruction.len() != frozen.bytes.len() {
+        return Err(
+            "restored-main terminal hook-time bytes do not decode as one exact instruction"
+                .to_owned(),
+        );
+    }
+    if instruction.code() != Code::Call_rm64 || instruction.op0_kind() != OpKind::Register {
+        return Ok(None);
+    }
+    if instruction.stack_pointer_increment() != -8
+        || instruction.has_segment_prefix()
+        || has_operand_size_override_prefix(&frozen.bytes)
+    {
+        return Err(format!(
+            "restored-main register call has an unsupported encoding: {}",
+            format_instruction(&instruction)
+        ));
+    }
+    let target_register = instruction.op0_register().full_register();
+    if target_register == Register::RSP {
+        return Err("restored-main register call uses RSP as its target".to_owned());
+    }
+    let target_value = iced_register_value(target_register, final_registers).ok_or_else(|| {
+        format!("restored-main register call uses unsupported {target_register:?}")
+    })?;
+    if register_value(final_registers, RegisterX86::RIP) != Some(target_value) {
+        return Err(format!(
+            "restored-main register-call target 0x{target_value:016x} disagrees with final RIP"
+        ));
+    }
+    if register_value(final_registers, RegisterX86::RSP) != Some(final_rsp) {
+        return Err("restored-main register-call snapshot RSP disagrees with final RSP".to_owned());
+    }
+    let pushed_return_address = read_u64(emu, final_rsp)?;
+    if pushed_return_address != instruction.next_ip() {
+        return Err(format!(
+            "restored-main register call did not push its fallthrough: expected 0x{:016x}, got 0x{pushed_return_address:016x}",
+            instruction.next_ip()
+        ));
+    }
+    Ok(Some(RegisterCallTerminal {
+        global_instruction_index: frozen.global_instruction_index,
+        instruction_address: last,
+        target_register,
+        target_value,
+        pushed_return_cell: final_rsp,
+        pushed_return_address,
+    }))
+}
+
+fn decode_watch_instruction(hit: &PersistentWatchHit) -> Option<iced_x86::Instruction> {
+    let mut decoder = Decoder::with_ip(64, &hit.code_window, hit.rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    (!instruction.is_invalid() && instruction.ip() == hit.rip).then_some(instruction)
+}
+
+fn is_full_qword_frame_push(entry: &FormattedWatchHit, tail: &[FormattedInstruction]) -> bool {
+    if entry.hit.is_write
+        || entry.hit.size != 8
+        || !tail
+            .iter()
+            .any(|instruction| instruction.address == entry.hit.rip)
+    {
+        return false;
+    }
+    let Some(instruction) = decode_watch_instruction(&entry.hit) else {
+        return false;
+    };
+    if instruction.code() != Code::Push_rm64
+        || instruction.memory_base() == Register::None
+        || instruction.memory_base().full_register() == Register::RSP
+        || instruction.memory_index() != Register::None
+        || instruction.has_segment_prefix()
+        || instruction.stack_pointer_increment() != -8
+    {
+        return false;
+    }
+    let Some(base) = iced_register_value(instruction.memory_base(), &entry.hit.registers) else {
+        return false;
+    };
+    base.wrapping_add(instruction.memory_displacement64()) == entry.hit.address
+}
+
+fn derive_zero_target_provenance(
+    main_hits: &[FormattedWatchHit],
+    tail: &[FormattedInstruction],
+    terminal: RegisterCallTerminal,
+) -> Result<Option<ZeroTargetProvenance>, String> {
+    if terminal.target_value != 0 {
+        return Ok(None);
+    }
+    let main_stack_end = STACK_BASE
+        .checked_add(STACK_SIZE)
+        .ok_or_else(|| "main stack range overflows".to_owned())?;
+    let mut candidates = Vec::new();
+    for (consumer_index, consumer) in main_hits.iter().enumerate() {
+        if consumer.hit.value != Some(terminal.target_value)
+            || !(STACK_BASE..main_stack_end).contains(&consumer.hit.address)
+            || !is_full_qword_frame_push(consumer, tail)
+        {
+            continue;
+        }
+        let Some(writer_index) = main_hits[..consumer_index].iter().rposition(|entry| {
+            entry.hit.is_write && entry.hit.address == consumer.hit.address && entry.hit.size == 8
+        }) else {
+            continue;
+        };
+        let writer = &main_hits[writer_index];
+        if writer.hit.value != Some(0) {
+            continue;
+        }
+        let Some(writer_instruction) = decode_watch_instruction(&writer.hit) else {
+            continue;
+        };
+        let mut info_factory = InstructionInfoFactory::new();
+        if !info_factory
+            .info(&writer_instruction)
+            .used_memory()
+            .iter()
+            .any(|memory| {
+                matches!(
+                    memory.access(),
+                    OpAccess::ReadWrite | OpAccess::ReadCondWrite
+                )
+            })
+        {
+            continue;
+        }
+        if main_hits[writer_index + 1..consumer_index]
+            .iter()
+            .any(|entry| {
+                entry.hit.is_write
+                    && access_overlaps(entry.hit.address, entry.hit.size, consumer.hit.address, 8)
+            })
+        {
+            continue;
+        }
+        let input = main_hits[..writer_index].iter().rev().find(|entry| {
+            !entry.hit.is_write
+                && entry.hit.global_instruction_index == writer.hit.global_instruction_index
+                && entry.hit.rip == writer.hit.rip
+                && entry.hit.address == writer.hit.address
+                && entry.hit.size == writer.hit.size
+        });
+        let Some(input) = input else {
+            continue;
+        };
+        let Some(zero_writer_input) = input.hit.value.filter(|value| *value != 0) else {
+            continue;
+        };
+        candidates.push(ZeroTargetProvenance {
+            source_cell: consumer.hit.address,
+            source_read_rip: consumer.hit.rip,
+            source_read_global_instruction_index: consumer.hit.global_instruction_index,
+            source_value: terminal.target_value,
+            zero_writer_rip: writer.hit.rip,
+            zero_writer_global_instruction_index: writer.hit.global_instruction_index,
+            zero_writer_input,
+            zero_writer_output: 0,
+            zero_writer_instruction: writer.instruction.clone(),
+        });
+    }
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some(candidate.clone())),
+        _ => Err(format!(
+            "restored-main zero provenance has {} source candidates",
+            candidates.len()
+        )),
+    }
+}
+
+fn single_added_kernel32_name(control: &ExportNameControl) -> Option<String> {
+    if !control.module_name.eq_ignore_ascii_case("kernel32.dll") {
+        return None;
+    }
+    let mut baseline = KERNEL32_EXPORTS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    baseline.sort_unstable();
+    baseline.dedup();
+    if control.names.len() != baseline.len() + 1
+        || !baseline
+            .iter()
+            .all(|name| control.names.binary_search(name).is_ok())
+    {
+        return None;
+    }
+    control
+        .names
+        .iter()
+        .find(|name| baseline.binary_search(name).is_err())
+        .cloned()
 }
 
 #[cfg(test)]
@@ -3180,8 +3521,25 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
     println!("child_per_leg_cap:     {}", config.child_per_leg_cap);
     println!("watch_hit_cap:         {}", config.watch_hit_cap);
     println!("poll_window_only:      true");
-    println!("export_control_module: \"user32.dll\"");
-    println!("export_control_names:  3");
+    println!("window_control_module: \"user32.dll\"");
+    println!("window_control_names:  3");
+    match &config.export_name_control {
+        Some(control) => {
+            println!("extra_control_module:  {:?}", control.module_name);
+            println!("extra_control_names:   {}", control.names.len());
+            println!("extra_control_applied: true");
+            println!(
+                "single_added_export:   {:?}",
+                single_added_kernel32_name(control)
+            );
+        }
+        None => {
+            println!("extra_control_module:  <none>");
+            println!("extra_control_names:   0");
+            println!("extra_control_applied: false");
+            println!("single_added_export:   None");
+        }
+    }
     println!(
         "main_prefix_calls:     {}",
         evidence.main_prefix_handled.len()
@@ -3267,8 +3625,20 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
         trace_digest(&evidence.post_create_rips)
     );
     println!("main_stop:             {:?}", evidence.main_stop);
+    println!("main_handled:          {:?}", evidence.main_handled);
     println!("main_pending_api:      {:?}", evidence.main_pending_api);
     println!("restored_main_cap:     {}", evidence.restored_main_cap);
+    println!(
+        "restored_watch_hits:   {}",
+        evidence
+            .hits
+            .len()
+            .saturating_sub(evidence.post_create_hit_end)
+    );
+    println!(
+        "restored_watch_cap:    {}",
+        evidence.restored_main_watch_hit_cap
+    );
     println!("main_rips:             {}", evidence.main_rips.len());
     println!(
         "main_digest:           0x{:016x}",
@@ -3278,8 +3648,77 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
         "instructions_past_poll: {}",
         evidence.instructions_past_poll
     );
+    let tail_rips = evidence
+        .main_tail_instructions
+        .iter()
+        .map(|instruction| instruction.address)
+        .collect::<Vec<_>>();
+    println!("main_tail_rips:        {}", tail_rips.len());
+    println!("main_tail_digest:      0x{:016x}", trace_digest(&tail_rips));
+    match evidence.main_terminal_call {
+        Some(call) => {
+            println!(
+                "main_terminal_call:    global {} 0x{:016x}: call {:?} -> 0x{:016x}",
+                call.global_instruction_index,
+                call.instruction_address,
+                call.target_register,
+                call.target_value
+            );
+            println!(
+                "main_call_fallthrough: cell=0x{:016x} value=0x{:016x}",
+                call.pushed_return_cell, call.pushed_return_address
+            );
+        }
+        None => println!("main_terminal_call:    <not a register call>"),
+    }
+    match &evidence.zero_target_provenance {
+        Some(source) => {
+            println!(
+                "zero_target_writer:    global {} 0x{:016x}: {} input=0x{:016x} output=0x{:016x}",
+                source.zero_writer_global_instruction_index,
+                source.zero_writer_rip,
+                source.zero_writer_instruction,
+                source.zero_writer_input,
+                source.zero_writer_output
+            );
+            println!(
+                "zero_target_consumer:  global {} 0x{:016x} cell=0x{:016x} value=0x{:016x}",
+                source.source_read_global_instruction_index,
+                source.source_read_rip,
+                source.source_cell,
+                source.source_value
+            );
+        }
+        None => println!("zero_target_writer:    <not applicable>"),
+    }
+    let classification = match (
+        config.export_name_control.is_some(),
+        config
+            .export_name_control
+            .as_ref()
+            .and_then(single_added_kernel32_name),
+        &evidence.main_stop,
+        evidence.main_pending_api.as_deref(),
+    ) {
+        (true, Some(added), TrapStop::UnhandledApi { name, .. }, Some(pending))
+            if added == *name && added == pending =>
+        {
+            format!("(b) missing API/return: {added}")
+        }
+        (true, None, TrapStop::UnhandledApi { name, .. }, Some(pending)) if name == pending => {
+            format!("names-only discovery exposes missing API candidate: {name}")
+        }
+        (false, None, TrapStop::NullControlTransfer, None) => {
+            "baseline zero-target register call; apply a names-only control to classify".to_owned()
+        }
+        _ => "control does not classify this terminal".to_owned(),
+    };
+    println!("post_poll_classification: {classification}");
     println!("poll watch hits:");
     for (index, entry) in evidence.hits.iter().enumerate() {
+        let Some(watched_value) = watched_byte(&entry.hit, evidence.poll.address) else {
+            continue;
+        };
         let phase = if index < evidence.post_create_hit_start {
             "main-or-child-prefix".to_owned()
         } else if (evidence.post_create_hit_start..evidence.post_create_hit_end).contains(&index) {
@@ -3288,15 +3727,12 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
             "restored-main".to_owned()
         };
         let operation = if entry.hit.is_write { "W" } else { "R" };
-        let watched_value = watched_byte(&entry.hit, evidence.poll.address)
-            .map_or_else(|| "None".to_owned(), |value| format!("Some(0x{value:02x})"));
         println!(
-            "  [{:>12}] phase={phase} {operation} addr=0x{:016x} size={} access_value={} poll_byte={} rip=0x{:016x}",
+            "  [{:>12}] phase={phase} {operation} addr=0x{:016x} size={} access_value={} poll_byte=0x{watched_value:02x} rip=0x{:016x}",
             entry.hit.global_instruction_index,
             entry.hit.address,
             entry.hit.size,
             format_optional_value(entry.hit.value),
-            watched_value,
             entry.hit.rip,
         );
         println!("      insn: {}", entry.instruction);
@@ -3801,6 +4237,29 @@ mod tests {
     }
 
     #[test]
+    fn committed_kernel32_control_adds_exactly_one_runtime_name() {
+        let names = parse_export_name_control(include_str!(
+            "../docs/controls/kernel32-with-getcommandlinea.txt"
+        ))
+        .unwrap();
+        let control = ExportNameControl {
+            module_name: "kernel32.dll".to_owned(),
+            names,
+        };
+        assert_eq!(
+            single_added_kernel32_name(&control).as_deref(),
+            Some("GetCommandLineA")
+        );
+
+        let mut missing_baseline = control.clone();
+        missing_baseline.names.retain(|name| name != "Sleep");
+        assert_eq!(single_added_kernel32_name(&missing_baseline), None);
+        let mut wrong_module = control;
+        wrong_module.module_name = "user32.dll".to_owned();
+        assert_eq!(single_added_kernel32_name(&wrong_module), None);
+    }
+
+    #[test]
     fn watch_hit_formatting_requires_hook_time_code_bytes() {
         let hit = PersistentWatchHit {
             global_instruction_index: 7,
@@ -4130,6 +4589,156 @@ mod tests {
             &disp8_call,
         )
         .is_err());
+    }
+
+    #[test]
+    fn register_call_terminal_derives_runtime_register_and_fallthrough() {
+        const CALL_BASE: u64 = 0x0000_0000_0104_0000;
+        let initial_rsp = STACK_BASE + 0xa000;
+        let image = PeImage {
+            image_base: CALL_BASE,
+            entry_point_rva: 0,
+            size_of_headers: 0,
+            size_of_image: 0x1000,
+            subsystem: 3,
+            sections: Vec::new(),
+        };
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CALL_BASE, &[0x41, 0xff, 0xd2]).unwrap(); // call r10
+        emu.write_reg(RegisterX86::R10, 0).unwrap();
+        emu.write_reg(RegisterX86::RSP, initial_rsp).unwrap();
+        emu.install_code_trace_hook().unwrap();
+
+        let mut env = Win64Env::new(CALL_BASE);
+        let result = run_with_import_trap(&mut env, &mut emu, &image, CALL_BASE, 16, 1).unwrap();
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
+        let final_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let registers = read_cpu_state(&emu).unwrap();
+        let terminal = derive_register_call_terminal(
+            &emu,
+            &emu.executed_addresses(),
+            final_rsp,
+            &registers,
+            &emu.recent_instructions(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(terminal.instruction_address, CALL_BASE);
+        assert_eq!(terminal.target_register, Register::R10);
+        assert_eq!(terminal.target_value, 0);
+        assert_eq!(terminal.pushed_return_cell, initial_rsp - 8);
+        assert_eq!(terminal.pushed_return_address, CALL_BASE + 3);
+
+        emu.write_mem(final_rsp, &0u64.to_le_bytes()).unwrap();
+        assert!(derive_register_call_terminal(
+            &emu,
+            &emu.executed_addresses(),
+            final_rsp,
+            &registers,
+            &emu.recent_instructions(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn zero_target_provenance_requires_a_paired_nonzero_to_zero_writer() {
+        let source_cell = STACK_BASE + 0x5008;
+        let rbp = source_cell + 8;
+        let writer_rip = 0x1000;
+        let consumer_rip = 0x1010;
+        let registers = vec![
+            (RegisterX86::RBP, rbp),
+            (RegisterX86::RAX, 0x55),
+            (RegisterX86::RSP, STACK_BASE + 0x6000),
+        ];
+        let raw_hits = vec![
+            PersistentWatchHit {
+                global_instruction_index: 10,
+                is_write: false,
+                address: source_cell,
+                size: 8,
+                rip: writer_rip,
+                value: Some(0x55),
+                registers: registers.clone(),
+                code_window: vec![0x48, 0x31, 0x45, 0xf8], // xor [rbp-8],rax
+            },
+            PersistentWatchHit {
+                global_instruction_index: 10,
+                is_write: true,
+                address: source_cell,
+                size: 8,
+                rip: writer_rip,
+                value: Some(0),
+                registers: registers.clone(),
+                code_window: vec![0x48, 0x31, 0x45, 0xf8],
+            },
+            PersistentWatchHit {
+                global_instruction_index: 20,
+                is_write: false,
+                address: source_cell,
+                size: 8,
+                rip: consumer_rip,
+                value: Some(0),
+                registers,
+                code_window: vec![0xff, 0x75, 0xf8], // push qword [rbp-8]
+            },
+        ];
+        let hits = format_watch_hits(raw_hits).unwrap();
+        let tail = vec![FormattedInstruction {
+            address: consumer_rip,
+            instruction: "push qword [rbp-8]".to_owned(),
+            writes_r13: Some(false),
+        }];
+        let terminal = RegisterCallTerminal {
+            global_instruction_index: 30,
+            instruction_address: 0x1020,
+            target_register: Register::RAX,
+            target_value: 0,
+            pushed_return_cell: STACK_BASE + 0x7000,
+            pushed_return_address: 0x1022,
+        };
+        let provenance = derive_zero_target_provenance(&hits, &tail, terminal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.source_cell, source_cell);
+        assert_eq!(provenance.zero_writer_input, 0x55);
+        assert_eq!(provenance.zero_writer_output, 0);
+
+        let mut zero_input = hits.clone();
+        zero_input[0].hit.value = Some(0);
+        assert_eq!(
+            derive_zero_target_provenance(&zero_input, &tail, terminal).unwrap(),
+            None
+        );
+
+        let mut conflicting = hits.clone();
+        conflicting.insert(
+            2,
+            FormattedWatchHit {
+                hit: PersistentWatchHit {
+                    global_instruction_index: 15,
+                    is_write: true,
+                    address: source_cell + 1,
+                    size: 1,
+                    rip: 0x1008,
+                    value: Some(0),
+                    registers: Vec::new(),
+                    code_window: vec![0x90],
+                },
+                instruction: "nop".to_owned(),
+                fallthrough: vec![(0x1008, "nop".to_owned())],
+            },
+        );
+        assert_eq!(
+            derive_zero_target_provenance(&conflicting, &tail, terminal).unwrap(),
+            None
+        );
+
+        let mut duplicate = hits;
+        let mut second_consumer = duplicate[2].clone();
+        second_consumer.hit.global_instruction_index = 21;
+        duplicate.push(second_consumer);
+        assert!(derive_zero_target_provenance(&duplicate, &tail, terminal).is_err());
     }
 
     #[test]
