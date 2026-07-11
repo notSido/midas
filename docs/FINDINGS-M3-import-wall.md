@@ -3154,3 +3154,99 @@ target/release/examples/trace_child_postmortem \
   samples/test_target_protected.exe 60000000 100000 4096 \
   --frontier-only
 ```
+
+## Poll release producer is a post-`CreateWindowExA` child store
+
+The poll producer was identified without adding another Win64 API handler.
+`trace_child_postmortem --poll-window` first derives the poll comparison from
+one bounded Sleep-to-Sleep replay, then starts a fresh emulator with a one-byte
+persistent watch armed before guest entry. Discovery selects the unique
+executed base-register-only `cmp r/m8,r8` whose byte equals the compared
+register at the repeated Sleep boundary. It does not assume an address,
+instruction index, or register allocation. This matters across the two
+observed variants: formal sample 1 uses `cmp [r12],dil`, while sample 3 uses
+`cmp [rsi],al`.
+
+The discovery hook is installed with an empty range before the first guest
+translation block executes, then reconfigured for the one-leg image-memory
+capture. The final one-byte watch remains armed across the main prefix, child
+execution, CPU-context restoration, and the resumed main leg. All retained
+accesses use hook-time instruction bytes and the persistent global instruction
+index. Retained restored-main instruction history has an independent
+1,000,000-instruction diagnostic cap; both reported runs stop naturally below
+72,000 instructions.
+
+### The advanced null is `CreateWindowExA`
+
+The prior advanced child terminal carries the complete x64 argument frame for
+`CreateWindowExA`: extended style `8`, class name `"SplashClassName"`, NULL
+window name, style `0x90000000`, default x/y `0x8000`, dimensions
+`0x237` by `0x12b`, NULL parent/menu, process image instance, and NULL
+parameter. Two names-only USER32 controls distinguish the A and W exports:
+
+| Control | Input SHA-256 | Formal output SHA-256 | Result |
+|---|---|---|---|
+| `user32-with-createwindowa.txt` | `91d4ca9bffea7a669bcf508f155d5a2f62604678a203700ee0fe479a2419d2b2` | `4101946e1dae39e2231a9da3d7a94c0fd3e1b2d17038b3010ac9565e8f13ae31` | The same 44,386-RIP child reaches `UnhandledApi { name: "CreateWindowExA" }` at the selected USER32 stub |
+| `user32-with-createwindoww.txt` | `f4a63033e35bbd557c81ab56dd6f619b7c2c3955b20581209399d42f67c153d5` | `e81e62774c5539ddd19365e8f20925c7c072d25127968e802e7c87b89784a040` | The target remains zero with the exact baseline child digest |
+
+This identifies the resolver-selected name and ABI shape. It does not
+implement `CreateWindowExA` or claim a complete USER32 window lifecycle.
+
+### Writer and main-loop release
+
+The bounded treatment returns a diagnostic nonzero opaque HWND at the derived
+`CreateWindowExA` boundary, without registering window state or invoking a
+WndProc. The existing child then executes until the next named frontier. The
+poll watch records a child store of byte one, after which restoring the saved
+main CPU context makes the next comparison read one and leave the Sleep loop.
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---|---|
+| Runtime-derived poll cell / compare | `0x000000014005aae0`; `0x000000014005ffeb: cmp [r12],dil` | `0x0000000140072f20`; `0x000000014006da94: cmp [rsi],al` |
+| False initializer | global 425,458, `0x000000014030b1c5: rep movsb`, stores `0` | global 1,335,237, `0x000000014033d1c5: rep movsb`, stores `0` |
+| Release writer | global 35,212,364, `0x00000001400a3fe8: mov [r9],r8b`, with `R9 = poll`, `R8B = 1` | global 36,966,978, `0x00000001400a62ea: mov [r15],r12b`, with `R15 = poll`, `R12B = 1` |
+| Post-create child frontier | handles `GetProcessHeap`, then stops at unhandled `RtlFreeHeap` after 10,567 RIPs (`0xf2cb668d6f40311a`) | same named frontier after 10,466 RIPs (`0x1cd09314fee386f6`) |
+| Restored main | reads `1`; 66,682 RIPs (`0xca21a387d6e00ed4`), including 64,695 instructions past the poll, then null control transfer | reads `1`; 71,516 RIPs (`0x8fe001a0013d9c96`), including 69,544 instructions past the poll, then null control transfer |
+
+Formal output `/tmp/midas-poll-window-final.txt` has SHA-256
+`1d7ff8ea9214236887f7f9eebc4277389ec44dc461f8528b2f3de4fcf0c79177`.
+The sample-3 engineering corroboration has SHA-256
+`f3eff209b697464accfc38a00673d45ccc26d1b09a8c6724472036b060d4cb56`;
+its provenance remains incomplete, so it is not formal milestone evidence.
+
+The producer is therefore classified as a **child-thread store after the
+window-creation return**, not the timer/APC/VEH/loader initializer alternatives
+for this observed release path. The previous scheduler-only negative control
+remains compatible with this result: its child stopped before receiving a
+valid `CreateWindowExA` return and therefore never reached the writer. This
+treatment runs the child through the store before restoring main, so it does
+not establish that fine-grained interleaving is required. A scheduler remains
+necessary to execute the created thread in production, but scheduler behavior
+alone is not sufficient; the observed window-creation boundary must also be
+handled. No production scheduler, window API, WndProc dispatch, or
+`RtlFreeHeap` handler is added in this slice.
+
+The main now has a positive north-star measurement under the bounded
+treatment, but the later null is not classified as OEP. OEP detection can
+shorten later execution once a natural transfer reaches an original-code
+candidate; it cannot replace the release prerequisite demonstrated here.
+
+Reproduce the controls and poll treatment locally with the formal sample:
+
+```text
+cargo build --locked --release --example trace_child_postmortem
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  user32.dll docs/controls/user32-with-createwindowa.txt \
+  --frontier-only > /tmp/midas-createwindowa-final.txt
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  user32.dll docs/controls/user32-with-createwindoww.txt \
+  --frontier-only > /tmp/midas-createwindoww-final.txt
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  --poll-window > /tmp/midas-poll-window-final.txt
+```

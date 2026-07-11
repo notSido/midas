@@ -49,6 +49,7 @@ implemented" section describe the latest production frontier.
 | Expanded production child post-mortem through the two USER32 calls: the child tracer accepts a bounded named-API tail, classifies a zero-target indirect qword `call` separately from the earlier RET terminal, and whole-run watches the derived pointer cell. Relevant watched code windows and the retained terminal tail are frozen at hook time rather than decoded from later writable guest memory. No VM-handler role is assigned to the current pointer cell, and the terminal is not classified as a clean thread return or OEP. | `cargo test --all-targets` is green with 152 tests (139 library, 10 `trace_child_postmortem`, and 3 `trace_slot`), and the full build plus `clippy -D warnings` pass. Formal release `trace_child_postmortem` handles child tail `[timeGetTime, LoadCursorA, RegisterClassExA]`, then executes `call qword [rdi+20108h]` at `0x000000014019b098`, with runtime-derived pointer cell `0x000000014006f108`; the pointer is zero and the pushed return is `0x000000014019b09e`. It reproduces 28,135 child RIPs (`0x6b27c3a47b61a00d`), 14,049 post-time RIPs (`0x9aecc2c386795f99`), and the unchanged 3,527-RIP restored-main Sleep digest `0x7fce9fdb31fbfd70`. The whole-run watch retains earlier byte initialization writes, then the last guest write before the final read is a qword-zero store at global 28,615,712, `0x00000001400accf7: mov [r9],rbx`, with no later watched write. An independent 841-name USER32 control does not change this post-class terminal, so it is not classified as another USER32 export gap. Incomplete-provenance sample 3 corroborates the same handled tail and a separate indirect-zero terminal with 27,654 child RIPs (`0x25e21a892db20b71`); sample 2 does not reach pending Sleep and is not a child-replay artifact. | M3 (groundwork) |
 | Bounded names-only module controls and first-frontier diagnostic mode: a control can replace one not-yet-loaded synthetic module's export seed with at most 4,096 strictly sorted unique printable names. The environment records whether the override actually supplied the mapped module and the child diagnostic rejects an unconsumed treatment. `--frontier-only` prints the first child terminal and skips all later provenance replays. Registered WndProc, synthetic-module ranges, child-TEB accesses, and terminal stack qwords remain read-only observations. | Focused tests cover bounds, ordering, duplicate/preload rejection, applied-state projection, and the dedicated kernel32 mapping route that previously bypassed controls. The committed 19-name and 20-name kernel32 inputs differ only by `WideCharToMultiByte` and have SHA-256 values `ead2f345b2eebfeedfabbd1551e1029fd721678d0d068321b598948ade757234` and `dfd7ed5f8d57f01047b511334aa6e45c42362964b7b0baba56c74561bc2490db`. Their formal output artifacts reproduce the old null versus the advanced frontier. | M3 (groundwork) |
 | Observed kernel32 export + bounded `WideCharToMultiByte`: the seed now includes the causally identified name. Dispatch supports CP_ACP, flags zero, `cchWideChar=-1`, null default-character pointers, and null-terminated printable 7-bit ASCII within 260 UTF-16 units. The query form returns the derived byte count including null; the conversion form requires a distinct non-null output with exactly the derived size, writes the derived bytes and terminator without changing the suffix, and returns that count. General code pages, flags, explicit lengths, non-ASCII/cap-exhausted inputs, host locale/code-page state, and last-error behavior remain unmodeled. | `cargo test --all-targets` is green with 160 tests (146 library, 11 `trace_child_postmortem`, and 3 `trace_slot`). Six focused API tests cover repeated/fresh query identity, dirty upper halves, output/suffix behavior, non-ASCII/cap rejection, unmodeled no-input/no-return access, input/return/output failure atomicity, and name-resolved kernel32 dispatch. The formal one-name treatment changes the established cell from zero to the `WideCharToMultiByte` stub. Production handles size query `(0,0,L"guest.exe",-1,NULL,0,NULL,NULL)` and conversion `(0,0,L"guest.exe",-1,buffer,10,NULL,NULL)`, both returning 10; then reaches a distinct near-return null after 44,386 child RIPs (`0xed010b86a52a2ab2`) and 30,300 post-time RIPs (`0x3d2b90b3678f0d4e`). Restored main remains the exact 3,527-RIP Sleep leg (`0x7fce9fdb31fbfd70`). Incomplete-provenance sample 3 independently handles the same two forms and seven-API tail before its own near-return null; it remains engineering corroboration. | M3 |
+| Runtime-derived poll-release diagnostic: a persistent whole-run watch identifies the release producer as a child-thread byte-one store after a bounded nonzero return at the causally confirmed `CreateWindowExA` boundary; restored formal-sample main execution advances 64,695 instructions past the poll, while production scheduling/window semantics and OEP proof remain absent. | [Formal finding and reproducer](docs/FINDINGS-M3-import-wall.md#poll-release-producer-is-a-post-createwindowexa-child-store) | M3 (groundwork) |
 
 ## Not yet implemented
 
@@ -87,29 +88,34 @@ store its synthetic kernel32 stub, and the terminal arguments exactly match
 the documented eight-argument size query for `L"guest.exe"`. Production
 supports that query and the immediately observed output conversion. The
 earlier `CreateWindowExA/W` and window-construction inference is superseded for
-this call.
+that historical indirect call only. The later distinct terminal is separately
+identified as `CreateWindowExA` by its complete argument frame and an A-versus-W
+names-only control.
 
-The advanced formal child handles tail `[timeGetTime, LoadCursorA,
-RegisterClassExA, WideCharToMultiByte, GetProcessHeap, RtlAllocateHeap,
-WideCharToMultiByte]`, but it still does not release the main poll and reaches a
-distinct near-return null. `--frontier-only` stops there without entering the
-legacy provenance passes. Exact CPU restoration reproduces the unchanged main
-loop. Completing one extra serial main Sleep leg before child entry and
-returning fixed uptime 1 or 1,000 do not change their tested frontiers; changing
-the child return sentinel did not change the older indirect-call frontier. A
-main TEB-prefix watch through `+0x70` and a full
-advanced-child TEB watch expose no `ClientId` or TLS access; the formal TLS
-callback array is empty; and mapped synthetic modules expose no guest DLL
-notification target. These controls exclude the observed identity,
-fixed-uptime-value, old-frontier sentinel-value sensitivity,
-one-extra-main-leg ordering, and mapped-image notification dependencies, not
-the advanced terminal's return/startup provenance, a coherently advancing
-clock, `Sleep` coupling, general scheduling, or every real-system-DLL effect. A
-scheduler remains a
-prerequisite for normal child execution, but running the advanced child once is
-not sufficient to release the poll. Incomplete-provenance sample 3 provides
-engineering corroboration for both conversion forms and the seven-API tail;
-sample 2 remains on its documented separate path.
+The normal production path still never schedules the created child. In a
+bounded diagnostic replay, returning only a nonzero opaque HWND at the
+runtime-confirmed `CreateWindowExA` boundary lets existing child code store byte
+one into the runtime-derived poll cell. Restoring the saved main CPU context
+then produces 64,695 instructions past the formal poll before a later null
+control transfer; no OEP is claimed. The earlier scheduler-only negative
+control remains valid because its child stopped before this window boundary.
+The positive replay does not prove fine-grained interleaving is required: one
+child run through the persistent store releases the next main leg. A production
+scheduler remains necessary, but is not sufficient without bounded
+window-creation behavior. `RtlFreeHeap` is the next child API frontier.
+
+Completing one extra serial main Sleep leg before child entry and returning
+fixed uptime 1 or 1,000 do not change their tested frontiers; changing the child
+return sentinel did not change the older indirect-call frontier. A main
+TEB-prefix watch through `+0x70` and a full advanced-child TEB watch expose no
+`ClientId` or TLS access; the formal TLS callback array is empty; and mapped
+synthetic modules expose no guest DLL notification target. These controls
+exclude the observed identity, fixed-uptime-value, old-frontier sentinel-value
+sensitivity, one-extra-main-leg ordering, and mapped-image notification
+dependencies, not a coherently advancing clock, `Sleep` coupling, general
+scheduling, or every real-system-DLL effect. Incomplete-provenance sample 3
+independently identifies a child byte-one writer and advances 69,544 instructions
+past its runtime-derived poll; sample 2 remains on its documented separate path.
 
 CPU contexts are now available as an emulator primitive, but no production path
 uses them to schedule or execute a created thread. They do not allocate or

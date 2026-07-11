@@ -25,6 +25,7 @@ use midas::{
 const DEFAULT_MAIN_PER_LEG_CAP: u64 = 60_000_000;
 const DEFAULT_CHILD_PER_LEG_CAP: u64 = 100_000;
 const MAX_CHILD_PER_LEG_CAP: u64 = 100_000;
+const MAX_POLL_MAIN_TRACE_CAP: u64 = 1_000_000;
 const DEFAULT_WATCH_HIT_CAP: usize = 4_096;
 const MAX_WATCH_HIT_CAP: usize = 16_384;
 const FROZEN_PATH_INSTRUCTION_CAP: usize = 4;
@@ -39,6 +40,7 @@ const CHILD_TEB_BASE: u64 = 0x0000_000f_5100_0000;
 const CHILD_TEB_SIZE: u64 = 0x1000;
 const CHILD_ENTRY_HEADROOM: u64 = 0x1000;
 const CHILD_RETURN_SENTINEL: u64 = 0x0000_000e_dead_0000;
+const DIAGNOSTIC_WINDOW_HANDLE: u64 = 0x0000_000f_3000_0020;
 
 const DISPLAY_REGISTERS: [(RegisterX86, &str); 18] = [
     (RegisterX86::RAX, "rax"),
@@ -110,6 +112,7 @@ struct Config {
     watch_hit_cap: usize,
     export_name_control: Option<ExportNameControl>,
     frontier_only: bool,
+    poll_window_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +221,55 @@ struct FormattedInstruction {
     writes_r13: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MainPollObservation {
+    address: u64,
+    compare_rip: u64,
+    compared_value: u8,
+    value_at_sleep: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CreateWindowExAObservation {
+    return_address: u64,
+    extended_style: u64,
+    class_name: u64,
+    window_name: u64,
+    style: u64,
+    x: u64,
+    y: u64,
+    width: u64,
+    height: u64,
+    parent: u64,
+    menu: u64,
+    instance: u64,
+    parameter: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PollWindowEvidence {
+    poll: MainPollObservation,
+    main_prefix_handled: Vec<String>,
+    thread_id: u32,
+    thread: RunnableUnscheduledThread,
+    child_handled: Vec<String>,
+    create_window: CreateWindowExAObservation,
+    window_procedure: u64,
+    post_create_handled: Vec<String>,
+    post_create_stop: TrapStop,
+    post_create_rips: Vec<u64>,
+    hits: Vec<FormattedWatchHit>,
+    post_create_hit_start: usize,
+    post_create_hit_end: usize,
+    release_writer_index: Option<usize>,
+    poll_final: u8,
+    main_stop: TrapStop,
+    main_pending_api: Option<String>,
+    restored_main_cap: u64,
+    main_rips: Vec<u64>,
+    instructions_past_poll: usize,
+}
+
 struct SummaryEvidence<'a> {
     terminal_watch: &'a PassEvidence,
     handler_writer: HandlerWriterSource,
@@ -283,6 +335,12 @@ fn run() -> Result<(), String> {
     let image = PeImage::parse(&bytes)
         .map_err(|error| format!("failed to parse {:?}: {error}", config.path))?;
 
+    if config.poll_window_only {
+        let poll = discover_main_poll(&config, &image, &bytes)?;
+        let evidence = run_poll_window_return(&config, &image, &bytes, poll)?;
+        print_poll_window_summary(&config, &image, &evidence);
+        return Ok(());
+    }
     let first = run_pass(&config, &image, &bytes, None)?;
     if config.frontier_only {
         print_frontier_only_summary(&config, &image, &first);
@@ -525,11 +583,18 @@ fn parse_args() -> Result<Config, String> {
         .unwrap_or_else(|| "trace_child_postmortem".to_owned());
     let path = args.next().ok_or_else(|| usage(&program))?;
     let mut positional = args.collect::<Vec<_>>();
-    let frontier_only = positional
-        .last()
-        .is_some_and(|argument| argument == "--frontier-only");
-    if frontier_only {
+    let mut frontier_only = false;
+    let mut poll_window_only = false;
+    while let Some(argument) = positional.last() {
+        match argument.as_str() {
+            "--frontier-only" => frontier_only = true,
+            "--poll-window" => poll_window_only = true,
+            _ => break,
+        }
         positional.pop();
+    }
+    if frontier_only && poll_window_only {
+        return Err("--frontier-only and --poll-window are mutually exclusive".to_owned());
     }
     let main_per_leg_cap = parse_optional(
         positional.first().cloned(),
@@ -575,16 +640,18 @@ fn parse_args() -> Result<Config, String> {
         watch_hit_cap,
         export_name_control,
         frontier_only,
+        poll_window_only,
     })
 }
 
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} <pe> [main-per-leg-cap] [child-per-leg-cap] [watch-hit-cap]\n\
-         [export-control-module export-name-list] [--frontier-only]\n\
+         [export-control-module export-name-list] [--frontier-only|--poll-window]\n\
          the diagnostic derives the pending Sleep, created thread, and timeGetTime stub at runtime;\n\
          an optional newline-delimited name list changes one synthetic module's names only;\n\
-         --frontier-only prints the first child terminal without provenance replays"
+         --frontier-only prints the first child terminal without provenance replays;\n\
+         --poll-window returns a diagnostic nonzero HWND at the confirmed CreateWindowExA boundary and watches the child/main suffix"
     )
 }
 
@@ -639,6 +706,378 @@ fn arm_persistent_watch(emu: &mut Emu, spec: &WatchSpec, hit_cap: usize) -> Resu
         }
         None => emu.configure_persistent_watch(&spec.ranges, hit_cap),
     }
+}
+
+fn discover_main_poll(
+    config: &Config,
+    image: &PeImage,
+    bytes: &[u8],
+) -> Result<MainPollObservation, String> {
+    let mut emu = Emu::new().map_err(|error| format!("failed to create emulator: {error}"))?;
+    emu.map_image(image, bytes, image.image_base)
+        .map_err(|error| format!("failed to map image: {error}"))?;
+    let mut env = Win64Env::new(image.image_base);
+    if let Some(control) = &config.export_name_control {
+        if !env.configure_module_export_name_control(&control.module_name, &control.names) {
+            return Err(format!(
+                "rejected export-name control for {:?}",
+                control.module_name
+            ));
+        }
+    }
+
+    // Install the persistent memory hook before any guest translation blocks
+    // execute. The empty range retains no hits; the bounded Sleep-leg replay
+    // below replaces it after reaching the discovery boundary.
+    emu.configure_persistent_watch(&[], 0)
+        .map_err(|error| format!("failed to install poll-discovery hook: {error}"))?;
+
+    let main = run_until_pending_api(
+        &mut env,
+        &mut emu,
+        image,
+        image.entry_point_va(),
+        "Sleep",
+        config.main_per_leg_cap,
+        MAIN_API_BOUND,
+    )?;
+    let image_end = image
+        .image_base
+        .checked_add(u64::from(image.size_of_image))
+        .ok_or_else(|| "image watch range overflows".to_owned())?;
+    emu.configure_persistent_watch(&[(image.image_base, image_end)], MAX_WATCH_HIT_CAP)
+        .map_err(|error| format!("failed to arm poll-discovery watch: {error}"))?;
+    let leg = run_with_import_trap(
+        &mut env,
+        &mut emu,
+        image,
+        main.pending_address,
+        config.main_per_leg_cap,
+        1,
+    )
+    .map_err(|error| format!("failed to run poll-discovery Sleep leg: {error}"))?;
+    if leg.handled != ["Sleep"] || !is_call_bound_stop(&leg.stop) {
+        return Err(format!(
+            "poll discovery did not span one Sleep-to-Sleep leg: handled={:?}, stop={:?}",
+            leg.handled, leg.stop
+        ));
+    }
+    let hits = emu.persistent_watch_hits();
+    if hits.len() >= MAX_WATCH_HIT_CAP {
+        return Err(format!(
+            "poll-discovery watch reached its {MAX_WATCH_HIT_CAP}-hit cap"
+        ));
+    }
+    let formatted = format_watch_hits(hits)?;
+    let mut candidates = formatted
+        .iter()
+        .filter_map(|entry| {
+            let address = entry.hit.address;
+            let compared_value = simple_byte_compare_value(entry)?;
+            let observation = MainPollObservation {
+                address,
+                compare_rip: entry.hit.rip,
+                compared_value,
+                value_at_sleep: watched_byte(&entry.hit, address)?,
+            };
+            (!entry.hit.is_write
+                && entry.hit.size == 1
+                && is_simple_byte_poll_compare(entry)
+                && observation.value_at_sleep == observation.compared_value)
+                .then_some(observation)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|candidate| {
+        (
+            candidate.address,
+            candidate.compare_rip,
+            candidate.compared_value,
+            candidate.value_at_sleep,
+        )
+    });
+    candidates.dedup();
+    let pending_rip = emu
+        .read_reg(RegisterX86::RIP)
+        .map_err(|error| format!("failed to read post-discovery RIP: {error}"))?;
+    let pending_name = env.callable_stub_name_at(pending_rip);
+    if pending_name.as_deref() != Some("Sleep") {
+        return Err(format!(
+            "poll discovery ended at 0x{pending_rip:016x} {pending_name:?}, not the next Sleep"
+        ));
+    }
+    match candidates.as_slice() {
+        [poll] => Ok(*poll),
+        [] => Err(format!(
+            "poll discovery found no simple byte-compare candidate among {} image-memory hits",
+            formatted.len()
+        )),
+        _ => Err(format!(
+            "poll discovery found {} distinct simple byte-compare candidates",
+            candidates.len()
+        )),
+    }
+}
+
+fn last_writer_before_releasing_compare(
+    hits: &[PersistentWatchHit],
+    poll: MainPollObservation,
+    compare_range: std::ops::Range<usize>,
+) -> Option<usize> {
+    let compare_index = hits
+        .get(compare_range.clone())?
+        .iter()
+        .position(|hit| {
+            !hit.is_write
+                && hit.size == 1
+                && hit.address == poll.address
+                && hit.rip == poll.compare_rip
+                && is_simple_byte_poll_hit(hit)
+                && simple_byte_compare_hit_value(hit) == Some(poll.compared_value)
+                && watched_byte(hit, poll.address).is_some_and(|value| value != poll.compared_value)
+        })
+        .map(|offset| compare_range.start + offset)?;
+    hits.get(..compare_index)?
+        .iter()
+        .rposition(|hit| hit.is_write && watched_byte(hit, poll.address).is_some())
+        .filter(|index| {
+            watched_byte(&hits[*index], poll.address)
+                .is_some_and(|value| value != poll.compared_value)
+        })
+}
+
+fn run_poll_window_return(
+    config: &Config,
+    image: &PeImage,
+    bytes: &[u8],
+    poll: MainPollObservation,
+) -> Result<PollWindowEvidence, String> {
+    if config.export_name_control.is_some() {
+        return Err("--poll-window supplies its own narrow USER32 names-only treatment".to_owned());
+    }
+    let mut emu = Emu::new().map_err(|error| format!("failed to create emulator: {error}"))?;
+    emu.map_image(image, bytes, image.image_base)
+        .map_err(|error| format!("failed to map image: {error}"))?;
+    let mut env = Win64Env::new(image.image_base);
+    let user32_names = [
+        "CreateWindowExA".to_owned(),
+        "LoadCursorA".to_owned(),
+        "RegisterClassExA".to_owned(),
+    ];
+    if !env.configure_module_export_name_control("user32.dll", &user32_names) {
+        return Err("failed to configure narrow USER32 CreateWindowExA treatment".to_owned());
+    }
+    let watch_end = poll
+        .address
+        .checked_add(1)
+        .ok_or_else(|| "poll-cell watch range overflows".to_owned())?;
+    emu.configure_persistent_watch(&[(poll.address, watch_end)], config.watch_hit_cap)
+        .map_err(|error| format!("failed to arm post-CreateWindowExA poll watch: {error}"))?;
+
+    let main = run_until_pending_api(
+        &mut env,
+        &mut emu,
+        image,
+        image.entry_point_va(),
+        "Sleep",
+        config.main_per_leg_cap,
+        MAIN_API_BOUND,
+    )?;
+    if read_u8(&emu, poll.address)? != poll.value_at_sleep {
+        return Err("post-CreateWindowExA replay changed the poll before Sleep".to_owned());
+    }
+    let (thread_id, thread) = sole_runnable_thread(&env)?;
+    let main_cpu = emu
+        .capture_cpu_context()
+        .map_err(|error| format!("failed to capture post-CreateWindowExA main context: {error}"))?;
+    configure_child_runtime(&mut emu, thread)?;
+    emu.install_code_trace_hook()
+        .map_err(|error| format!("failed to install post-CreateWindowExA code trace: {error}"))?;
+    let child = run_until_pending_api(
+        &mut env,
+        &mut emu,
+        image,
+        thread.start_address,
+        "CreateWindowExA",
+        config.child_per_leg_cap,
+        CHILD_PREFIX_API_BOUND + CHILD_TAIL_API_BOUND,
+    )?;
+    if !env.module_export_name_control_was_applied("user32.dll") {
+        return Err("narrow USER32 CreateWindowExA treatment was not applied".to_owned());
+    }
+    let create_window = observe_create_window_ex_a(&emu)?;
+    let procedures = env.registered_window_procedures().collect::<Vec<_>>();
+    let [(_atom, window_procedure)] = procedures.as_slice() else {
+        return Err(format!(
+            "CreateWindowExA boundary requires one registered window procedure, got {}",
+            procedures.len()
+        ));
+    };
+    let window_procedure = *window_procedure;
+    let post_create_hit_start = emu.persistent_watch_hits().len();
+    let post_create_trace_start = emu.executed_addresses().len();
+    diagnostic_scalar_return(&mut emu, DIAGNOSTIC_WINDOW_HANDLE)?;
+    let post_create_begin = emu
+        .read_reg(RegisterX86::RIP)
+        .map_err(|error| format!("failed to read post-CreateWindowExA RIP: {error}"))?;
+    let post_create = run_with_import_trap(
+        &mut env,
+        &mut emu,
+        image,
+        post_create_begin,
+        config.child_per_leg_cap,
+        CHILD_TAIL_API_BOUND,
+    )
+    .map_err(|error| format!("post-CreateWindowExA child treatment failed: {error}"))?;
+    let post_create_hit_end = emu.persistent_watch_hits().len();
+    let post_create_trace_end = emu.executed_addresses().len();
+    let raw_hits = emu.persistent_watch_hits();
+    if raw_hits.len() >= config.watch_hit_cap {
+        return Err(format!(
+            "post-CreateWindowExA poll watch reached its {}-hit cap",
+            config.watch_hit_cap
+        ));
+    }
+    let post_create_rips = emu
+        .executed_addresses()
+        .get(post_create_trace_start..post_create_trace_end)
+        .ok_or_else(|| "post-CreateWindowExA trace bounds are inconsistent".to_owned())?
+        .to_vec();
+
+    emu.restore_cpu_context(&main_cpu)
+        .map_err(|error| format!("failed to restore post-CreateWindowExA main context: {error}"))?;
+    let main_begin = emu
+        .read_reg(RegisterX86::RIP)
+        .map_err(|error| format!("failed to read restored main RIP: {error}"))?;
+    let main_hit_start = emu.persistent_watch_hits().len();
+    let main_trace_start = emu.executed_addresses().len();
+    let restored_main_cap = config.main_per_leg_cap.min(MAX_POLL_MAIN_TRACE_CAP);
+    let main_leg =
+        run_with_import_trap(&mut env, &mut emu, image, main_begin, restored_main_cap, 1)
+            .map_err(|error| format!("post-CreateWindowExA restored-main leg failed: {error}"))?;
+    let main_hit_end = emu.persistent_watch_hits().len();
+    let main_trace_end = emu.executed_addresses().len();
+    let main_pending_rip = emu
+        .read_reg(RegisterX86::RIP)
+        .map_err(|error| format!("failed to read post-CreateWindowExA main stop RIP: {error}"))?;
+    let main_pending_api = env.callable_stub_name_at(main_pending_rip);
+    let raw_hits = emu.persistent_watch_hits();
+    if raw_hits.len() >= config.watch_hit_cap {
+        return Err(format!(
+            "post-CreateWindowExA poll watch reached its {}-hit cap",
+            config.watch_hit_cap
+        ));
+    }
+    let release_writer_index =
+        last_writer_before_releasing_compare(&raw_hits, poll, main_hit_start..main_hit_end);
+    let main_rips = emu
+        .executed_addresses()
+        .get(main_trace_start..main_trace_end)
+        .ok_or_else(|| "post-CreateWindowExA main trace bounds are inconsistent".to_owned())?
+        .to_vec();
+    let main_loop_repeated = main_leg.handled == ["Sleep"]
+        && is_call_bound_stop(&main_leg.stop)
+        && main_pending_api.as_deref() == Some("Sleep");
+    let instructions_past_poll = if main_loop_repeated {
+        0
+    } else {
+        main_rips
+            .iter()
+            .rposition(|rip| *rip == poll.compare_rip)
+            .map_or(0, |index| main_rips.len() - index - 1)
+    };
+    let poll_final = read_u8(&emu, poll.address)?;
+    if (poll_final != poll.compared_value || instructions_past_poll > 0)
+        && release_writer_index.is_none()
+    {
+        return Err(format!(
+            "restored main advanced or left poll byte 0x{poll_final:02x} without a retained writer feeding its releasing comparison"
+        ));
+    }
+    let hits = format_watch_hits(raw_hits)?;
+    if !hits[..post_create_hit_start]
+        .iter()
+        .any(|entry| is_main_poll_compare(entry, poll))
+        || !hits[post_create_hit_end..]
+            .iter()
+            .any(|entry| is_main_poll_compare(entry, poll))
+    {
+        return Err(
+            "post-CreateWindowExA replay did not retain both main poll comparisons".to_owned(),
+        );
+    }
+    Ok(PollWindowEvidence {
+        poll,
+        main_prefix_handled: main.handled,
+        thread_id,
+        thread,
+        child_handled: child.handled,
+        create_window,
+        window_procedure,
+        post_create_handled: post_create.handled,
+        post_create_stop: post_create.stop,
+        post_create_rips,
+        hits,
+        post_create_hit_start,
+        post_create_hit_end,
+        release_writer_index,
+        poll_final,
+        main_stop: main_leg.stop,
+        main_pending_api,
+        restored_main_cap,
+        main_rips,
+        instructions_past_poll,
+    })
+}
+
+fn observe_create_window_ex_a(emu: &Emu) -> Result<CreateWindowExAObservation, String> {
+    let rsp = emu
+        .read_reg(RegisterX86::RSP)
+        .map_err(|error| format!("failed to read CreateWindowExA RSP: {error}"))?;
+    let stack = |offset: u64| -> Result<u64, String> {
+        let address = rsp
+            .checked_add(offset)
+            .ok_or_else(|| "CreateWindowExA stack address overflows".to_owned())?;
+        read_u64(emu, address)
+    };
+    Ok(CreateWindowExAObservation {
+        return_address: stack(0)?,
+        extended_style: emu
+            .read_reg(RegisterX86::RCX)
+            .map_err(|error| format!("failed to read CreateWindowExA RCX: {error}"))?,
+        class_name: emu
+            .read_reg(RegisterX86::RDX)
+            .map_err(|error| format!("failed to read CreateWindowExA RDX: {error}"))?,
+        window_name: emu
+            .read_reg(RegisterX86::R8)
+            .map_err(|error| format!("failed to read CreateWindowExA R8: {error}"))?,
+        style: emu
+            .read_reg(RegisterX86::R9)
+            .map_err(|error| format!("failed to read CreateWindowExA R9: {error}"))?,
+        x: stack(0x28)?,
+        y: stack(0x30)?,
+        width: stack(0x38)?,
+        height: stack(0x40)?,
+        parent: stack(0x48)?,
+        menu: stack(0x50)?,
+        instance: stack(0x58)?,
+        parameter: stack(0x60)?,
+    })
+}
+
+fn diagnostic_scalar_return(emu: &mut Emu, value: u64) -> Result<(), String> {
+    let rsp = emu
+        .read_reg(RegisterX86::RSP)
+        .map_err(|error| format!("failed to read diagnostic return RSP: {error}"))?;
+    let return_address = read_u64(emu, rsp)?;
+    let new_rsp = rsp
+        .checked_add(8)
+        .ok_or_else(|| "diagnostic return RSP overflows".to_owned())?;
+    emu.write_reg(RegisterX86::RAX, value)
+        .map_err(|error| format!("failed to set diagnostic return value: {error}"))?;
+    emu.write_reg(RegisterX86::RIP, return_address)
+        .map_err(|error| format!("failed to set diagnostic return RIP: {error}"))?;
+    emu.write_reg(RegisterX86::RSP, new_rsp)
+        .map_err(|error| format!("failed to set diagnostic return RSP: {error}"))
 }
 
 fn run_pass(
@@ -799,7 +1238,6 @@ fn run_pass(
             child_tail.handled
         ));
     }
-
     let child_rips = emu.executed_addresses();
     let registered_window_procedures = env.registered_window_procedures().collect::<Vec<_>>();
     if let Some(control) = &config.export_name_control {
@@ -925,7 +1363,6 @@ fn run_pass(
         .get(trace_len_before_sleep..)
         .ok_or_else(|| "main trace shrank after context restore".to_owned())?
         .to_vec();
-
     Ok(PassEvidence {
         main_handled: main.handled,
         thread_id,
@@ -1171,6 +1608,14 @@ fn configure_child_runtime(
 fn write_u64(emu: &mut Emu, address: u64, value: u64) -> Result<(), String> {
     emu.write_mem(address, &value.to_le_bytes())
         .map_err(|error| format!("failed to write 0x{value:016x} at 0x{address:016x}: {error}"))
+}
+
+fn read_u8(emu: &Emu, address: u64) -> Result<u8, String> {
+    emu.read_mem(address, 1)
+        .map_err(|error| format!("failed to read byte at 0x{address:016x}: {error}"))?
+        .first()
+        .copied()
+        .ok_or_else(|| format!("short byte read at 0x{address:016x}"))
 }
 
 fn read_u64(emu: &Emu, address: u64) -> Result<u64, String> {
@@ -1621,6 +2066,99 @@ fn validate_watched_replay(pass: &PassEvidence, hit_cap: usize) -> Result<(), St
         }
     }
     Ok(())
+}
+
+fn is_main_poll_compare(entry: &FormattedWatchHit, poll: MainPollObservation) -> bool {
+    !entry.hit.is_write
+        && entry.hit.size == 1
+        && entry.hit.address == poll.address
+        && entry.hit.rip == poll.compare_rip
+        && is_simple_byte_poll_compare(entry)
+}
+
+fn is_simple_byte_poll_compare(entry: &FormattedWatchHit) -> bool {
+    is_simple_byte_poll_hit(&entry.hit)
+}
+
+fn is_simple_byte_poll_hit(hit: &PersistentWatchHit) -> bool {
+    let mut decoder = Decoder::with_ip(64, &hit.code_window, hit.rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    instruction.ip() == hit.rip
+        && instruction.code() == Code::Cmp_rm8_r8
+        && instruction.memory_index() == Register::None
+        && instruction.memory_displacement64() == 0
+        && iced_register_value(instruction.memory_base(), &hit.registers) == Some(hit.address)
+        && simple_byte_compare_hit_value(hit).is_some()
+}
+
+fn simple_byte_compare_value(entry: &FormattedWatchHit) -> Option<u8> {
+    simple_byte_compare_hit_value(&entry.hit)
+}
+
+fn simple_byte_compare_hit_value(hit: &PersistentWatchHit) -> Option<u8> {
+    let mut decoder = Decoder::with_ip(64, &hit.code_window, hit.rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    (instruction.ip() == hit.rip && instruction.code() == Code::Cmp_rm8_r8)
+        .then(|| iced_byte_register_value(instruction.op1_register(), &hit.registers))?
+}
+
+fn iced_register_value(register: Register, registers: &[(RegisterX86, u64)]) -> Option<u64> {
+    let register = match register.full_register() {
+        Register::RAX => RegisterX86::RAX,
+        Register::RBX => RegisterX86::RBX,
+        Register::RCX => RegisterX86::RCX,
+        Register::RDX => RegisterX86::RDX,
+        Register::RSI => RegisterX86::RSI,
+        Register::RDI => RegisterX86::RDI,
+        Register::RBP => RegisterX86::RBP,
+        Register::RSP => RegisterX86::RSP,
+        Register::R8 => RegisterX86::R8,
+        Register::R9 => RegisterX86::R9,
+        Register::R10 => RegisterX86::R10,
+        Register::R11 => RegisterX86::R11,
+        Register::R12 => RegisterX86::R12,
+        Register::R13 => RegisterX86::R13,
+        Register::R14 => RegisterX86::R14,
+        Register::R15 => RegisterX86::R15,
+        _ => return None,
+    };
+    register_value(registers, register)
+}
+
+fn iced_byte_register_value(register: Register, registers: &[(RegisterX86, u64)]) -> Option<u8> {
+    let value = iced_register_value(register, registers)?;
+    match register {
+        Register::AH | Register::BH | Register::CH | Register::DH => Some((value >> 8) as u8),
+        Register::AL
+        | Register::BL
+        | Register::CL
+        | Register::DL
+        | Register::SIL
+        | Register::DIL
+        | Register::BPL
+        | Register::SPL
+        | Register::R8L
+        | Register::R9L
+        | Register::R10L
+        | Register::R11L
+        | Register::R12L
+        | Register::R13L
+        | Register::R14L
+        | Register::R15L => Some(value as u8),
+        _ => None,
+    }
+}
+
+fn watched_byte(hit: &PersistentWatchHit, watched_address: u64) -> Option<u8> {
+    if hit.size == 0 || hit.size > 8 || watched_address < hit.address {
+        return None;
+    }
+    let offset = usize::try_from(watched_address - hit.address).ok()?;
+    if offset >= hit.size {
+        return None;
+    }
+    let value = hit.value?;
+    Some((value >> (offset * 8)) as u8)
 }
 
 struct IndirectCallObservation<'a> {
@@ -2634,6 +3172,138 @@ fn print_module_writer_provenance(pass: &PassEvidence, modules: &[(String, u64, 
     }
 }
 
+fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWindowEvidence) {
+    println!("image:                 {:?}", config.path);
+    println!("image_base:            0x{:016x}", image.image_base);
+    println!("entry_va:              0x{:016x}", image.entry_point_va());
+    println!("main_per_leg_cap:      {}", config.main_per_leg_cap);
+    println!("child_per_leg_cap:     {}", config.child_per_leg_cap);
+    println!("watch_hit_cap:         {}", config.watch_hit_cap);
+    println!("poll_window_only:      true");
+    println!("export_control_module: \"user32.dll\"");
+    println!("export_control_names:  3");
+    println!(
+        "main_prefix_calls:     {}",
+        evidence.main_prefix_handled.len()
+    );
+    println!("main_pending_api:      Sleep");
+    println!("poll_cell:             0x{:016x}", evidence.poll.address);
+    println!(
+        "poll_compare_rip:      0x{:016x}",
+        evidence.poll.compare_rip
+    );
+    println!(
+        "poll_compared_value:   0x{:02x}",
+        evidence.poll.compared_value
+    );
+    println!("poll_final:            0x{:02x}", evidence.poll_final);
+    println!("thread_id:             {}", evidence.thread_id);
+    println!(
+        "thread_start:          0x{:016x}",
+        evidence.thread.start_address
+    );
+    println!("child_apis:            {:?}", evidence.child_handled);
+    println!("child_pending_api:     CreateWindowExA");
+    println!(
+        "create_window_args:    ex=0x{:x} class=0x{:016x} title=0x{:016x} style=0x{:x} x=0x{:x} y=0x{:x} width=0x{:x} height=0x{:x} parent=0x{:016x} menu=0x{:016x} instance=0x{:016x} param=0x{:016x}",
+        evidence.create_window.extended_style,
+        evidence.create_window.class_name,
+        evidence.create_window.window_name,
+        evidence.create_window.style,
+        evidence.create_window.x,
+        evidence.create_window.y,
+        evidence.create_window.width,
+        evidence.create_window.height,
+        evidence.create_window.parent,
+        evidence.create_window.menu,
+        evidence.create_window.instance,
+        evidence.create_window.parameter,
+    );
+    println!(
+        "create_window_return:  0x{:016x}",
+        evidence.create_window.return_address
+    );
+    println!(
+        "registered_wndproc:    0x{:016x}",
+        evidence.window_procedure
+    );
+    println!(
+        "writer_classification: {}",
+        match evidence.release_writer_index {
+            Some(index)
+                if (evidence.post_create_hit_start..evidence.post_create_hit_end)
+                    .contains(&index)
+                    && evidence.poll_final != evidence.poll.compared_value
+                    && evidence.instructions_past_poll > 0 =>
+            {
+                "post-CreateWindowExA child store"
+            }
+            Some(index)
+                if (evidence.post_create_hit_start..evidence.post_create_hit_end)
+                    .contains(&index) =>
+            {
+                "post-CreateWindowExA child transient store; main release not observed"
+            }
+            Some(_) => "non-child release-valued store",
+            None => "no release-valued guest writer observed",
+        }
+    );
+    println!(
+        "release_writer_index:  {}",
+        evidence
+            .release_writer_index
+            .map_or_else(|| "<none>".to_owned(), |index| index.to_string())
+    );
+    println!("diagnostic_hwnd:       0x{DIAGNOSTIC_WINDOW_HANDLE:016x}");
+    println!("post_create_handled:   {:?}", evidence.post_create_handled);
+    println!("post_create_stop:      {:?}", evidence.post_create_stop);
+    println!(
+        "post_create_hits:      {}..{}",
+        evidence.post_create_hit_start, evidence.post_create_hit_end
+    );
+    println!("post_create_rips:      {}", evidence.post_create_rips.len());
+    println!(
+        "post_create_digest:    0x{:016x}",
+        trace_digest(&evidence.post_create_rips)
+    );
+    println!("main_stop:             {:?}", evidence.main_stop);
+    println!("main_pending_api:      {:?}", evidence.main_pending_api);
+    println!("restored_main_cap:     {}", evidence.restored_main_cap);
+    println!("main_rips:             {}", evidence.main_rips.len());
+    println!(
+        "main_digest:           0x{:016x}",
+        trace_digest(&evidence.main_rips)
+    );
+    println!(
+        "instructions_past_poll: {}",
+        evidence.instructions_past_poll
+    );
+    println!("poll watch hits:");
+    for (index, entry) in evidence.hits.iter().enumerate() {
+        let phase = if index < evidence.post_create_hit_start {
+            "main-or-child-prefix".to_owned()
+        } else if (evidence.post_create_hit_start..evidence.post_create_hit_end).contains(&index) {
+            "post-CreateWindowExA-child".to_owned()
+        } else {
+            "restored-main".to_owned()
+        };
+        let operation = if entry.hit.is_write { "W" } else { "R" };
+        let watched_value = watched_byte(&entry.hit, evidence.poll.address)
+            .map_or_else(|| "None".to_owned(), |value| format!("Some(0x{value:02x})"));
+        println!(
+            "  [{:>12}] phase={phase} {operation} addr=0x{:016x} size={} access_value={} poll_byte={} rip=0x{:016x}",
+            entry.hit.global_instruction_index,
+            entry.hit.address,
+            entry.hit.size,
+            format_optional_value(entry.hit.value),
+            watched_value,
+            entry.hit.rip,
+        );
+        println!("      insn: {}", entry.instruction);
+        println!("      regs: {}", format_registers(&entry.hit.registers));
+    }
+}
+
 fn print_frontier_only_summary(config: &Config, image: &PeImage, first: &PassEvidence) {
     println!("image:                 {:?}", config.path);
     println!("image_base:            0x{:016x}", image.image_base);
@@ -3152,6 +3822,93 @@ mod tests {
         let mut missing = hit;
         missing.code_window.clear();
         assert!(format_watch_hits(vec![missing]).is_err());
+    }
+
+    #[test]
+    fn poll_compare_and_overlapping_writer_are_classified_from_hook_state() {
+        let poll = MainPollObservation {
+            address: 0x2003,
+            compare_rip: 0x1000,
+            compared_value: 0,
+            value_at_sleep: 0,
+        };
+        let compare = PersistentWatchHit {
+            global_instruction_index: 10,
+            is_write: false,
+            address: poll.address,
+            size: 1,
+            rip: poll.compare_rip,
+            value: Some(0),
+            registers: vec![(RegisterX86::R12, poll.address), (RegisterX86::RDI, 0)],
+            code_window: vec![0x41, 0x38, 0x3c, 0x24],
+        };
+        let formatted = format_watch_hits(vec![compare.clone()]).unwrap().remove(0);
+        assert!(is_main_poll_compare(&formatted, poll));
+        assert_eq!(simple_byte_compare_value(&formatted), Some(0));
+
+        let alternate_poll = MainPollObservation {
+            address: 0x3000,
+            compare_rip: 0x1100,
+            ..poll
+        };
+        let alternate_compare = PersistentWatchHit {
+            global_instruction_index: 10,
+            is_write: false,
+            address: alternate_poll.address,
+            size: 1,
+            rip: alternate_poll.compare_rip,
+            value: Some(0),
+            registers: vec![
+                (RegisterX86::RSI, alternate_poll.address),
+                (RegisterX86::RAX, 0),
+            ],
+            code_window: vec![0x38, 0x06],
+        };
+        let formatted = format_watch_hits(vec![alternate_compare])
+            .unwrap()
+            .remove(0);
+        assert!(is_main_poll_compare(&formatted, alternate_poll));
+        assert_eq!(simple_byte_compare_value(&formatted), Some(0));
+
+        let zero = PersistentWatchHit {
+            global_instruction_index: 11,
+            is_write: true,
+            address: 0x2000,
+            size: 8,
+            rip: 0x1010,
+            value: Some(0),
+            registers: Vec::new(),
+            code_window: vec![0x90],
+        };
+        let release = PersistentWatchHit {
+            global_instruction_index: 12,
+            value: Some(0x8877_6655_4433_2211),
+            rip: 0x1020,
+            ..zero.clone()
+        };
+        assert_eq!(watched_byte(&zero, poll.address), Some(0));
+        assert_eq!(watched_byte(&release, poll.address), Some(0x44));
+        let releasing_compare = PersistentWatchHit {
+            global_instruction_index: 13,
+            value: Some(0x44),
+            ..compare
+        };
+        assert_eq!(
+            last_writer_before_releasing_compare(
+                &[zero.clone(), release.clone(), releasing_compare.clone()],
+                poll,
+                2..3,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            last_writer_before_releasing_compare(
+                &[zero.clone(), release, zero, releasing_compare],
+                poll,
+                3..4,
+            ),
+            None
+        );
     }
 
     #[test]

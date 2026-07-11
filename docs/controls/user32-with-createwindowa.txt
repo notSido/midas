@@ -1,0 +1,3 @@
+CreateWindowExA
+LoadCursorA
+RegisterClassExA
