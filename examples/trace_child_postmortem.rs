@@ -108,6 +108,14 @@ struct Config {
     main_per_leg_cap: u64,
     child_per_leg_cap: u64,
     watch_hit_cap: usize,
+    export_name_control: Option<ExportNameControl>,
+    frontier_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ExportNameControl {
+    module_name: String,
+    names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,9 +239,13 @@ struct PassEvidence {
     child_prefix_handled: Vec<String>,
     time_return_address: u64,
     child_tail_handled: Vec<String>,
+    registered_window_procedures: Vec<(u16, u64)>,
+    window_procedure_trace_edges: Vec<(u64, Option<u64>)>,
+    synthetic_module_image_ranges: Vec<(String, u64, u64)>,
     terminal: ChildTerminal,
     terminal_transfer: TerminalTransfer,
     terminal_registers: Vec<(RegisterX86, u64)>,
+    terminal_stack_qwords: Vec<u64>,
     terminal_cell: u64,
     terminal_value: u64,
     child_rips: Vec<u64>,
@@ -272,6 +284,10 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to parse {:?}: {error}", config.path))?;
 
     let first = run_pass(&config, &image, &bytes, None)?;
+    if config.frontier_only {
+        print_frontier_only_summary(&config, &image, &first);
+        return Ok(());
+    }
     let watch_end = first.terminal_cell.checked_add(8).ok_or_else(|| {
         format!(
             "terminal watch range overflows at {:#x}",
@@ -296,7 +312,48 @@ fn run() -> Result<(), String> {
         whole_run.release_replay_traces();
         validate_watched_replay(&whole_run, config.watch_hit_cap)?;
         let writer_index = validate_indirect_call_frontier(&whole_run)?;
-        print_indirect_call_frontier_summary(&config, &image, &first, &whole_run, writer_index);
+        let module_watch = if config.export_name_control.is_some() {
+            None
+        } else if let Some(writer_index) = writer_index {
+            let writer = &whole_run.watch_hits[writer_index].hit;
+            let mut ranges = first
+                .synthetic_module_image_ranges
+                .iter()
+                .map(|(_, start, end)| (*start, *end))
+                .collect::<Vec<_>>();
+            ranges.push((first.terminal_cell, watch_end));
+            let mut module_config = config.clone();
+            module_config.watch_hit_cap = MAX_WATCH_HIT_CAP;
+            let mut pass = run_pass(
+                &module_config,
+                &image,
+                &bytes,
+                Some(WatchSpec {
+                    ranges,
+                    phase: WatchPhase::CaptureMainLegWriting {
+                        address: first.terminal_cell,
+                        writer_rip: writer.rip,
+                        global_instruction_index: writer.global_instruction_index,
+                        value: first.terminal_value,
+                    },
+                    global_instruction_range: None,
+                }),
+            )?;
+            compare_passes(&first, &pass)?;
+            pass.release_replay_traces();
+            validate_watched_replay(&pass, module_config.watch_hit_cap)?;
+            Some(pass)
+        } else {
+            None
+        };
+        print_indirect_call_frontier_summary(
+            &config,
+            &image,
+            &first,
+            &whole_run,
+            writer_index,
+            module_watch.as_ref(),
+        );
         return Ok(());
     }
 
@@ -467,16 +524,42 @@ fn parse_args() -> Result<Config, String> {
         .next()
         .unwrap_or_else(|| "trace_child_postmortem".to_owned());
     let path = args.next().ok_or_else(|| usage(&program))?;
-    let main_per_leg_cap = parse_optional(args.next(), DEFAULT_MAIN_PER_LEG_CAP, "main-cap")?;
-    let child_per_leg_cap = parse_optional(args.next(), DEFAULT_CHILD_PER_LEG_CAP, "child-cap")?;
+    let mut positional = args.collect::<Vec<_>>();
+    let frontier_only = positional
+        .last()
+        .is_some_and(|argument| argument == "--frontier-only");
+    if frontier_only {
+        positional.pop();
+    }
+    let main_per_leg_cap = parse_optional(
+        positional.first().cloned(),
+        DEFAULT_MAIN_PER_LEG_CAP,
+        "main-cap",
+    )?;
+    let child_per_leg_cap = parse_optional(
+        positional.get(1).cloned(),
+        DEFAULT_CHILD_PER_LEG_CAP,
+        "child-cap",
+    )?;
     let watch_hit_cap = validate_hit_cap(parse_optional(
-        args.next(),
+        positional.get(2).cloned(),
         DEFAULT_WATCH_HIT_CAP,
         "watch-hit-cap",
     )?)?;
-    if args.next().is_some() {
-        return Err(usage(&program));
-    }
+    let export_name_control = match positional.get(3..).unwrap_or_default() {
+        [] => None,
+        [module_name, names_path] => {
+            let contents = fs::read_to_string(names_path).map_err(|error| {
+                format!("failed to read export-name control {names_path:?}: {error}")
+            })?;
+            let names = parse_export_name_control(&contents)?;
+            Some(ExportNameControl {
+                module_name: module_name.to_owned(),
+                names,
+            })
+        }
+        _ => return Err(usage(&program)),
+    };
     if main_per_leg_cap == 0 || child_per_leg_cap == 0 {
         return Err("instruction caps must be nonzero".to_owned());
     }
@@ -490,14 +573,41 @@ fn parse_args() -> Result<Config, String> {
         main_per_leg_cap,
         child_per_leg_cap,
         watch_hit_cap,
+        export_name_control,
+        frontier_only,
     })
 }
 
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} <pe> [main-per-leg-cap] [child-per-leg-cap] [watch-hit-cap]\n\
-         the diagnostic derives the pending Sleep, created thread, and timeGetTime stub at runtime"
+         [export-control-module export-name-list] [--frontier-only]\n\
+         the diagnostic derives the pending Sleep, created thread, and timeGetTime stub at runtime;\n\
+         an optional newline-delimited name list changes one synthetic module's names only;\n\
+         --frontier-only prints the first child terminal without provenance replays"
     )
+}
+
+fn parse_export_name_control(contents: &str) -> Result<Vec<String>, String> {
+    let names = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err("export-name control is empty".to_owned());
+    }
+    if names.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("export-name control must be strictly sorted and deduplicated".to_owned());
+    }
+    if names
+        .iter()
+        .any(|name| name.len() > 256 || !name.bytes().all(|byte| (0x21..=0x7e).contains(&byte)))
+    {
+        return Err("export-name control contains an invalid name".to_owned());
+    }
+    Ok(names)
 }
 
 fn parse_optional<T>(value: Option<String>, default: T, name: &str) -> Result<T, String>
@@ -541,6 +651,14 @@ fn run_pass(
     emu.map_image(image, bytes, image.image_base)
         .map_err(|error| format!("failed to map image: {error}"))?;
     let mut env = Win64Env::new(image.image_base);
+    if let Some(control) = &config.export_name_control {
+        if !env.configure_module_export_name_control(&control.module_name, &control.names) {
+            return Err(format!(
+                "rejected export-name control for {:?}",
+                control.module_name
+            ));
+        }
+    }
 
     if let Some(spec) = watch_spec
         .as_ref()
@@ -633,6 +751,13 @@ fn run_pass(
         .map_err(|error| format!("failed to snapshot main TEB: {error}"))?;
 
     let entry_rsp = configure_child_runtime(&mut emu, thread)?;
+    if watch_spec.is_none() {
+        emu.configure_persistent_watch(
+            &[(CHILD_TEB_BASE, CHILD_TEB_BASE + CHILD_TEB_SIZE)],
+            config.watch_hit_cap,
+        )
+        .map_err(|error| format!("failed to arm child-TEB access watch: {error}"))?;
+    }
     emu.install_code_trace_hook()
         .map_err(|error| format!("failed to install child code trace: {error}"))?;
 
@@ -676,6 +801,31 @@ fn run_pass(
     }
 
     let child_rips = emu.executed_addresses();
+    let registered_window_procedures = env.registered_window_procedures().collect::<Vec<_>>();
+    if let Some(control) = &config.export_name_control {
+        if !env.module_export_name_control_was_applied(&control.module_name) {
+            return Err(format!(
+                "export-name control for {:?} was never applied",
+                control.module_name
+            ));
+        }
+    }
+    let synthetic_module_image_ranges = env
+        .synthetic_module_image_ranges()
+        .map(|(name, start, end)| (name.to_owned(), start, end))
+        .collect::<Vec<_>>();
+    let window_procedure_trace_edges = registered_window_procedures
+        .iter()
+        .map(|(_, procedure)| {
+            let predecessor = child_rips
+                .iter()
+                .position(|rip| rip == procedure)
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| child_rips.get(index))
+                .copied();
+            (*procedure, predecessor)
+        })
+        .collect();
     let post_time_rips = child_rips
         .get(pre_time_rips.len()..)
         .ok_or_else(|| "child trace shrank across timeGetTime".to_owned())?
@@ -687,6 +837,14 @@ fn run_pass(
         .read_reg(RegisterX86::RSP)
         .map_err(|error| format!("failed to read child final RSP: {error}"))?;
     let terminal_registers = read_cpu_state(&emu)?;
+    let terminal_stack_qwords = (0..=12)
+        .map(|index| {
+            let address = final_rsp
+                .checked_add(index * 8)
+                .ok_or_else(|| "terminal stack observation overflows".to_owned())?;
+            read_u64(&emu, address)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let frozen_tail = emu.recent_instructions();
     let (terminal_transfer, terminal_cell) = derive_terminal_transfer(
         &emu,
@@ -703,6 +861,24 @@ fn run_pass(
         Some(hits) => hits,
         None => format_watch_hits(emu.persistent_watch_hits())?,
     };
+    if watch_spec.is_none() {
+        if watch_hits.len() >= config.watch_hit_cap {
+            return Err(format!(
+                "child-TEB watch reached its {}-hit cap; access absence would be inconclusive",
+                config.watch_hit_cap
+            ));
+        }
+        if watch_hits.iter().any(|entry| {
+            !access_overlaps(
+                entry.hit.address,
+                entry.hit.size,
+                CHILD_TEB_BASE,
+                CHILD_TEB_SIZE,
+            )
+        }) {
+            return Err("child-TEB watch retained an access outside the child TEB".to_owned());
+        }
+    }
     let terminal_source = match terminal_transfer {
         TerminalTransfer::NearReturn { .. } => {
             derive_terminal_source(&emu, terminal_cell, terminal_value, &watch_hits)?
@@ -758,9 +934,13 @@ fn run_pass(
         child_prefix_handled: child_prefix.handled,
         time_return_address,
         child_tail_handled: child_tail.handled,
+        registered_window_procedures,
+        window_procedure_trace_edges,
+        synthetic_module_image_ranges,
         terminal,
         terminal_transfer,
         terminal_registers,
+        terminal_stack_qwords,
         terminal_cell,
         terminal_value,
         child_rips,
@@ -1373,9 +1553,13 @@ fn compare_passes(first: &PassEvidence, second: &PassEvidence) -> Result<(), Str
         && first.child_prefix_handled == second.child_prefix_handled
         && first.time_return_address == second.time_return_address
         && first.child_tail_handled == second.child_tail_handled
+        && first.registered_window_procedures == second.registered_window_procedures
+        && first.window_procedure_trace_edges == second.window_procedure_trace_edges
+        && first.synthetic_module_image_ranges == second.synthetic_module_image_ranges
         && first.terminal == second.terminal
         && first.terminal_transfer == second.terminal_transfer
         && first.terminal_registers == second.terminal_registers
+        && first.terminal_stack_qwords == second.terminal_stack_qwords
         && first.terminal_cell == second.terminal_cell
         && first.terminal_value == second.terminal_value
         && first.child_rips == second.child_rips
@@ -1474,12 +1658,22 @@ fn validate_indirect_call_observation(
     else {
         return Err("call frontier is not an indirect call".to_owned());
     };
-    if *observation.terminal != ChildTerminal::NullControlTransfer
+    let terminal_matches_value = matches!(
+        (observation.terminal, observation.terminal_value),
+        (ChildTerminal::NullControlTransfer, 0)
+            | (ChildTerminal::UnhandledApi { .. }, 1..=u64::MAX)
+    );
+    if !terminal_matches_value
         || observation.terminal_cell != pointer_cell
-        || observation.terminal_value != 0
         || observation.terminal_source.is_some()
     {
-        return Err("indirect-call null frontier has inconsistent terminal evidence".to_owned());
+        return Err(format!(
+            "indirect-call frontier has inconsistent terminal evidence: terminal={:?}, cell=0x{:016x}, pointer_cell=0x{pointer_cell:016x}, value=0x{:016x}, source={:?}",
+            observation.terminal,
+            observation.terminal_cell,
+            observation.terminal_value,
+            observation.terminal_source
+        ));
     }
     if observation.watch_phase != Some(WatchPhase::BeforeMain) {
         return Err("indirect-call pointer watch was not active for the whole run".to_owned());
@@ -1493,7 +1687,7 @@ fn validate_indirect_call_observation(
             !entry.hit.is_write
                 && entry.hit.address == pointer_cell
                 && entry.hit.size == 8
-                && entry.hit.value == Some(0)
+                && entry.hit.value == Some(observation.terminal_value)
                 && entry.hit.rip == instruction_address
                 && entry.instruction.starts_with("call qword [rdi+")
         })
@@ -2255,6 +2449,7 @@ fn print_indirect_call_frontier_summary(
     first: &PassEvidence,
     whole_run: &PassEvidence,
     writer_index: Option<usize>,
+    module_watch: Option<&PassEvidence>,
 ) {
     let TerminalTransfer::IndirectCall {
         instruction_address,
@@ -2270,6 +2465,7 @@ fn print_indirect_call_frontier_summary(
     println!("main_per_leg_cap:      {}", config.main_per_leg_cap);
     println!("child_per_leg_cap:     {}", config.child_per_leg_cap);
     println!("watch_hit_cap:         {}", config.watch_hit_cap);
+    print_export_name_control(config);
     println!("main_prefix_calls:     {}", first.main_handled.len());
     println!("main_pending_api:      Sleep");
     println!("thread_id:             {}", first.thread_id);
@@ -2281,12 +2477,24 @@ fn print_indirect_call_frontier_summary(
     println!("child_entry_rsp:       0x{:016x}", first.entry_rsp);
     println!("child_prefix_apis:     {:?}", first.child_prefix_handled);
     println!("child_tail_apis:       {:?}", first.child_tail_handled);
+    println!(
+        "registered_wndprocs:    {:?}",
+        first.registered_window_procedures
+    );
+    println!(
+        "wndproc_trace_edges:    {:?}",
+        first.window_procedure_trace_edges
+    );
     println!("child_terminal:        {:?}", first.terminal);
     println!("terminal_transfer:     indirect qword call");
     println!("terminal_instruction:  0x{instruction_address:016x}");
     println!("terminal_pointer_cell: 0x{pointer_cell:016x}");
     println!("terminal_value:        0x{:016x}", first.terminal_value);
     println!("pushed_return_address: 0x{pushed_return_address:016x}");
+    println!(
+        "terminal_stack_qwords: [{}]",
+        format_qwords(&first.terminal_stack_qwords)
+    );
     for (label, register) in [
         ("terminal_rax", RegisterX86::RAX),
         ("terminal_rcx", RegisterX86::RCX),
@@ -2323,6 +2531,7 @@ fn print_indirect_call_frontier_summary(
     for entry in &first.tail_instructions {
         println!("  0x{:016x}: {}", entry.address, entry.instruction);
     }
+    print_watch_hits("child-TEB access hits", &first.watch_hits);
     print_watch_hits(
         "whole-run indirect-call pointer watch hits",
         &whole_run.watch_hits,
@@ -2359,7 +2568,147 @@ fn print_indirect_call_frontier_summary(
             .count()
     );
     println!("whole_run_watch:       true");
+    match (module_watch, config.export_name_control.as_ref()) {
+        (Some(pass), _) => {
+            print_module_writer_provenance(pass, &first.synthetic_module_image_ranges)
+        }
+        (None, Some(_)) => {
+            println!("resolver_module_watch: skipped under export-name control")
+        }
+        (None, None) => {}
+    }
     println!("replays_identical:     true");
+}
+
+fn print_module_writer_provenance(pass: &PassEvidence, modules: &[(String, u64, u64)]) {
+    let Some(writer_index) = pass.watch_hits.iter().rposition(|entry| {
+        entry.hit.is_write
+            && entry.hit.address == pass.terminal_cell
+            && entry.hit.size == 8
+            && entry.hit.value == Some(pass.terminal_value)
+    }) else {
+        println!("resolver_module_watch: <terminal writer absent>");
+        return;
+    };
+
+    let mut counts = vec![0usize; modules.len()];
+    let mut last = None;
+    for entry in &pass.watch_hits[..writer_index] {
+        if let Some((module_index, module)) =
+            modules.iter().enumerate().find(|(_, (_, start, end))| {
+                access_overlaps(
+                    entry.hit.address,
+                    entry.hit.size,
+                    *start,
+                    end.saturating_sub(*start),
+                )
+            })
+        {
+            counts[module_index] += 1;
+            last = Some((module, entry));
+        }
+    }
+
+    println!("resolver_watch_hits:   {}", pass.watch_hits.len());
+    println!("resolver_watch_cap:    {MAX_WATCH_HIT_CAP}");
+    let summary = modules
+        .iter()
+        .zip(counts)
+        .filter(|(_, count)| *count != 0)
+        .map(|((name, _, _), count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("resolver_module_hits:  [{summary}]");
+    match last {
+        Some(((name, start, _), entry)) => {
+            println!("last_resolver_module:  {name:?}");
+            println!(
+                "last_resolver_access:  global {} addr 0x{:016x} rva 0x{:x}",
+                entry.hit.global_instruction_index,
+                entry.hit.address,
+                entry.hit.address.saturating_sub(*start)
+            );
+            println!("last_resolver_insn:    {}", entry.instruction);
+        }
+        None => println!("last_resolver_module:  <none in writer leg>"),
+    }
+}
+
+fn print_frontier_only_summary(config: &Config, image: &PeImage, first: &PassEvidence) {
+    println!("image:                 {:?}", config.path);
+    println!("image_base:            0x{:016x}", image.image_base);
+    println!("entry_va:              0x{:016x}", image.entry_point_va());
+    println!("main_per_leg_cap:      {}", config.main_per_leg_cap);
+    println!("child_per_leg_cap:     {}", config.child_per_leg_cap);
+    println!("watch_hit_cap:         {}", config.watch_hit_cap);
+    println!("frontier_only:         true");
+    print_export_name_control(config);
+    println!("main_prefix_calls:     {}", first.main_handled.len());
+    println!("main_pending_api:      Sleep");
+    println!("thread_id:             {}", first.thread_id);
+    println!(
+        "thread_start:          0x{:016x}",
+        first.thread.start_address
+    );
+    println!("thread_parameter:      0x{:016x}", first.thread.parameter);
+    println!("child_entry_rsp:       0x{:016x}", first.entry_rsp);
+    println!("child_prefix_apis:     {:?}", first.child_prefix_handled);
+    println!("child_tail_apis:       {:?}", first.child_tail_handled);
+    println!(
+        "registered_wndprocs:    {:?}",
+        first.registered_window_procedures
+    );
+    println!(
+        "wndproc_trace_edges:    {:?}",
+        first.window_procedure_trace_edges
+    );
+    println!("child_terminal:        {:?}", first.terminal);
+    println!("terminal_transfer:     {:?}", first.terminal_transfer);
+    println!("terminal_cell:         0x{:016x}", first.terminal_cell);
+    println!("terminal_value:        0x{:016x}", first.terminal_value);
+    println!(
+        "terminal_stack_qwords: [{}]",
+        format_qwords(&first.terminal_stack_qwords)
+    );
+    for (label, register) in [
+        ("terminal_rax", RegisterX86::RAX),
+        ("terminal_rcx", RegisterX86::RCX),
+        ("terminal_rdx", RegisterX86::RDX),
+        ("terminal_r8", RegisterX86::R8),
+        ("terminal_r9", RegisterX86::R9),
+        ("terminal_rdi", RegisterX86::RDI),
+        ("terminal_rsp", RegisterX86::RSP),
+        ("terminal_rip", RegisterX86::RIP),
+    ] {
+        println!(
+            "{label:<22}0x{:016x}",
+            register_value(&first.terminal_registers, register).unwrap_or(0)
+        );
+    }
+    println!("child_rips:            {}", first.child_rips.len());
+    println!(
+        "child_digest:          0x{:016x}",
+        trace_digest(&first.child_rips)
+    );
+    println!("post_time_rips:        {}", first.post_time_rips.len());
+    println!(
+        "post_time_digest:      0x{:016x}",
+        trace_digest(&first.post_time_rips)
+    );
+    println!("main_stack_unchanged:  {}", first.main_stack_unchanged);
+    println!("main_teb_unchanged:    {}", first.main_teb_unchanged);
+    println!("main_cpu_restored:     {}", first.main_cpu_restored);
+    println!("main_sleep_rips:       {}", first.main_sleep_rips.len());
+    println!(
+        "main_sleep_digest:     0x{:016x}",
+        trace_digest(&first.main_sleep_rips)
+    );
+    println!("terminal tail:");
+    for entry in &first.tail_instructions {
+        println!("  0x{:016x}: {}", entry.address, entry.instruction);
+    }
+    print_watch_hits("child-TEB access hits", &first.watch_hits);
+    println!("provenance_replays:    skipped by --frontier-only");
 }
 
 fn print_summary(
@@ -2378,6 +2727,7 @@ fn print_summary(
     println!("main_per_leg_cap:      {}", config.main_per_leg_cap);
     println!("child_per_leg_cap:     {}", config.child_per_leg_cap);
     println!("watch_hit_cap:         {}", config.watch_hit_cap);
+    print_export_name_control(config);
     println!("main_prefix_calls:     {}", first.main_handled.len());
     println!("main_pending_api:      Sleep");
     println!("thread_id:             {}", first.thread_id);
@@ -2692,6 +3042,24 @@ fn format_optional_value(value: Option<u64>) -> String {
     value.map_or_else(|| "None".to_owned(), |value| format!("Some(0x{value:x})"))
 }
 
+fn print_export_name_control(config: &Config) {
+    match &config.export_name_control {
+        Some(control) => {
+            println!("export_control_module: {:?}", control.module_name);
+            println!("export_control_names:  {}", control.names.len());
+        }
+        None => println!("export_control_module: <none>"),
+    }
+}
+
+fn format_qwords(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(|value| format!("0x{value:016x}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_registers(registers: &[(RegisterX86, u64)]) -> String {
     let mut output = String::new();
     for (index, (register, name)) in DISPLAY_REGISTERS.iter().enumerate() {
@@ -2748,6 +3116,18 @@ mod tests {
         );
         assert!(validate_hit_cap(0).is_err());
         assert!(validate_hit_cap(MAX_WATCH_HIT_CAP + 1).is_err());
+    }
+
+    #[test]
+    fn export_name_control_parser_requires_sorted_unique_printable_names() {
+        assert_eq!(
+            parse_export_name_control("Alpha\nBeta\n").unwrap(),
+            vec!["Alpha".to_owned(), "Beta".to_owned()]
+        );
+        assert!(parse_export_name_control("").is_err());
+        assert!(parse_export_name_control("Beta\nAlpha\n").is_err());
+        assert!(parse_export_name_control("Alpha\nAlpha\n").is_err());
+        assert!(parse_export_name_control("Alpha Beta\n").is_err());
     }
 
     #[test]
@@ -3089,6 +3469,29 @@ mod tests {
             &terminal_registers
         )
         .is_err());
+
+        let nonzero_value = 0x6000;
+        let nonzero_terminal = ChildTerminal::UnhandledApi {
+            name: "DiagnosticApi".to_owned(),
+        };
+        let mut nonzero_hits = hits.clone();
+        for entry in &mut nonzero_hits {
+            entry.hit.value = Some(nonzero_value);
+        }
+        assert_eq!(
+            validate_indirect_call_observation(IndirectCallObservation {
+                transfer,
+                terminal: &nonzero_terminal,
+                terminal_cell: POINTER_CELL,
+                terminal_value: nonzero_value,
+                terminal_source: None,
+                watch_phase: Some(WatchPhase::BeforeMain),
+                watch_hits: &nonzero_hits,
+                terminal_registers: &terminal_registers,
+            })
+            .unwrap(),
+            Some(0)
+        );
 
         let later_writer = FormattedWatchHit {
             hit: PersistentWatchHit {

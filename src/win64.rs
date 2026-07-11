@@ -1,6 +1,6 @@
 //! Minimal Win64 import-call trap and API stubs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     emu::{Emu, EmuError, FaultKind, RegisterX86, StopReason},
@@ -9,7 +9,9 @@ use crate::{
 
 const IMPORT_NAME_CAP: usize = 256;
 const SET_CURRENT_DIRECTORY_W_UNIT_CAP: usize = 260;
+const WIDE_CHAR_TO_MULTI_BYTE_UNIT_CAP: usize = 260;
 const WINDOW_CLASS_NAME_BYTE_CAP: usize = 256;
+const DIAGNOSTIC_EXPORT_NAME_CAP: usize = 4_096;
 const WNDCLASSEXA_SIZE: usize = 80;
 const FAKE_MODULE_BASE_START: u64 = 0x0000_7fff_0000_0000;
 const FAKE_MODULE_BASE_STEP: u64 = 0x0010_0000;
@@ -110,6 +112,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "CreateThread",
     "GetVersion",
     "Sleep",
+    "WideCharToMultiByte",
 ];
 
 /// Seed ntdll export names observed during the bootstrap export walk; this is
@@ -485,6 +488,8 @@ pub struct Win64Env {
     modules: BTreeMap<String, u64>,
     next_base: u64,
     synthetic_modules: BTreeMap<String, SyntheticModule>,
+    diagnostic_export_name_controls: BTreeMap<String, Vec<String>>,
+    applied_diagnostic_export_name_controls: BTreeSet<String>,
     proc_stubs: BTreeMap<String, u64>,
     proc_stub_mapped_end: u64,
     next_window_class_atom: u32,
@@ -511,6 +516,8 @@ impl Win64Env {
             modules: BTreeMap::new(),
             next_base: FAKE_MODULE_BASE_START,
             synthetic_modules: BTreeMap::new(),
+            diagnostic_export_name_controls: BTreeMap::new(),
+            applied_diagnostic_export_name_controls: BTreeSet::new(),
             proc_stubs: BTreeMap::new(),
             proc_stub_mapped_end: PROC_STUB_BASE,
             next_window_class_atom: WINDOW_CLASS_ATOM_BASE,
@@ -538,6 +545,69 @@ impl Win64Env {
         self.stub_export_at(address)
             .or_else(|| self.proc_stub_at(address))
             .map(|(name, _rva)| name)
+    }
+
+    /// Iterate over the window procedures owned by successfully registered
+    /// ANSI classes, in atom order.
+    ///
+    /// This is a read-only diagnostic projection. It does not invoke a
+    /// callback or model window/message lifecycle.
+    pub fn registered_window_procedures(&self) -> impl Iterator<Item = (u16, u64)> + '_ {
+        self.window_classes_by_atom
+            .iter()
+            .map(|(&atom, class)| (atom, class.window_procedure))
+    }
+
+    /// Iterate over mapped synthetic module image ranges in normalized-name
+    /// order. Stub arenas are excluded.
+    ///
+    /// This is a read-only diagnostic projection; it does not load a module.
+    pub fn synthetic_module_image_ranges(&self) -> impl Iterator<Item = (&str, u64, u64)> {
+        self.synthetic_modules.iter().filter_map(|(name, module)| {
+            let size = u64::try_from(module.image.len()).ok()?;
+            let end = module.base.checked_add(size)?;
+            Some((name.as_str(), module.base, end))
+        })
+    }
+
+    /// Override one not-yet-loaded synthetic module's export-name seed for a
+    /// bounded diagnostic control.
+    ///
+    /// This changes names only: no provider implementation is mapped or run.
+    /// Production callers do not configure controls. The override must be
+    /// installed before the named module is loaded, and names must be strictly
+    /// sorted, unique, printable, and bounded.
+    pub fn configure_module_export_name_control(
+        &mut self,
+        module_name: &str,
+        names: &[String],
+    ) -> bool {
+        let key = normalize_module_name(module_name).to_ascii_lowercase();
+        if key.is_empty()
+            || names.is_empty()
+            || names.len() > DIAGNOSTIC_EXPORT_NAME_CAP
+            || self.synthetic_modules.contains_key(&key)
+            || self.diagnostic_export_name_controls.contains_key(&key)
+            || names.windows(2).any(|pair| pair[0] >= pair[1])
+            || names.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > IMPORT_NAME_CAP
+                    || !name.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            })
+        {
+            return false;
+        }
+
+        self.diagnostic_export_name_controls
+            .insert(key, names.to_vec());
+        true
+    }
+
+    /// Report whether a configured names-only control supplied the export
+    /// table used to map the normalized module.
+    pub fn module_export_name_control_was_applied(&self, module_name: &str) -> bool {
+        let key = normalize_module_name(module_name).to_ascii_lowercase();
+        self.applied_diagnostic_export_name_controls.contains(&key)
     }
 
     fn add_vectored_exception_handler(&mut self, first: u32, handler: u64) -> u64 {
@@ -799,11 +869,26 @@ impl Win64Env {
     }
 
     fn ensure_kernel32(&mut self, emu: &mut Emu) -> Result<u64, EmuError> {
-        self.ensure_module(emu, "kernel32.dll", KERNEL32_EXPORTS)
+        self.ensure_loaded_module(emu, "kernel32.dll")
     }
 
     fn ensure_loaded_module(&mut self, emu: &mut Emu, name: &str) -> Result<u64, EmuError> {
         let normalized = normalize_module_name(name);
+        let control_key = normalized.to_ascii_lowercase();
+        if let Some(controlled_names) = self
+            .diagnostic_export_name_controls
+            .get(&control_key)
+            .cloned()
+        {
+            let exports = controlled_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let base = self.ensure_module(emu, &normalized, &exports)?;
+            self.applied_diagnostic_export_name_controls
+                .insert(control_key);
+            return Ok(base);
+        }
         let module_name = normalized
             .rsplit(['/', '\\'])
             .next()
@@ -1042,6 +1127,75 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             Ok(ApiOutcome::Handled {
                 name: name.to_owned(),
                 ret,
+            })
+        }
+        "WideCharToMultiByte" => {
+            // DWORD/UINT/int arguments consume only their low 32 bits. The
+            // retained policy supports the observed CP_ACP, flags-zero,
+            // null-terminated printable-ASCII size query and an exactly sized
+            // output conversion. General code pages remain unmodeled.
+            let code_page = emu.read_reg(RegisterX86::RCX)? as u32;
+            let flags = emu.read_reg(RegisterX86::RDX)? as u32;
+            let wide_string = emu.read_reg(RegisterX86::R8)?;
+            let wide_count = emu.read_reg(RegisterX86::R9)? as u32 as i32;
+            let rsp = emu.read_reg(RegisterX86::RSP)?;
+            let output_address = checked_stack_argument_address(rsp, 0x28, 8)?;
+            let output_size_address = checked_stack_argument_address(rsp, 0x30, 4)?;
+            let default_character_address = checked_stack_argument_address(rsp, 0x38, 8)?;
+            let used_default_address = checked_stack_argument_address(rsp, 0x40, 8)?;
+            let output = read_u64_at(emu, output_address)?;
+            let output_size = read_u32_at(emu, output_size_address)? as i32;
+            let default_character = read_u64_at(emu, default_character_address)?;
+            let used_default = read_u64_at(emu, used_default_address)?;
+
+            if code_page != 0
+                || flags != 0
+                || wide_string == 0
+                || wide_count != -1
+                || default_character != 0
+                || used_default != 0
+                || (output == 0 && output_size != 0)
+                || (output != 0 && output_size <= 0)
+                || (output != 0 && output == wide_string)
+            {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let units = match read_raw_utf16_z(emu, wide_string, WIDE_CHAR_TO_MULTI_BYTE_UNIT_CAP)?
+            {
+                RawUtf16Read::Terminated(units)
+                    if units.iter().all(|unit| (0x20..=0x7e).contains(unit)) =>
+                {
+                    units
+                }
+                RawUtf16Read::Terminated(_) | RawUtf16Read::CapExhausted => {
+                    return Ok(ApiOutcome::Unhandled {
+                        name: name.to_owned(),
+                    });
+                }
+            };
+            let mut converted = units.into_iter().map(|unit| unit as u8).collect::<Vec<_>>();
+            converted.push(0);
+            let required_size =
+                u32::try_from(converted.len()).map_err(|_| EmuError::CodeTooLarge)?;
+            if output == 0 {
+                return handled_scalar_api_return(emu, name, u64::from(required_size));
+            }
+            if output_size != required_size as i32 {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let return_state = preflight_api_return(emu)?;
+            emu.write_mem(output, &converted)?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, u64::from(required_size))?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: u64::from(required_size),
             })
         }
         "Sleep" => {
@@ -1538,17 +1692,23 @@ fn handled_scalar_api_return(emu: &mut Emu, name: &str, ret: u64) -> Result<ApiO
     })
 }
 
-fn api_return(emu: &mut Emu) -> Result<(), EmuError> {
+fn preflight_api_return(emu: &Emu) -> Result<(u64, u64), EmuError> {
     let rsp = emu.read_reg(RegisterX86::RSP)?;
-    let bytes = emu.read_mem(rsp, 8)?;
-    let mut ret_bytes = [0u8; 8];
-    ret_bytes.copy_from_slice(&bytes);
-    let ret = u64::from_le_bytes(ret_bytes);
+    let ret = read_u64_at(emu, rsp)?;
     let new_rsp = rsp
         .checked_add(8)
         .ok_or(EmuError::AddressRangeOverflow { base: rsp, size: 8 })?;
+    Ok((ret, new_rsp))
+}
+
+fn commit_api_return(emu: &mut Emu, (ret, new_rsp): (u64, u64)) -> Result<(), EmuError> {
     emu.write_reg(RegisterX86::RIP, ret)?;
     emu.write_reg(RegisterX86::RSP, new_rsp)
+}
+
+fn api_return(emu: &mut Emu) -> Result<(), EmuError> {
+    let return_state = preflight_api_return(emu)?;
+    commit_api_return(emu, return_state)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1864,8 +2024,59 @@ mod tests {
 
     const WINDOW_CLASS_STRUCT_ADDRESS: u64 = crate::emu::STACK_BASE + 0x4000;
     const WINDOW_CLASS_NAME_ADDRESS: u64 = WINDOW_CLASS_STRUCT_ADDRESS + 0x100;
+    const WIDE_STRING_ADDRESS: u64 = crate::emu::STACK_BASE + 0x6000;
     const WINDOW_PROCEDURE_SENTINEL: u64 = 0x0000_0001_5000_1230;
     const ALTERNATE_WINDOW_PROCEDURE_SENTINEL: u64 = 0x0000_0001_5000_1240;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct WideCharToMultiByteArgs {
+        code_page: u64,
+        flags: u64,
+        wide_string: u64,
+        wide_count: u64,
+        output: u64,
+        output_size_slot: u64,
+        default_character: u64,
+        used_default: u64,
+    }
+
+    impl WideCharToMultiByteArgs {
+        fn observed(wide_string: u64) -> Self {
+            Self {
+                code_page: 0xaaaa_bbbb_0000_0000,
+                flags: 0xcccc_dddd_0000_0000,
+                wide_string,
+                wide_count: 0x1234_5678_ffff_ffff,
+                output: 0,
+                output_size_slot: 0xeeee_ffff_0000_0000,
+                default_character: 0,
+                used_default: 0,
+            }
+        }
+    }
+
+    fn prepare_wide_char_to_multi_byte_call(
+        emu: &mut Emu,
+        args: WideCharToMultiByteArgs,
+        rsp: u64,
+        return_address: Option<u64>,
+    ) {
+        if let Some(return_address) = return_address {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        }
+        for (offset, value) in [
+            (0x28, args.output),
+            (0x30, args.output_size_slot),
+            (0x38, args.default_character),
+            (0x40, args.used_default),
+        ] {
+            emu.write_mem(rsp + offset, &value.to_le_bytes()).unwrap();
+        }
+        seed_sleep_machine_state(emu, args.code_page, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, args.flags).unwrap();
+        emu.write_reg(RegisterX86::R8, args.wide_string).unwrap();
+        emu.write_reg(RegisterX86::R9, args.wide_count).unwrap();
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct RegisterClassExAArgs {
@@ -2312,6 +2523,68 @@ mod tests {
         assert!(emu
             .read_mem(module.base + u64::from(module.stub_region_rva), 1)
             .is_err());
+    }
+
+    #[test]
+    fn diagnostic_export_name_control_is_bounded_preload_only_and_projects_range() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let names = vec!["Alpha".to_owned(), "Beta".to_owned()];
+
+        assert!(env.configure_module_export_name_control("Controlled", &names));
+        assert!(!env.module_export_name_control_was_applied("controlled.dll"));
+        assert!(!env
+            .configure_module_export_name_control("controlled.dll", &["Replacement".to_owned()]));
+        let base = env
+            .ensure_loaded_module(&mut emu, "controlled.dll")
+            .unwrap();
+        let module = env.synthetic_modules.get("controlled.dll").unwrap();
+        assert_eq!(module.exports.keys().cloned().collect::<Vec<_>>(), names);
+        let image_len = module.image.len() as u64;
+        assert!(env.module_export_name_control_was_applied("CONTROLLED"));
+        assert!(!env.configure_module_export_name_control("controlled.dll", &["Gamma".to_owned()]));
+
+        let ranges = env.synthetic_module_image_ranges().collect::<Vec<_>>();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].0, "controlled.dll");
+        assert_eq!(ranges[0].1, base);
+        assert_eq!(ranges[0].2, base + image_len);
+
+        let mut fresh = Win64Env::new(IMAGE_BASE);
+        assert!(!fresh.configure_module_export_name_control("", &names));
+        assert!(!fresh.configure_module_export_name_control(
+            "dup.dll",
+            &["Same".to_owned(), "Same".to_owned()]
+        ));
+        assert!(!fresh.configure_module_export_name_control(
+            "unsorted.dll",
+            &["Beta".to_owned(), "Alpha".to_owned()]
+        ));
+        assert!(!fresh.configure_module_export_name_control("bad.dll", &["has space".to_owned()]));
+        assert!(!fresh
+            .configure_module_export_name_control("long.dll", &["A".repeat(IMPORT_NAME_CAP + 1)]));
+        assert!(!fresh.configure_module_export_name_control(
+            "many.dll",
+            &vec!["Name".to_owned(); DIAGNOSTIC_EXPORT_NAME_CAP + 1]
+        ));
+
+        let mut kernel_emu = Emu::new().unwrap();
+        let mut kernel_env = Win64Env::new(IMAGE_BASE);
+        let kernel_names = vec!["OnlyDiagnosticName".to_owned()];
+        assert!(kernel_env.configure_module_export_name_control("kernel32", &kernel_names));
+        kernel_env.ensure_kernel32(&mut kernel_emu).unwrap();
+        assert!(kernel_env.module_export_name_control_was_applied("KERNEL32.DLL"));
+        assert_eq!(
+            kernel_env
+                .synthetic_modules
+                .get("kernel32.dll")
+                .unwrap()
+                .exports
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            kernel_names
+        );
     }
 
     #[test]
@@ -2830,6 +3103,338 @@ mod tests {
             assert_eq!(sleep_machine_state(&emu), machine_before);
             assert_eq!(sleep_environment_state(&env), environment_before);
         }
+    }
+
+    #[test]
+    fn wide_char_to_multi_byte_observed_size_query_returns_ascii_bytes_including_nul() {
+        let call_and_assert = |env: &mut Win64Env, emu: &mut Emu, rsp: u64, return_address: u64| {
+            let wide = "guest.exe\0"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            emu.write_mem(WIDE_STRING_ADDRESS, &wide).unwrap();
+            let args = WideCharToMultiByteArgs::observed(WIDE_STRING_ADDRESS);
+            prepare_wide_char_to_multi_byte_call(emu, args, rsp, Some(return_address));
+            let machine_before = sleep_machine_state(emu);
+            let environment_before = sleep_environment_state(env);
+            let stack_before = emu.read_mem(rsp, 0x48).unwrap();
+            let wide_before = emu.read_mem(WIDE_STRING_ADDRESS, wide.len()).unwrap();
+
+            let outcome = dispatch(env, emu, "WideCharToMultiByte").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Handled {
+                    name: "WideCharToMultiByte".to_owned(),
+                    ret: 10,
+                }
+            );
+            for (register, value) in machine_before {
+                let expected = match register {
+                    RegisterX86::RAX => 10,
+                    RegisterX86::RIP => return_address,
+                    RegisterX86::RSP => value + 8,
+                    _ => value,
+                };
+                assert_eq!(
+                    emu.read_reg(register).unwrap(),
+                    expected,
+                    "unexpected {register:?} change"
+                );
+            }
+            assert_eq!(emu.read_mem(rsp, 0x48).unwrap(), stack_before);
+            assert_eq!(
+                emu.read_mem(WIDE_STRING_ADDRESS, wide.len()).unwrap(),
+                wide_before
+            );
+            assert_eq!(sleep_environment_state(env), environment_before);
+        };
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        call_and_assert(
+            &mut env,
+            &mut emu,
+            crate::emu::STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        call_and_assert(
+            &mut env,
+            &mut emu,
+            crate::emu::STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+
+        let mut fresh_emu = Emu::new().unwrap();
+        let mut fresh_env = Win64Env::new(IMAGE_BASE);
+        call_and_assert(
+            &mut fresh_env,
+            &mut fresh_emu,
+            crate::emu::STACK_BASE + 0x600,
+            0x1357_2468_ace0_bdf1,
+        );
+    }
+
+    #[test]
+    fn wide_char_to_multi_byte_observed_conversion_writes_ascii_and_preserves_suffix() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0;
+        let output = WIDE_STRING_ADDRESS + 0x100;
+        let wide = "guest.exe\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        emu.write_mem(WIDE_STRING_ADDRESS, &wide).unwrap();
+        emu.write_mem(output, &[0xcc; 12]).unwrap();
+        let args = WideCharToMultiByteArgs {
+            output,
+            output_size_slot: 0xeeee_ffff_0000_000a,
+            ..WideCharToMultiByteArgs::observed(WIDE_STRING_ADDRESS)
+        };
+        prepare_wide_char_to_multi_byte_call(&mut emu, args, rsp, Some(return_address));
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+
+        let outcome = dispatch(&mut env, &mut emu, "WideCharToMultiByte").unwrap();
+
+        assert_eq!(
+            outcome,
+            ApiOutcome::Handled {
+                name: "WideCharToMultiByte".to_owned(),
+                ret: 10,
+            }
+        );
+        assert_eq!(emu.read_mem(output, 12).unwrap(), b"guest.exe\0\xcc\xcc");
+        for (register, value) in machine_before {
+            let expected = match register {
+                RegisterX86::RAX => 10,
+                RegisterX86::RIP => return_address,
+                RegisterX86::RSP => value + 8,
+                _ => value,
+            };
+            assert_eq!(
+                emu.read_reg(register).unwrap(),
+                expected,
+                "unexpected {register:?} change"
+            );
+        }
+        assert_eq!(sleep_environment_state(&env), environment_before);
+    }
+
+    #[test]
+    fn wide_char_to_multi_byte_unmodeled_shapes_do_not_read_input_or_return_frame() {
+        const ARGUMENT_PAGE: u64 = 0x0000_0000_dead_1000;
+        let base = WideCharToMultiByteArgs::observed(0x0000_0000_dead_0000);
+        let cases = [
+            WideCharToMultiByteArgs {
+                code_page: 1,
+                ..base
+            },
+            WideCharToMultiByteArgs { flags: 1, ..base },
+            WideCharToMultiByteArgs {
+                wide_count: 0,
+                ..base
+            },
+            WideCharToMultiByteArgs { output: 1, ..base },
+            WideCharToMultiByteArgs {
+                output_size_slot: 1,
+                ..base
+            },
+            WideCharToMultiByteArgs {
+                default_character: 1,
+                ..base
+            },
+            WideCharToMultiByteArgs {
+                used_default: 1,
+                ..base
+            },
+            WideCharToMultiByteArgs {
+                output: base.wide_string,
+                output_size_slot: 10,
+                ..base
+            },
+        ];
+
+        for args in cases {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.map_zeroed_rw(ARGUMENT_PAGE, 0x1000).unwrap();
+            let rsp = ARGUMENT_PAGE - 0x28;
+            prepare_wide_char_to_multi_byte_call(&mut emu, args, rsp, None);
+            assert!(emu.read_mem(rsp, 8).is_err());
+            assert!(emu.read_mem(args.wide_string, 2).is_err());
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "WideCharToMultiByte").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Unhandled {
+                    name: "WideCharToMultiByte".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn wide_char_to_multi_byte_rejects_unmodeled_text_and_output_size_bounds() {
+        const ARGUMENT_PAGE: u64 = 0x0000_0000_dead_1000;
+        const STRING_PAGE: u64 = 0x0000_0000_beef_0000;
+        let inputs = [
+            vec![0x00e9, 0],
+            vec![u16::from(b'A'); WIDE_CHAR_TO_MULTI_BYTE_UNIT_CAP],
+        ];
+
+        for units in inputs {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.map_zeroed_rw(ARGUMENT_PAGE, 0x1000).unwrap();
+            emu.map_zeroed_rw(STRING_PAGE, 0x1000).unwrap();
+            let bytes = units
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            emu.write_mem(STRING_PAGE, &bytes).unwrap();
+            let rsp = ARGUMENT_PAGE - 0x28;
+            prepare_wide_char_to_multi_byte_call(
+                &mut emu,
+                WideCharToMultiByteArgs::observed(STRING_PAGE),
+                rsp,
+                None,
+            );
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let outcome = dispatch(&mut env, &mut emu, "WideCharToMultiByte").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Unhandled {
+                    name: "WideCharToMultiByte".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.map_zeroed_rw(ARGUMENT_PAGE, 0x1000).unwrap();
+        emu.map_zeroed_rw(STRING_PAGE, 0x1000).unwrap();
+        let wide = "guest.exe\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let output = STRING_PAGE + 0x100;
+        emu.write_mem(STRING_PAGE, &wide).unwrap();
+        emu.write_mem(output, &[0xcc; 12]).unwrap();
+        let rsp = ARGUMENT_PAGE - 0x28;
+        prepare_wide_char_to_multi_byte_call(
+            &mut emu,
+            WideCharToMultiByteArgs {
+                output,
+                output_size_slot: 11,
+                ..WideCharToMultiByteArgs::observed(STRING_PAGE)
+            },
+            rsp,
+            None,
+        );
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+
+        let outcome = dispatch(&mut env, &mut emu, "WideCharToMultiByte").unwrap();
+
+        assert_eq!(
+            outcome,
+            ApiOutcome::Unhandled {
+                name: "WideCharToMultiByte".to_owned(),
+            }
+        );
+        assert_eq!(emu.read_mem(output, 12).unwrap(), [0xcc; 12]);
+        assert_eq!(sleep_machine_state(&emu), machine_before);
+        assert_eq!(sleep_environment_state(&env), environment_before);
+    }
+
+    #[test]
+    fn wide_char_to_multi_byte_input_and_return_failures_are_atomic() {
+        const ARGUMENT_PAGE: u64 = 0x0000_0000_dead_1000;
+        const STRING_PAGE: u64 = 0x0000_0000_beef_0000;
+
+        for map_string in [false, true] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.map_zeroed_rw(ARGUMENT_PAGE, 0x1000).unwrap();
+            if map_string {
+                emu.map_zeroed_rw(STRING_PAGE, 0x1000).unwrap();
+                let wide = "guest.exe\0"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>();
+                emu.write_mem(STRING_PAGE, &wide).unwrap();
+            }
+            let rsp = ARGUMENT_PAGE - 0x28;
+            let output = STRING_PAGE + 0x100;
+            let args = if map_string {
+                emu.write_mem(output, &[0xcc; 12]).unwrap();
+                WideCharToMultiByteArgs {
+                    output,
+                    output_size_slot: 10,
+                    ..WideCharToMultiByteArgs::observed(STRING_PAGE)
+                }
+            } else {
+                WideCharToMultiByteArgs::observed(STRING_PAGE)
+            };
+            prepare_wide_char_to_multi_byte_call(&mut emu, args, rsp, None);
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            let error = dispatch(&mut env, &mut emu, "WideCharToMultiByte").unwrap_err();
+
+            let expected_address = if map_string { rsp } else { STRING_PAGE };
+            assert!(
+                matches!(error, EmuError::ReadMem { addr, .. } if addr == expected_address),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+            if map_string {
+                assert_eq!(emu.read_mem(output, 12).unwrap(), [0xcc; 12]);
+            }
+        }
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0;
+        let wide = "guest.exe\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        emu.write_mem(WIDE_STRING_ADDRESS, &wide).unwrap();
+        let args = WideCharToMultiByteArgs {
+            output: 0x0000_0000_dead_0000,
+            output_size_slot: 10,
+            ..WideCharToMultiByteArgs::observed(WIDE_STRING_ADDRESS)
+        };
+        prepare_wide_char_to_multi_byte_call(&mut emu, args, rsp, Some(return_address));
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+        let return_frame_before = emu.read_mem(rsp, 8).unwrap();
+
+        let error = dispatch(&mut env, &mut emu, "WideCharToMultiByte").unwrap_err();
+
+        assert!(
+            matches!(error, EmuError::WriteUnmapped { addr, .. } if addr == args.output),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(sleep_machine_state(&emu), machine_before);
+        assert_eq!(sleep_environment_state(&env), environment_before);
+        assert_eq!(emu.read_mem(rsp, 8).unwrap(), return_frame_before);
     }
 
     #[test]
@@ -5620,6 +6225,52 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_kernel32_export_traps_wide_char_to_multi_byte_size_query() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
+        let stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("WideCharToMultiByte")
+            .unwrap();
+        assert_eq!(
+            env.callable_stub_name_at(stub).as_deref(),
+            Some("WideCharToMultiByte")
+        );
+        assert_eq!(
+            env.resolve_proc(&mut emu, kernel32_base, "WideCharToMultiByte")
+                .unwrap(),
+            stub
+        );
+
+        let loop_address = image.entry_point_va();
+        emu.map_code(loop_address, &[0xeb, 0xfe]).unwrap();
+        let rsp = crate::emu::STACK_BASE + 0x400;
+        let wide = "guest.exe\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        emu.write_mem(WIDE_STRING_ADDRESS, &wide).unwrap();
+        prepare_wide_char_to_multi_byte_call(
+            &mut emu,
+            WideCharToMultiByteArgs::observed(WIDE_STRING_ADDRESS),
+            rsp,
+            Some(loop_address),
+        );
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, stub, 32, 8).unwrap();
+
+        assert_eq!(result.handled, vec!["WideCharToMultiByte".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 10);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
     fn synthetic_user32_export_traps_register_class_ex_a() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
@@ -5683,6 +6334,10 @@ mod tests {
             env.window_class_atoms_by_name
                 .get(&(IMAGE_BASE, "midastestclass".to_owned())),
             Some(&(WINDOW_CLASS_ATOM_BASE as u16))
+        );
+        assert_eq!(
+            env.registered_window_procedures().collect::<Vec<_>>(),
+            vec![(WINDOW_CLASS_ATOM_BASE as u16, args.window_procedure)]
         );
     }
 

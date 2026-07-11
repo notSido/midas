@@ -46,7 +46,9 @@ implemented" section describe the latest production frontier.
 | Global-instruction-filtered persistent watching and six-pass reconstruction of the checkpoint RET-zero producer: a persistent watch can retain hits only in a validated half-open global instruction interval, including across resume legs. `trace_child_postmortem` adds fresh source-context, destination-stack, and upstream-stack replays and validates the straight-line register/stack path rather than selecting a producer by a fixed sample address. | Focused emulator coverage proves the global filter, invalid-range atomicity, and clearing on ordinary reconfiguration; a mutation test proves that the stack-route validator rejects changed data flow. The formal checkpoint replay identifies source context qword `0x000000014006f9e0` and the zero route `RAX` → `R8` → temporary stack cell → future `R15` stack cell → `R15` → source context. The decisive stores/pops occur at globals 29,776,565/566 and 29,777,861/862; global 29,777,862 is `0x00000001400996fc: mov [rcx],r15`, and global 29,776,566 is `0x00000001400d5438: pop qword [rsp+80h]`. All six replays retain the same checkpoint child, post-time, and restored-main traces. | M3 (groundwork) |
 | Observed USER32 export + bounded `LoadCursorA`: `user32.dll` now exposes the two observed names `LoadCursorA` and `RegisterClassExA`. The cursor handler accepts only the observed full-width `(hInstance = NULL, lpCursorName = MAKEINTRESOURCEA(IDC_HAND = 32649))`, returns the fixed stable opaque unmapped policy handle `0x0000000f30000010`, and consumes a valid return frame before changing `RAX`. Module resources, string names, and every other predefined cursor remain unhandled before pointer or return-stack access. | Focused direct tests cover repeated and fresh environments, stable unmapped identity, unsupported-input no-access behavior, and invalid-return failure atomicity; a name-resolved synthetic-USER32 trap test covers module-local dispatch. A pinned 841-name Wine USER32 control used export names only and a one-name narrow A/B reproduced `LoadCursorA` with `RCX = 0`, `RDX = 0x7f89`; the resulting production child replay advances past the former RET-zero terminal. | M3 |
 | Observed USER32 export + bounded `RegisterClassExA`: dispatch parses the 80-byte x64 `WNDCLASSEXA` and supports only the formal sample's observed scalar shape with an ordinary printable 7-bit ASCII name supplied to the A API. It owns the supported record, allocates deterministic local class atoms from `0xc000..=0xffff`, keys names case-insensitively within the instance, and returns zero for duplicate names, known-invalid fields, unterminated/empty names, collisions, or exhaustion. Other plausibly valid Windows shapes and atom-name input remain unhandled. | Focused tests exercise the observed scalar shape with neutral names and window-procedure sentinels, owned-record behavior, two distinct atoms, fresh environments, duplicate-name rejection, unsupported-shape classification without class-name or return-frame access, known-invalid returns, memory/return failure atomicity, strict 256-byte name-scan and atom bounds; a synthetic-USER32 trap test dispatches by name. The formal replay supplies the actual `SplashClassName` record. The narrow two-name control identifies `RegisterClassExA` with `RCX = 0x0000000f500fef40`; production returns atom `0xc000` and advances beyond that call. | M3 |
-| Expanded production child post-mortem through the two USER32 calls: the child tracer accepts a bounded named-API tail, classifies a zero-target indirect qword `call` separately from the earlier RET terminal, and whole-run watches the derived pointer cell. Relevant watched code windows and the retained terminal tail are frozen at hook time rather than decoded from later writable guest memory. No VM-handler role is assigned to the current pointer cell, and the terminal is not classified as a clean thread return or OEP. | `cargo test --all-targets` is green with 152 tests (139 library, 10 `trace_child_postmortem`, and 3 `trace_slot`), and the full build plus `clippy -D warnings` pass. Formal release `trace_child_postmortem` handles child tail `[timeGetTime, LoadCursorA, RegisterClassExA]`, then executes `call qword [rdi+108h]` at `0x000000014019b098`, with runtime-derived pointer cell `0x000000014006f108`; the pointer is zero and the pushed return is `0x000000014019b09e`. It reproduces 28,135 child RIPs (`0x6b27c3a47b61a00d`), 14,049 post-time RIPs (`0x9aecc2c386795f99`), and the unchanged 3,527-RIP restored-main Sleep digest `0x7fce9fdb31fbfd70`. The whole-run watch retains earlier byte initialization writes, then the last guest write before the final read is a qword-zero store at global 28,615,712, `0x00000001400accf7: mov [r9],rbx`, with no later watched write. An independent 841-name USER32 control does not change this post-class terminal, so it is not classified as another USER32 export gap. Incomplete-provenance sample 3 corroborates the same handled tail and a separate indirect-zero terminal with 27,654 child RIPs (`0x25e21a892db20b71`); sample 2 does not reach pending Sleep and is not a child-replay artifact. | M3 (groundwork) |
+| Expanded production child post-mortem through the two USER32 calls: the child tracer accepts a bounded named-API tail, classifies a zero-target indirect qword `call` separately from the earlier RET terminal, and whole-run watches the derived pointer cell. Relevant watched code windows and the retained terminal tail are frozen at hook time rather than decoded from later writable guest memory. No VM-handler role is assigned to the current pointer cell, and the terminal is not classified as a clean thread return or OEP. | `cargo test --all-targets` is green with 152 tests (139 library, 10 `trace_child_postmortem`, and 3 `trace_slot`), and the full build plus `clippy -D warnings` pass. Formal release `trace_child_postmortem` handles child tail `[timeGetTime, LoadCursorA, RegisterClassExA]`, then executes `call qword [rdi+20108h]` at `0x000000014019b098`, with runtime-derived pointer cell `0x000000014006f108`; the pointer is zero and the pushed return is `0x000000014019b09e`. It reproduces 28,135 child RIPs (`0x6b27c3a47b61a00d`), 14,049 post-time RIPs (`0x9aecc2c386795f99`), and the unchanged 3,527-RIP restored-main Sleep digest `0x7fce9fdb31fbfd70`. The whole-run watch retains earlier byte initialization writes, then the last guest write before the final read is a qword-zero store at global 28,615,712, `0x00000001400accf7: mov [r9],rbx`, with no later watched write. An independent 841-name USER32 control does not change this post-class terminal, so it is not classified as another USER32 export gap. Incomplete-provenance sample 3 corroborates the same handled tail and a separate indirect-zero terminal with 27,654 child RIPs (`0x25e21a892db20b71`); sample 2 does not reach pending Sleep and is not a child-replay artifact. | M3 (groundwork) |
+| Bounded names-only module controls and first-frontier diagnostic mode: a control can replace one not-yet-loaded synthetic module's export seed with at most 4,096 strictly sorted unique printable names. The environment records whether the override actually supplied the mapped module and the child diagnostic rejects an unconsumed treatment. `--frontier-only` prints the first child terminal and skips all later provenance replays. Registered WndProc, synthetic-module ranges, child-TEB accesses, and terminal stack qwords remain read-only observations. | Focused tests cover bounds, ordering, duplicate/preload rejection, applied-state projection, and the dedicated kernel32 mapping route that previously bypassed controls. The committed 19-name and 20-name kernel32 inputs differ only by `WideCharToMultiByte` and have SHA-256 values `ead2f345b2eebfeedfabbd1551e1029fd721678d0d068321b598948ade757234` and `dfd7ed5f8d57f01047b511334aa6e45c42362964b7b0baba56c74561bc2490db`. Their formal output artifacts reproduce the old null versus the advanced frontier. | M3 (groundwork) |
+| Observed kernel32 export + bounded `WideCharToMultiByte`: the seed now includes the causally identified name. Dispatch supports CP_ACP, flags zero, `cchWideChar=-1`, null default-character pointers, and null-terminated printable 7-bit ASCII within 260 UTF-16 units. The query form returns the derived byte count including null; the conversion form requires a distinct non-null output with exactly the derived size, writes the derived bytes and terminator without changing the suffix, and returns that count. General code pages, flags, explicit lengths, non-ASCII/cap-exhausted inputs, host locale/code-page state, and last-error behavior remain unmodeled. | `cargo test --all-targets` is green with 160 tests (146 library, 11 `trace_child_postmortem`, and 3 `trace_slot`). Six focused API tests cover repeated/fresh query identity, dirty upper halves, output/suffix behavior, non-ASCII/cap rejection, unmodeled no-input/no-return access, input/return/output failure atomicity, and name-resolved kernel32 dispatch. The formal one-name treatment changes the established cell from zero to the `WideCharToMultiByte` stub. Production handles size query `(0,0,L"guest.exe",-1,NULL,0,NULL,NULL)` and conversion `(0,0,L"guest.exe",-1,buffer,10,NULL,NULL)`, both returning 10; then reaches a distinct near-return null after 44,386 child RIPs (`0xed010b86a52a2ab2`) and 30,300 post-time RIPs (`0x3d2b90b3678f0d4e`). Restored main remains the exact 3,527-RIP Sleep leg (`0x7fce9fdb31fbfd70`). Incomplete-provenance sample 3 independently handles the same two forms and seven-API tail before its own near-return null; it remains engineering corroboration. | M3 |
 
 ## Not yet implemented
 
@@ -77,27 +79,37 @@ registers under the bounded atom model. Other cursors, general class shapes,
 window creation, message processing, callback invocation, and broader USER32
 state remain unmodeled.
 
-After child tail `[timeGetTime, LoadCursorA, RegisterClassExA]`, the current
-formal frontier is instead an indirect qword call at
-`0x000000014019b098` through pointer cell `0x000000014006f108`, whose value is
-zero; the pushed return address is `0x000000014019b09e`. The whole-run watch
-retains earlier byte initialization writes, but the last guest write before the
-terminal read is an exact qword-zero store at global instruction 28,615,712,
-`0x00000001400accf7: mov [r9],rbx`, with no later watched write. The current
-pointer cell `0x000000014006f108` is distinct from the earlier RET handler slot
-`0x0000000140066c04`; it is not labeled a handler slot. A broad, pinned
-841-name USER32 control does not change this post-registration null, so no
-additional USER32 export is claimed as its cause. The current pointer's
-semantic role and the upstream reason for its zero remain unresolved.
+The historical post-class indirect null is now resolved. With the prior
+19-name kernel32 seed, loader writer `0x00000001400accf7: mov [r9],rbx` stores
+zero in cell `0x000000014006f108`, and the child later calls it at
+`0x000000014019b098`. Adding only `WideCharToMultiByte` makes the same writer
+store its synthetic kernel32 stub, and the terminal arguments exactly match
+the documented eight-argument size query for `L"guest.exe"`. Production
+supports that query and the immediately observed output conversion. The
+earlier `CreateWindowExA/W` and window-construction inference is superseded for
+this call.
 
-The expanded child does not release the main poll condition, and exact CPU
-context restoration leaves the main loop unchanged. This falsifies only the
-tested direct child runs as the loop release, not all possible scheduling or
-Windows thread-start models. Incomplete-provenance sample 3 corroborates the
-same two USER32 calls followed by its own indirect-zero terminal. Sample 2 does
-not reach pending `Sleep` and retains its previously documented separate
-indirect call through zero. Samples 2 and 3 remain engineering corroboration,
-not formal milestone evidence until their provenance is completed.
+The advanced formal child handles tail `[timeGetTime, LoadCursorA,
+RegisterClassExA, WideCharToMultiByte, GetProcessHeap, RtlAllocateHeap,
+WideCharToMultiByte]`, but it still does not release the main poll and reaches a
+distinct near-return null. `--frontier-only` stops there without entering the
+legacy provenance passes. Exact CPU restoration reproduces the unchanged main
+loop. Completing one extra serial main Sleep leg before child entry and
+returning fixed uptime 1 or 1,000 do not change their tested frontiers; changing
+the child return sentinel did not change the older indirect-call frontier. A
+main TEB-prefix watch through `+0x70` and a full
+advanced-child TEB watch expose no `ClientId` or TLS access; the formal TLS
+callback array is empty; and mapped synthetic modules expose no guest DLL
+notification target. These controls exclude the observed identity,
+fixed-uptime-value, old-frontier sentinel-value sensitivity,
+one-extra-main-leg ordering, and mapped-image notification dependencies, not
+the advanced terminal's return/startup provenance, a coherently advancing
+clock, `Sleep` coupling, general scheduling, or every real-system-DLL effect. A
+scheduler remains a
+prerequisite for normal child execution, but running the advanced child once is
+not sufficient to release the poll. Incomplete-provenance sample 3 provides
+engineering corroboration for both conversion forms and the seven-API tail;
+sample 2 remains on its documented separate path.
 
 CPU contexts are now available as an emulator primitive, but no production path
 uses them to schedule or execute a created thread. They do not allocate or

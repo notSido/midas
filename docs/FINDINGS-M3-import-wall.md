@@ -2443,6 +2443,7 @@ cargo run --locked --release --example trace_child_postmortem -- \
   samples/test_target_protected.exe 60000000 100000 4096
 ```
 
+
 `trace_child_postmortem` does not hardcode the formal call position, thread ID,
 start address, parameter, `timeGetTime` stub, return address, VM handler slot,
 or terminal stack cell. It advances one trapped API at a time until the
@@ -2712,7 +2713,6 @@ All six fresh replays preserve the checkpoint's 18,188 child RIPs and digest
 stack path that produced the source-context zero. It does not establish why
 `RAX` was zero at the beginning of the frozen sequence, nor does it give that
 value Windows lifecycle meaning.
-
 ## Names-only USER32 controls identify two bounded child APIs
 
 The prior source chain ends in the empty synthetic export-name table of
@@ -2850,7 +2850,7 @@ This terminal is not the prior trampoline `ret` and its pointer cell is not the
 prior VM handler slot. In particular, historical RET handler slot
 `0x0000000140066c04` belongs to the 18,188-RIP checkpoint chain above. Current
 cell `0x000000014006f108` is the runtime-derived memory operand of
-`0x000000014019b098: call qword [rdi+108h]`; the diagnostic calls it an indirect
+`0x000000014019b098: call qword [rdi+20108h]`; the diagnostic calls it an indirect
 pointer cell and does not assign a handler-table role without evidence.
 
 A fresh whole-run watch on the runtime-derived current cell retains ten hits;
@@ -2909,4 +2909,248 @@ cargo clippy --all-targets -- -D warnings
 git diff --check
 cargo run --locked --release --example trace_child_postmortem -- \
   samples/test_target_protected.exe 60000000 100000 4096
+```
+
+## `WideCharToMultiByte` is the causal post-class null
+
+The post-class cell is no longer semantically unresolved. A corrected
+names-only kernel32 control identifies it as `WideCharToMultiByte`, and a
+bounded implementation advances the child through both observed conversion
+calls. This result comes from address and control provenance at the loader
+writer; no further zero-value VM/stack chain was followed.
+
+### One-name A/B identifies the cell
+
+The retained export-name control now records whether it was actually applied
+and rejects a run if the configured module bypassed it. This check exposed and
+fixed a diagnostic bug: the dedicated `GetModuleHandleA("kernel32.dll")` path
+had mapped the ordinary kernel32 seed directly, so the earlier reported broad
+kernel32 control was a no-op. No conclusion from that no-op is retained.
+
+The two committed control files are strictly sorted and differ by exactly one
+line:
+
+```text
+docs/controls/kernel32-without-widechar.txt  # 19 production names
+docs/controls/kernel32-with-widechar.txt     # same names + WideCharToMultiByte
+```
+
+Their SHA-256 values are, respectively,
+`ead2f345b2eebfeedfabbd1551e1029fd721678d0d068321b598948ade757234`
+and
+`dfd7ed5f8d57f01047b511334aa6e45c42362964b7b0baba56c74561bc2490db`.
+Reproduce the current-tree A/B with:
+
+```text
+cargo build --locked --release --example trace_child_postmortem
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-without-widechar.txt \
+  > /tmp/midas-widechar-without-artifact.txt
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-with-widechar.txt \
+  --frontier-only \
+  > /tmp/midas-widechar-with-artifact.txt
+
+sha256sum /tmp/midas-widechar-{without,with}-artifact.txt
+```
+
+The output SHA-256 values are
+`331931055f374b1728f7c47b2abf05b3add5c201cc0ca9a459a5f522c26b87d0`
+and
+`44e1a79e5bd4c4af74182b168e2011e11c56a9a8760120a6e121eb76116ca280`.
+The treatment changes the observable frontier:
+
+| Observation | 19-name control | Same control plus `WideCharToMultiByte` |
+|---|---|---|
+| Cell writer | global 28,615,712, `0x00000001400accf7: mov [r9],rbx`, `RBX=0` | same writer instruction stores the runtime synthetic kernel32 stub; the extra sorted name shifts it to global 28,635,463 |
+| First post-class transfer | `0x000000014019b098 -> [0x000000014006f108] = 0` | same instruction/cell reads nonzero stub `0x00007fff00001130` |
+| Old-frontier boundary | null indirect terminal | same call dispatches to name-resolved `WideCharToMultiByte` |
+| Trace to that call | 28,135 child RIPs, digest `0x6b27c3a47b61a00d`; 14,049 post-time RIPs, `0x9aecc2c386795f99` | exact same counts and digests before dispatch |
+| First reported terminal | old indirect null | after two conversions plus `GetProcessHeap` and `RtlAllocateHeap`, a distinct near-return null |
+| Restored main | 3,527 RIPs, digest `0x7fce9fdb31fbfd70`, next `Sleep(1)` | exact same loop and digest |
+
+Before the handler was added, the 20-name treatment stopped as
+`UnhandledApi { name: "WideCharToMultiByte" }` with pointer value
+`0x00007fff00001130`; that captured report has SHA-256
+`8e715c1016a9e982a6533c56aa8b00b8fffd46f2ffb1a8ab02005bc9ddbd7985`.
+A genuine 1,416-name treatment from Wine's
+[pinned kernel32 spec](https://github.com/wine-mirror/wine/blob/6eb2e4c32cc9e271856146df11ed3a5c2cf29234/dlls/kernel32/kernel32.spec)
+independently selected the same name, but exceeded the ordinary
+60,000,000-instruction leg cap. The one-name treatment above completes at the
+formal bound and is the causal artifact.
+
+### The terminal arguments are an exact conversion-size query
+
+The terminal instruction bytes remain `ff 97 08 01 02 00`, or
+`call qword [rdi+0x20108]`. Interpreting the four registers and four stack
+arguments under the eight-argument kernel32 signature gives:
+
+```text
+WideCharToMultiByte(
+    CodePage          = 0,                       # CP_ACP
+    dwFlags           = 0,
+    lpWideCharStr     = 0x0000000140111121,      # L"guest.exe"
+    cchWideChar       = -1,
+    lpMultiByteStr    = NULL,
+    cbMultiByte       = 0,
+    lpDefaultChar     = NULL,
+    lpUsedDefaultChar = NULL)
+```
+
+This exact match supersedes the earlier window-construction-shaped inference.
+Microsoft documents that `cchWideChar=-1` processes the terminating null and
+that `cbMultiByte=0` returns the required byte count without using an output
+buffer:
+<https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-widechartomultibyte>.
+For printable ASCII `guest.exe` plus its terminator, the supported result is
+10.
+
+A query-only production checkpoint returned 10, then exposed
+`GetProcessHeap`, `RtlAllocateHeap`, and a second call through the same cell.
+Its report SHA-256 is
+`7872e94a586b9cdbbd6e80ff653e9fe217492ffa189dd282b5ea20e0e846cac4`.
+The second observed shape is:
+
+```text
+WideCharToMultiByte(
+    0, 0, L"guest.exe", -1,
+    0x0000000f40007000, 10, NULL, NULL)
+```
+
+The implementation is deliberately narrower than general Windows NLS:
+
+- kernel32 exposes the one observed name;
+- `UINT`, `DWORD`, and `int` inputs consume their low 32 bits, while pointers
+  remain full-width;
+- only `CP_ACP`, flags zero, `cchWideChar=-1`, null default-character pointers,
+  and a null-terminated printable 7-bit ASCII input within 260 UTF-16 units are
+  supported;
+- the size-query form returns the derived byte count including null;
+- the output form requires a non-null buffer with the derived size, writes the
+  derived ASCII bytes and terminator without touching its suffix, and returns
+  the same count;
+- other code pages, flags, explicit input lengths, non-ASCII text, and
+  cap-exhausted strings remain `Unhandled`; host locale and code-page state are
+  not consulted.
+
+Focused tests cover repeated and fresh size queries, dirty upper halves,
+conversion output and suffix preservation, non-ASCII and cap rejection,
+unmodeled-shape no-input/no-return access, input/return/output failure
+atomicity, and dispatch through the name-resolved kernel32 stub.
+
+### Production advances to a distinct bounded frontier
+
+The current formal command deliberately stops after the first new terminal so
+the diagnostic does not enter another long provenance chain:
+
+```text
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  --frontier-only \
+  > /tmp/midas-widechar-production-artifact.txt
+sha256sum samples/test_target_protected.exe \
+  /tmp/midas-widechar-production-artifact.txt
+```
+
+The formal sample SHA-256 remains
+`8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf`;
+the report SHA-256 is
+`221b073964e9899c3e0969ba3af516397c4098a0c7a06b74cbd2445821ea02b8`.
+It reports:
+
+```text
+child tail APIs = [timeGetTime, LoadCursorA, RegisterClassExA,
+                   WideCharToMultiByte, GetProcessHeap, RtlAllocateHeap,
+                   WideCharToMultiByte]
+child terminal  = NullControlTransfer
+terminal        = near `ret 0` at 0x000000014005cb7c
+terminal cell   = 0x0000000f500fee90, value 0
+child trace     = 44,386 RIPs, digest 0xed010b86a52a2ab2
+post-time       = 30,300 RIPs, digest 0x3d2b90b3678f0d4e
+restored main   = 3,527 RIPs, digest 0x7fce9fdb31fbfd70,
+                  next API Sleep(1)
+provenance      = skipped by --frontier-only
+```
+
+The new terminal is not followed backward here. It is not classified as a
+clean Windows thread return, startup-thunk return, callback, or OEP.
+
+Incomplete-provenance sample 3 independently exercises both bounded
+`WideCharToMultiByte` forms and the same seven-API tail, then reaches its own
+near-return null. Its report has 43,724 child RIPs (digest
+`0x55db266985c561e3`), 29,869 post-time RIPs
+(`0x892e272b7fedd906`), and the unchanged 3,523-RIP restored-main digest
+`0xe6f2315efb90611e`; `/tmp/midas-widechar-sample3.txt` has SHA-256
+`c2270cc7c8488f49c7d3cbc4ca53374a2b92bb42e7346cafe58f0726e4e7a5b1`.
+This is engineering corroboration only; the formal sample remains the
+milestone artifact.
+
+### Lifecycle hypothesis matrix
+
+| Hypothesis | Bounded observation or treatment | Result |
+|---|---|---|
+| Missing kernel32 `WideCharToMultiByte` name/semantics causes the post-class null | Current-tree 19-name versus 20-name controls; then query-only and output-form handlers | Supported causally. One added name changes the same loader writer/cell from zero to the named stub; the two documented shapes return/write 10 and advance 16,251 child instructions beyond the old terminal |
+| One extra serial main leg before direct child entry is sufficient | Complete one more 3,527-instruction `Sleep(1)` leg, then enter the child directly | Child and restored-main results remain unchanged. This tests only that ordering, not a scheduler yield or real interleaving |
+| Current-thread ID, `TEB.ClientId`, or per-thread TLS supplies the missing value | Main TEB prefix through `+0x70`; complete child TEB watch; formal image TLS-cell watches | Main has 1,545 reads at `TEB+0x30`; the advanced child has four, all at `TEB+0x30`. Neither path reads `ClientId`, the TEB TLS pointer, or the formal image TLS cells |
+| The fixed zero `timeGetTime` value is the immediate blocker | Return fixed 1 and 1,000 in separate recorded controls | Neither changes the old terminal or loop. A coherently advancing clock, `Sleep` coupling, and time-driven scheduling remain untested |
+| A mapped-image TLS/DLL thread callback initializes the cell | Decode the formal TLS directory and mapped synthetic module headers | Formal callback array starts with NULL; synthetic modules have zero entry point and no TLS callback directory. There is no runtime-derived guest notification target to invoke |
+| `RegisterClassExA` callback/window lifecycle causes the current call | Record the registered WndProc and classify all eight terminal arguments | The registered WndProc is not executed before the call, and the arguments exactly identify `WideCharToMultiByte`, not `CreateWindowExA/W` or a WndProc |
+| A scheduler alone releases the main poll | Directly run the recorded child before and after the conversion fix, restore main CPU state, and execute the next leg | Not supported. Midas still lacks a scheduler, but even the advanced direct child leaves the next main leg exact and reaches a distinct child null |
+
+The main TEB and TLS controls remain reproducible with:
+
+```text
+target/release/examples/trace_slot samples/test_target_protected.exe \
+  f10000000 f10000070 4096 60000000 39 \
+  > /tmp/midas-main-teb-watch.txt
+target/release/examples/trace_slot samples/test_target_protected.exe \
+  14004e000 14004e018 256 60000000 39 \
+  > /tmp/midas-tls-watch.txt
+```
+
+Their SHA-256 values are
+`155f237c7cb131c4ae2cfe16cbbe15d89145ea1017aaafa12bf346196fd1204b`
+and
+`15f4d8bb3eab8605470320d306cfc44e437be3b331dfb007b5f1fa289d8bcb62`.
+A disposable advanced-child watch of the same three image TLS cells retained
+no hit; its full report SHA-256 is
+`e8130b78fec17442f080eb252aa8cbfeec30ada456f5750bbd17c59b06445364`.
+
+### Supported causal explanation and next question
+
+The missing/inaccurate semantic that causes the diagnostic child's current
+post-`RegisterClassExA` null is the absence of kernel32
+`WideCharToMultiByte`, specifically its CP_ACP printable-ASCII size query and
+matching output conversion. It is not thread identity, fixed uptime value,
+mapped-image DLL notification, or USER32 class/callback lifecycle.
+
+That semantic is not, by itself, the explanation for the main loop. Normal
+Midas execution never starts the recorded child because there is no scheduler;
+after direct diagnostic execution with both conversions implemented, the poll
+and restored Sleep leg still do not change, and the child reaches a distinct
+near-return null. The evidence therefore supports two separate blockers rather
+than one Windows semantic that explains both observations.
+
+No additional speculative API or return policy is added. The next bounded
+question is the control provenance of the distinct `ret 0`: is it intended to
+reach the diagnostic return sentinel/thread-start wrapper, or is one more
+runtime-selected dependency missing? That question should be tested at the
+new terminal with a bounded return/startup treatment and poll comparison, not
+by extending another zero-value VM/stack trace.
+
+Current verification is:
+
+```text
+cargo fmt --check
+cargo build --all-targets
+cargo test --all-targets              # 160 passed (146 library, 11 child diagnostic, 3 trace_slot)
+cargo clippy --all-targets -- -D warnings
+git diff --check
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 60000000 100000 4096 \
+  --frontier-only
 ```
