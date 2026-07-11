@@ -3,7 +3,7 @@ use std::{env, fs, process};
 use midas::{
     emu::Emu,
     pe::PeImage,
-    win64::{run_with_import_trap, TrapStop, Win64Env},
+    win64::{run_with_cooperative_scheduler, TrapStop, Win64Env},
 };
 
 const DEFAULT_PER_RUN_CAP: u64 = 60_000_000;
@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to map image: {error}"))?;
 
     let mut env = Win64Env::new(image.image_base);
-    let result = run_with_import_trap(
+    let result = run_with_cooperative_scheduler(
         &mut env,
         &mut emu,
         &image,
@@ -49,6 +49,25 @@ fn run() -> Result<(), String> {
     for (index, name) in result.handled.iter().enumerate() {
         println!("  {:03}: {name}", index + 1);
     }
+
+    println!("cooperative yields:");
+    for (index, yielded) in result.cooperative_yields.iter().enumerate() {
+        println!(
+            "  {:03}: thread={} stack=0x{:016x}+0x{:x} teb=0x{:016x} instructions={} stop={:?}",
+            index + 1,
+            yielded.thread_id,
+            yielded.stack_base,
+            yielded.stack_size,
+            yielded.teb_base,
+            yielded.instructions_executed,
+            yielded.stop,
+        );
+        println!("       handled={:?}", yielded.handled);
+    }
+    println!(
+        "main instructions after first yield: {}",
+        result.main_instructions_after_first_yield
+    );
 
     println!("stop: {}", format_stop(&image, &result.stop));
     Ok(())
