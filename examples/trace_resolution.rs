@@ -109,6 +109,7 @@ fn format_stop_reason(reason: &StopReason) -> String {
     match reason {
         StopReason::ReachedInstructionCap => "instruction cap reached".to_owned(),
         StopReason::ReachedUntil => "until address reached".to_owned(),
+        StopReason::IndirectTransferObserved => "indirect transfer observed".to_owned(),
         StopReason::MemoryFault(fault) => format!(
             "memory fault kind={} address=0x{:016x}",
             format_fault_kind(fault.kind),

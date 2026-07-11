@@ -1,12 +1,13 @@
 //! Minimal Unicorn-backed x86-64 emulation harness.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use crate::pe;
 
 pub use unicorn_engine::RegisterX86;
 
+use iced_x86::{Decoder, DecoderOptions, FlowControl};
 use thiserror::Error;
 use unicorn_engine::{
     uc_error,
@@ -18,6 +19,7 @@ const PAGE_SIZE: u64 = 0x1000;
 const RECENT_RIPS_CAP: usize = 64;
 const PERSISTENT_WATCH_CODE_WINDOW_SIZE: usize = 64;
 const PERSISTENT_WATCH_CODE_WINDOW_FALLBACK: usize = 16;
+const MAX_INDIRECT_TRANSFER_WATCH_RANGES: usize = 64;
 const REGISTER_SNAPSHOT_ORDER: [RegisterX86; 18] = [
     RegisterX86::RAX,
     RegisterX86::RBX,
@@ -162,6 +164,16 @@ pub enum EmuError {
     #[error("global instruction watch range must be nonempty and ordered, got {start}..{end}")]
     InvalidGlobalInstructionRange { start: u64, end: u64 },
 
+    #[error("indirect-transfer watch range must be nonempty and ordered, got {start}..{end}")]
+    InvalidIndirectTransferWatchRange { start: u64, end: u64 },
+
+    #[error("indirect-transfer watch has too many {kind} ranges: {count} (maximum {maximum})")]
+    TooManyIndirectTransferWatchRanges {
+        kind: &'static str,
+        count: usize,
+        maximum: usize,
+    },
+
     #[error("address range overflows: base 0x{base:016x}, size {size:#x}")]
     AddressRangeOverflow { base: u64, size: u64 },
 
@@ -199,6 +211,7 @@ pub struct MemFault {
 pub enum StopReason {
     ReachedInstructionCap,
     ReachedUntil,
+    IndirectTransferObserved,
     MemoryFault(MemFault),
     InvalidInstruction,
     Other(String),
@@ -211,6 +224,53 @@ pub struct RunReport {
     pub instructions_executed: u64,
     pub recent_rips: Vec<u64>,
     pub registers: Vec<(RegisterX86, u64)>,
+}
+
+/// Runtime class of an indirect x86-64 control-transfer instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectTransferKind {
+    Branch,
+    Call,
+    Return,
+}
+
+/// One bounded source-to-target observation frozen before the target executes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectTransferObservation {
+    pub global_instruction_index: u64,
+    pub source_rip: u64,
+    pub target_rip: u64,
+    pub kind: IndirectTransferKind,
+    pub source_bytes: Vec<u8>,
+    pub target_bytes: Vec<u8>,
+    pub registers: Vec<(RegisterX86, u64)>,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectTransferCaptureFailureReason {
+    #[error("source instruction bytes were unavailable")]
+    SourceBytesUnavailable,
+    #[error("source instruction bytes did not decode exactly")]
+    SourceInstructionInvalid,
+    #[error("target instruction bytes were unavailable")]
+    TargetBytesUnavailable,
+    #[error("target instruction bytes did not decode exactly")]
+    TargetInstructionInvalid,
+    #[error("captured {captured} of {expected} required registers")]
+    IncompleteRegisterSnapshot { captured: usize, expected: usize },
+}
+
+/// A potential watched source-to-target edge whose proof payload could not be
+/// frozen completely. This is retained instead of emitting an OEP candidate.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error(
+    "global instruction {global_instruction_index}, source 0x{source_rip:016x}, target 0x{target_rip:016x}: {reason}"
+)]
+pub struct IndirectTransferCaptureFailure {
+    pub global_instruction_index: u64,
+    pub source_rip: u64,
+    pub target_rip: u64,
+    pub reason: IndirectTransferCaptureFailureReason,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +346,24 @@ struct EmuData {
     persistent_watch_hits: Vec<PersistentWatchHit>,
     persistent_watch_hit_cap: usize,
     persistent_watch_global_range: Option<(u64, u64)>,
+    indirect_transfer_watch: Option<IndirectTransferWatch>,
+    indirect_transfer_stop_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviousInstruction {
+    address: u64,
+    size: u32,
+}
+
+struct IndirectTransferWatch {
+    source_ranges: Vec<(u64, u64)>,
+    target_ranges: Vec<(u64, u64)>,
+    include_calls: bool,
+    executed_target_rips: BTreeSet<u64>,
+    previous: Option<PreviousInstruction>,
+    observation: Option<IndirectTransferObservation>,
+    capture_failure: Option<IndirectTransferCaptureFailure>,
 }
 
 /// An opaque, reusable snapshot of Unicorn CPU state owned by one [`Emu`].
@@ -547,6 +625,56 @@ impl Emu {
         self.uc.get_data().total_instr_count
     }
 
+    /// Watch for the first previously unseen entry from any `source_ranges`
+    /// address into any `target_ranges` address through an indirect branch,
+    /// return, or (when requested) indirect call.
+    ///
+    /// Ranges are half-open. Coverage and a latched observation persist across
+    /// resume legs and CPU-context restores, while predecessor continuity is
+    /// deliberately reset at each host-driven resume boundary. Reconfiguring
+    /// replaces all prior watch state.
+    pub fn configure_indirect_transfer_watch(
+        &mut self,
+        source_ranges: &[(u64, u64)],
+        target_ranges: &[(u64, u64)],
+        include_calls: bool,
+    ) -> Result<(), EmuError> {
+        validate_indirect_transfer_ranges("source", source_ranges)?;
+        validate_indirect_transfer_ranges("target", target_ranges)?;
+
+        self.uc.get_data_mut().indirect_transfer_watch = Some(IndirectTransferWatch {
+            source_ranges: source_ranges.to_vec(),
+            target_ranges: target_ranges.to_vec(),
+            include_calls,
+            executed_target_rips: BTreeSet::new(),
+            previous: None,
+            observation: None,
+            capture_failure: None,
+        });
+        self.uc.get_data_mut().indirect_transfer_stop_requested = false;
+        Ok(())
+    }
+
+    /// Return the immutable first observation retained by the configured
+    /// indirect-transfer watch.
+    pub fn indirect_transfer_observation(&self) -> Option<IndirectTransferObservation> {
+        self.uc
+            .get_data()
+            .indirect_transfer_watch
+            .as_ref()
+            .and_then(|watch| watch.observation.clone())
+    }
+
+    /// Return the first incomplete proof-payload capture retained by the
+    /// configured indirect-transfer watch.
+    pub fn indirect_transfer_capture_failure(&self) -> Option<IndirectTransferCaptureFailure> {
+        self.uc
+            .get_data()
+            .indirect_transfer_watch
+            .as_ref()
+            .and_then(|watch| watch.capture_failure.clone())
+    }
+
     /// Capture the current Unicorn CPU state into a new reusable context.
     ///
     /// See [`CpuContext`] for the intentionally narrow snapshot scope.
@@ -656,6 +784,7 @@ impl Emu {
     }
 
     pub fn run(&mut self, begin: u64, until: u64, count: usize) -> Result<(), EmuError> {
+        self.reset_indirect_transfer_leg();
         self.uc
             .emu_start(begin, until, 0, count)
             .map_err(|source| EmuError::Start {
@@ -684,6 +813,10 @@ impl Emu {
             data.last_fault = None;
             data.recent_rips.clear();
             data.recent_instructions.clear();
+            data.indirect_transfer_stop_requested = false;
+            if let Some(watch) = data.indirect_transfer_watch.as_mut() {
+                watch.previous = None;
+            }
         }
 
         let run_result = if max_instructions == 0 {
@@ -793,6 +926,10 @@ impl Emu {
             data.watch_ranges.extend_from_slice(ranges);
             data.watch_hits.clear();
             data.watch_hit_cap = hit_cap;
+            data.indirect_transfer_stop_requested = false;
+            if let Some(watch) = data.indirect_transfer_watch.as_mut() {
+                watch.previous = None;
+            }
         }
 
         self.uc
@@ -874,6 +1011,10 @@ impl Emu {
             data.trace_from = max_instructions.saturating_sub(trace_window);
             data.trace_events.clear();
             data.trace_active = false;
+            data.indirect_transfer_stop_requested = false;
+            if let Some(watch) = data.indirect_transfer_watch.as_mut() {
+                watch.previous = None;
+            }
         }
 
         self.uc
@@ -966,6 +1107,9 @@ impl Emu {
     ) -> Result<RunReport, EmuError> {
         let instructions_executed = self.uc.get_data().instr_count;
         let stop_reason = match run_result {
+            Ok(()) if self.uc.get_data().indirect_transfer_stop_requested => {
+                StopReason::IndirectTransferObserved
+            }
             Ok(()) => {
                 if instructions_executed >= max_instructions {
                     StopReason::ReachedInstructionCap
@@ -1027,6 +1171,8 @@ impl Emu {
                         data.recent_instructions.pop_front();
                     }
                 }
+
+                observe_indirect_transfer(uc, address, size);
             })
             .map(|_| ())
             .map_err(EmuError::Hook)?;
@@ -1049,6 +1195,14 @@ impl Emu {
 
         self.observation_hooks_installed = true;
         Ok(())
+    }
+
+    fn reset_indirect_transfer_leg(&mut self) {
+        let data = self.uc.get_data_mut();
+        data.indirect_transfer_stop_requested = false;
+        if let Some(watch) = data.indirect_transfer_watch.as_mut() {
+            watch.previous = None;
+        }
     }
 
     fn ensure_persistent_watch_hook(&mut self) -> Result<(), EmuError> {
@@ -1111,6 +1265,219 @@ impl Emu {
         self.persistent_watch_hook_installed = true;
         Ok(())
     }
+}
+
+fn validate_indirect_transfer_ranges(
+    kind: &'static str,
+    ranges: &[(u64, u64)],
+) -> Result<(), EmuError> {
+    if ranges.len() > MAX_INDIRECT_TRANSFER_WATCH_RANGES {
+        return Err(EmuError::TooManyIndirectTransferWatchRanges {
+            kind,
+            count: ranges.len(),
+            maximum: MAX_INDIRECT_TRANSFER_WATCH_RANGES,
+        });
+    }
+    for &(start, end) in ranges {
+        if start >= end {
+            return Err(EmuError::InvalidIndirectTransferWatchRange { start, end });
+        }
+    }
+    Ok(())
+}
+
+fn address_in_ranges(address: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, end)| start <= address && address < end)
+}
+
+fn decode_exact_flow_control(
+    address: u64,
+    expected_size: u32,
+    bytes: &[u8],
+) -> Option<FlowControl> {
+    if bytes.len() != expected_size as usize {
+        return None;
+    }
+    let mut decoder = Decoder::with_ip(64, bytes, address, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() || instruction.len() != expected_size as usize {
+        return None;
+    }
+    Some(instruction.flow_control())
+}
+
+fn read_target_code_window(
+    uc: &Unicorn<'_, EmuData>,
+    address: u64,
+    exact_bytes: Vec<u8>,
+    target_ranges: &[(u64, u64)],
+) -> Vec<u8> {
+    let available = target_ranges
+        .iter()
+        .filter(|&&(start, end)| start <= address && address < end)
+        .map(|&(_, end)| end.saturating_sub(address))
+        .max()
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(exact_bytes.len());
+
+    for preferred in [
+        PERSISTENT_WATCH_CODE_WINDOW_SIZE,
+        PERSISTENT_WATCH_CODE_WINDOW_FALLBACK,
+    ] {
+        let size = preferred.min(available);
+        if size < exact_bytes.len() {
+            continue;
+        }
+        let bytes = read_code_bytes(uc, address, size);
+        if !bytes.is_empty() {
+            return bytes;
+        }
+    }
+    exact_bytes
+}
+
+fn retain_indirect_transfer_capture_failure(
+    uc: &mut Unicorn<'_, EmuData>,
+    previous: PreviousInstruction,
+    target_rip: u64,
+    reason: IndirectTransferCaptureFailureReason,
+) {
+    let global_instruction_index = uc.get_data().total_instr_count;
+    let data = uc.get_data_mut();
+    let Some(watch) = data.indirect_transfer_watch.as_mut() else {
+        return;
+    };
+    if watch.observation.is_none() && watch.capture_failure.is_none() {
+        watch.capture_failure = Some(IndirectTransferCaptureFailure {
+            global_instruction_index,
+            source_rip: previous.address,
+            target_rip,
+            reason,
+        });
+    }
+}
+
+fn observe_indirect_transfer(uc: &mut Unicorn<'_, EmuData>, address: u64, size: u32) {
+    let candidate = {
+        let data = uc.get_data_mut();
+        let Some(watch) = data.indirect_transfer_watch.as_mut() else {
+            return;
+        };
+        let previous = watch
+            .previous
+            .replace(PreviousInstruction { address, size });
+        if watch.observation.is_some()
+            || watch.capture_failure.is_some()
+            || !address_in_ranges(address, &watch.target_ranges)
+        {
+            return;
+        }
+        let target_was_unseen = watch.executed_target_rips.insert(address);
+        let Some(previous) = previous else {
+            return;
+        };
+        let is_fallthrough =
+            previous.address.checked_add(u64::from(previous.size)) == Some(address);
+        if !target_was_unseen
+            || is_fallthrough
+            || !address_in_ranges(previous.address, &watch.source_ranges)
+        {
+            return;
+        }
+        Some((previous, watch.include_calls, watch.target_ranges.clone()))
+    };
+    let Some((previous, include_calls, target_ranges)) = candidate else {
+        return;
+    };
+
+    // The source instruction has just executed. Reading exactly the size that
+    // Unicorn reported avoids decoding adjacent mutable bytes; target bytes
+    // are frozen by this hook before the target instruction executes.
+    let source_bytes = read_code_bytes(uc, previous.address, previous.size as usize);
+    if source_bytes.len() != previous.size as usize {
+        retain_indirect_transfer_capture_failure(
+            uc,
+            previous,
+            address,
+            IndirectTransferCaptureFailureReason::SourceBytesUnavailable,
+        );
+        return;
+    }
+    let Some(source_flow_control) =
+        decode_exact_flow_control(previous.address, previous.size, &source_bytes)
+    else {
+        retain_indirect_transfer_capture_failure(
+            uc,
+            previous,
+            address,
+            IndirectTransferCaptureFailureReason::SourceInstructionInvalid,
+        );
+        return;
+    };
+    let kind = match source_flow_control {
+        FlowControl::IndirectBranch => IndirectTransferKind::Branch,
+        FlowControl::IndirectCall => IndirectTransferKind::Call,
+        FlowControl::Return => IndirectTransferKind::Return,
+        _ => return,
+    };
+    if kind == IndirectTransferKind::Call && !include_calls {
+        return;
+    }
+
+    let target_exact_bytes = read_code_bytes(uc, address, size as usize);
+    if target_exact_bytes.len() != size as usize {
+        retain_indirect_transfer_capture_failure(
+            uc,
+            previous,
+            address,
+            IndirectTransferCaptureFailureReason::TargetBytesUnavailable,
+        );
+        return;
+    }
+    if decode_exact_flow_control(address, size, &target_exact_bytes).is_none() {
+        retain_indirect_transfer_capture_failure(
+            uc,
+            previous,
+            address,
+            IndirectTransferCaptureFailureReason::TargetInstructionInvalid,
+        );
+        return;
+    }
+    let registers = snapshot_registers(uc);
+    if registers.len() != REGISTER_SNAPSHOT_ORDER.len() {
+        retain_indirect_transfer_capture_failure(
+            uc,
+            previous,
+            address,
+            IndirectTransferCaptureFailureReason::IncompleteRegisterSnapshot {
+                captured: registers.len(),
+                expected: REGISTER_SNAPSHOT_ORDER.len(),
+            },
+        );
+        return;
+    }
+
+    let observation = IndirectTransferObservation {
+        global_instruction_index: uc.get_data().total_instr_count,
+        source_rip: previous.address,
+        target_rip: address,
+        kind,
+        source_bytes,
+        target_bytes: read_target_code_window(uc, address, target_exact_bytes, &target_ranges),
+        registers,
+    };
+    let data = uc.get_data_mut();
+    let Some(watch) = data.indirect_transfer_watch.as_mut() else {
+        return;
+    };
+    if watch.observation.is_some() {
+        return;
+    }
+    watch.observation = Some(observation);
+    data.indirect_transfer_stop_requested = true;
+    let _ = uc.emu_stop();
 }
 
 fn read_hook_value(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> u64 {
@@ -1330,8 +1697,10 @@ mod tests {
     use crate::pe;
 
     use super::{
-        access_overlaps_ranges, map_region, read_hook_value_opt, write_hook_value_opt, Emu,
-        EmuError, FaultKind, RegisterX86, StopReason, TraceEvent, PAGE_SIZE, PEB_BASE,
+        access_overlaps_ranges, map_region, read_hook_value_opt,
+        retain_indirect_transfer_capture_failure, write_hook_value_opt, Emu, EmuError, FaultKind,
+        IndirectTransferCaptureFailure, IndirectTransferCaptureFailureReason, IndirectTransferKind,
+        PreviousInstruction, RegisterX86, StopReason, TraceEvent, PAGE_SIZE, PEB_BASE,
         PEB_IMAGEBASE_OFFSET, RECENT_RIPS_CAP, REGISTER_SNAPSHOT_ORDER, STACK_BASE, STACK_SIZE,
         TEB_BASE, TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_STACKBASE_OFFSET,
     };
@@ -2167,6 +2536,301 @@ mod tests {
         assert_eq!(write_hook_value_opt(value, 9), None);
         assert_eq!(read_hook_value_opt(&emu.uc, STACK_BASE, 9), None);
         assert_eq!(read_hook_value_opt(&emu.uc, 0xdead_beef, 8), None);
+    }
+
+    #[test]
+    fn indirect_transfer_watch_freezes_unseen_branch_entry_and_registers() {
+        const SOURCE: u64 = 0x0000_0000_0200_0000;
+        const TARGET: u64 = SOURCE + 0x2000;
+        let mut code = vec![0x48, 0xb8]; // mov rax, TARGET
+        code.extend_from_slice(&TARGET.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(SOURCE, &code).unwrap();
+        emu.map_code(TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + 0x1000)],
+            &[(TARGET, TARGET + 0x1000)],
+            false,
+        )
+        .unwrap();
+
+        let report = emu.resume(SOURCE, 16).unwrap();
+        assert_eq!(report.stop_reason, StopReason::IndirectTransferObserved);
+        let observation = emu.indirect_transfer_observation().unwrap();
+        assert_eq!(observation.global_instruction_index, 3);
+        assert_eq!(observation.source_rip, SOURCE + 10);
+        assert_eq!(observation.target_rip, TARGET);
+        assert_eq!(observation.kind, IndirectTransferKind::Branch);
+        assert_eq!(observation.source_bytes, vec![0xff, 0xe0]);
+        assert_eq!(&observation.target_bytes[..3], &[0x90, 0x0f, 0x0b]);
+        assert_eq!(
+            observation
+                .registers
+                .iter()
+                .map(|(register, _)| *register)
+                .collect::<Vec<_>>(),
+            REGISTER_SNAPSHOT_ORDER
+        );
+        assert_eq!(
+            observation
+                .registers
+                .iter()
+                .find_map(|(register, value)| (*register == RegisterX86::RAX).then_some(*value)),
+            Some(TARGET)
+        );
+        assert_eq!(
+            observation
+                .registers
+                .iter()
+                .find_map(|(register, value)| (*register == RegisterX86::RIP).then_some(*value)),
+            Some(TARGET)
+        );
+        assert!(emu.indirect_transfer_capture_failure().is_none());
+    }
+
+    #[test]
+    fn indirect_transfer_watch_captures_target_at_mapped_page_end() {
+        const SOURCE: u64 = 0x0000_0000_0208_0000;
+        const TARGET_PAGE: u64 = SOURCE + 0x2000;
+        const TARGET: u64 = TARGET_PAGE + PAGE_SIZE - 1;
+        let mut source = vec![0x48, 0xb8]; // mov rax, TARGET
+        source.extend_from_slice(&TARGET.to_le_bytes());
+        source.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        let mut target_page = vec![0u8; PAGE_SIZE as usize];
+        target_page[PAGE_SIZE as usize - 1] = 0x90; // nop
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(SOURCE, &source).unwrap();
+        emu.map_code(TARGET_PAGE, &target_page).unwrap();
+        // Keep Unicorn's translation lookahead mapped while making the
+        // accepted target range end at the executable page boundary.
+        emu.map_code(TARGET_PAGE + PAGE_SIZE, &[0xcc]).unwrap();
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + PAGE_SIZE)],
+            &[(TARGET_PAGE, TARGET_PAGE + PAGE_SIZE)],
+            false,
+        )
+        .unwrap();
+
+        let report = emu.resume(SOURCE, 16).unwrap();
+        assert_eq!(report.stop_reason, StopReason::IndirectTransferObserved);
+        let observation = emu.indirect_transfer_observation().unwrap();
+        assert_eq!(observation.target_rip, TARGET);
+        assert_eq!(observation.target_bytes, vec![0x90]);
+        assert_eq!(observation.registers.len(), REGISTER_SNAPSHOT_ORDER.len());
+        assert!(emu.indirect_transfer_capture_failure().is_none());
+    }
+
+    #[test]
+    fn indirect_transfer_watch_retains_and_resets_explicit_capture_failure() {
+        const SOURCE: u64 = 0x0000_0000_020c_0000;
+        const TARGET: u64 = SOURCE + 0x2000;
+        let mut emu = Emu::new().unwrap();
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + PAGE_SIZE)],
+            &[(TARGET, TARGET + PAGE_SIZE)],
+            false,
+        )
+        .unwrap();
+
+        retain_indirect_transfer_capture_failure(
+            &mut emu.uc,
+            PreviousInstruction {
+                address: SOURCE,
+                size: 2,
+            },
+            TARGET,
+            IndirectTransferCaptureFailureReason::TargetBytesUnavailable,
+        );
+        assert_eq!(
+            emu.indirect_transfer_capture_failure(),
+            Some(IndirectTransferCaptureFailure {
+                global_instruction_index: 0,
+                source_rip: SOURCE,
+                target_rip: TARGET,
+                reason: IndirectTransferCaptureFailureReason::TargetBytesUnavailable,
+            })
+        );
+        assert!(emu.indirect_transfer_observation().is_none());
+
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + PAGE_SIZE)],
+            &[(TARGET, TARGET + PAGE_SIZE)],
+            false,
+        )
+        .unwrap();
+        assert!(emu.indirect_transfer_capture_failure().is_none());
+    }
+
+    #[test]
+    fn indirect_transfer_watch_captures_return_but_can_exclude_calls() {
+        const SOURCE: u64 = 0x0000_0000_0210_0000;
+        const CALL_SOURCE: u64 = SOURCE + 0x2000;
+        const TARGET: u64 = SOURCE + 0x4000;
+        let rsp = STACK_BASE + 0x2000;
+
+        let mut return_emu = Emu::new().unwrap();
+        return_emu.map_code(SOURCE, &[0xc3]).unwrap();
+        return_emu.map_code(TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        return_emu.write_mem(rsp, &TARGET.to_le_bytes()).unwrap();
+        return_emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        return_emu
+            .configure_indirect_transfer_watch(
+                &[(SOURCE, SOURCE + 0x1000)],
+                &[(TARGET, TARGET + 0x1000)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            return_emu.resume(SOURCE, 8).unwrap().stop_reason,
+            StopReason::IndirectTransferObserved
+        );
+        assert_eq!(
+            return_emu.indirect_transfer_observation().unwrap().kind,
+            IndirectTransferKind::Return
+        );
+
+        let mut call_code = vec![0x48, 0xb8]; // mov rax, TARGET
+        call_code.extend_from_slice(&TARGET.to_le_bytes());
+        call_code.extend_from_slice(&[0xff, 0xd0]); // call rax
+        call_code.extend_from_slice(&[0x0f, 0x0b]);
+        let mut call_emu = Emu::new().unwrap();
+        call_emu.map_code(CALL_SOURCE, &call_code).unwrap();
+        call_emu.map_code(TARGET, &[0xc3]).unwrap();
+        call_emu
+            .configure_indirect_transfer_watch(
+                &[(CALL_SOURCE, CALL_SOURCE + 0x1000)],
+                &[(TARGET, TARGET + 0x1000)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            call_emu.resume(CALL_SOURCE, 16).unwrap().stop_reason,
+            StopReason::InvalidInstruction
+        );
+        assert!(call_emu.indirect_transfer_observation().is_none());
+    }
+
+    #[test]
+    fn indirect_transfer_watch_rejects_direct_and_previously_seen_targets() {
+        const DIRECT: u64 = 0x0000_0000_0220_0000;
+        const INDIRECT: u64 = DIRECT + 0x2000;
+        const TARGET: u64 = DIRECT + 0x4000;
+
+        let displacement = i64::try_from(TARGET).unwrap() - i64::try_from(DIRECT + 5).unwrap();
+        let mut direct_code = vec![0xe9];
+        direct_code.extend_from_slice(&(displacement as i32).to_le_bytes());
+        let mut indirect_code = vec![0x48, 0xb8];
+        indirect_code.extend_from_slice(&TARGET.to_le_bytes());
+        indirect_code.extend_from_slice(&[0xff, 0xe0]);
+
+        let mut direct_emu = Emu::new().unwrap();
+        direct_emu.map_code(DIRECT, &direct_code).unwrap();
+        direct_emu.map_code(TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        direct_emu
+            .configure_indirect_transfer_watch(
+                &[(DIRECT, DIRECT + 0x1000)],
+                &[(TARGET, TARGET + 0x1000)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            direct_emu.resume(DIRECT, 8).unwrap().stop_reason,
+            StopReason::InvalidInstruction
+        );
+        assert!(direct_emu.indirect_transfer_observation().is_none());
+
+        let mut seen_emu = Emu::new().unwrap();
+        seen_emu.map_code(INDIRECT, &indirect_code).unwrap();
+        seen_emu.map_code(TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        seen_emu
+            .configure_indirect_transfer_watch(
+                &[(INDIRECT, INDIRECT + 0x1000)],
+                &[(TARGET, TARGET + 0x1000)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            seen_emu.resume(TARGET, 1).unwrap().stop_reason,
+            StopReason::ReachedInstructionCap
+        );
+        assert_eq!(
+            seen_emu.resume(INDIRECT, 16).unwrap().stop_reason,
+            StopReason::InvalidInstruction
+        );
+        assert!(seen_emu.indirect_transfer_observation().is_none());
+    }
+
+    #[test]
+    fn indirect_transfer_watch_resets_predecessor_across_resume_boundaries() {
+        const SOURCE: u64 = 0x0000_0000_0230_0000;
+        const TARGET: u64 = SOURCE + 0x2000;
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(SOURCE, &[0x90]).unwrap();
+        emu.map_code(TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + 0x1000)],
+            &[(TARGET, TARGET + 0x1000)],
+            false,
+        )
+        .unwrap();
+
+        // A host-selected resume at TARGET is not a guest edge from SOURCE.
+        assert_eq!(
+            emu.resume(SOURCE, 1).unwrap().stop_reason,
+            StopReason::ReachedInstructionCap
+        );
+        assert_eq!(
+            emu.resume(TARGET, 1).unwrap().stop_reason,
+            StopReason::ReachedInstructionCap
+        );
+        assert!(emu.indirect_transfer_observation().is_none());
+    }
+
+    #[test]
+    fn indirect_transfer_watch_configuration_is_bounded_and_failure_atomic() {
+        let mut emu = Emu::new().unwrap();
+        emu.configure_indirect_transfer_watch(&[(0x1000, 0x2000)], &[(0x3000, 0x4000)], false)
+            .unwrap();
+
+        let invalid = emu
+            .configure_indirect_transfer_watch(&[(0x2000, 0x2000)], &[(0x3000, 0x4000)], false)
+            .unwrap_err();
+        assert!(matches!(
+            invalid,
+            EmuError::InvalidIndirectTransferWatchRange {
+                start: 0x2000,
+                end: 0x2000
+            }
+        ));
+
+        let excessive = (0..=super::MAX_INDIRECT_TRANSFER_WATCH_RANGES)
+            .map(|index| {
+                let start = 0x10_0000 + (index as u64 * 0x1000);
+                (start, start + 0x1000)
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            emu.configure_indirect_transfer_watch(
+                &excessive,
+                &[(0x3000, 0x4000)],
+                false
+            ),
+            Err(EmuError::TooManyIndirectTransferWatchRanges {
+                kind: "source",
+                count,
+                maximum: super::MAX_INDIRECT_TRANSFER_WATCH_RANGES,
+            }) if count == excessive.len()
+        ));
+
+        // Both rejected configurations leave the original empty observation
+        // and valid watch available rather than partially replacing it.
+        assert!(emu.indirect_transfer_observation().is_none());
+        let watch = emu.uc.get_data().indirect_transfer_watch.as_ref().unwrap();
+        assert_eq!(watch.source_ranges, vec![(0x1000, 0x2000)]);
+        assert_eq!(watch.target_ranges, vec![(0x3000, 0x4000)]);
     }
 
     #[test]

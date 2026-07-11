@@ -276,6 +276,7 @@ fn format_stop(stop: &TrapStop) -> String {
             format!("unexpected fetch fault at 0x{address:016x}")
         }
         TrapStop::InstructionCap => "instruction cap reached".to_owned(),
+        TrapStop::IndirectTransferObserved => "indirect transfer observed".to_owned(),
         TrapStop::NullControlTransfer => "null control transfer".to_owned(),
         TrapStop::Other(value) => value.clone(),
     }
