@@ -52,15 +52,14 @@ present on disk** (all gitignored).
 | SHA-256 | `1f583d70d7bd0655cd873415dd818adeee8215769d73754065719d133f45f3ee` |
 | Size | 1,903,014 bytes |
 | Format | PE32+ (PE64) console executable, x86-64, 23 sections (per `objdump`: ImageBase `0x140000000`, AddressOfEntryPoint `0x33d058`, Subsystem 3 Windows CUI) |
-| Protector | Themida (provenance to be supplied by the sample author) |
-| Themida version | *to be supplied by author* |
-| Config | *to be supplied by author* |
-| Provenance | Second distinct sample, deposited on disk 2026-07-09. Themida version/config, source program, and pre-protection hash are **not yet recorded** — the fields above marked "to be supplied" must be filled in by the author before this sample is relied on for a milestone artifact. The SHA-256, size, and format fields were computed directly from the on-disk binary. |
+| Protector | Themida demo (free evaluation build), `Themida64.exe` |
+| Themida version | 3.2.4.34 (x64), supplied by the sample author |
+| Config | Same demo-default configuration as sample 1, supplied by the sample author: Anti-debug ON; Compress & Encrypt (Application, Resources, SecureEngine) ON; Detect file/registry monitors ON; Allow execution under VMware/Virtual PC ON. Entry Point Virtualization, Anti-File-Patching, Anti-Sandbox, String Encryption all OFF. |
+| Provenance | Second distinct sample, deposited on disk 2026-07-09. The author confirmed the version/configuration on 2026-07-11. The source program and pre-protection hash are **not yet recorded** because the original is temporarily unavailable on the author's work notebook. The SHA-256, size, and format fields were computed directly from the on-disk binary. |
 
-> The verified facts (hash, size, format, and the `objdump`-read header values)
-> are direct observations of the deposited file. The Themida version/config and
-> source provenance are placeholders until the author records them; do not treat
-> them as known.
+> The hash, size, format, and `objdump`-read header values are direct
+> observations of the deposited file. Version/configuration are author-supplied
+> provenance. Source and pre-protection-binary provenance remain pending.
 
 ### 3. `test_target3_protected.exe`
 
@@ -70,13 +69,14 @@ present on disk** (all gitignored).
 | SHA-256 | `6c70e14c40fde8661b0b0121161deb1afd9edffd682f1f30f2b5916895f79585` |
 | Size | 1,911,748 bytes |
 | Format | PE32+ (PE64) console executable, x86-64, 23 sections; entry RVA `0x33d058` (from midas / probe) |
-| Protector | Themida (provenance to be supplied by the sample author) |
-| Themida version | *to be supplied by author* |
-| Config | *to be supplied by author* |
-| Provenance | Third distinct sample, deposited on disk 2026-07-09. Themida version/config, source program, and pre-protection hash are **not yet recorded** — to be supplied by the author. SHA-256, size, and format were computed directly from the on-disk binary. |
+| Protector | Themida demo (free evaluation build), `Themida64.exe` |
+| Themida version | 3.2.4.34 (x64), supplied by the sample author |
+| Config | Same demo-default configuration as samples 1 and 2, supplied by the sample author: Anti-debug ON; Compress & Encrypt (Application, Resources, SecureEngine) ON; Detect file/registry monitors ON; Allow execution under VMware/Virtual PC ON. Entry Point Virtualization, Anti-File-Patching, Anti-Sandbox, String Encryption all OFF. |
+| Provenance | Third distinct sample, deposited on disk 2026-07-09. The author confirmed the version/configuration on 2026-07-11. The source program and pre-protection hash are **not yet recorded** because the original is temporarily unavailable on the author's work notebook. SHA-256, size, and format were computed directly from the on-disk binary. |
 
-> Same caveat as sample 2: only the hash/size/format and midas-observed header
-> values are verified; the Themida version/config/source are placeholders.
+> Same caveat as sample 2: hash/size/format and midas-observed header values are
+> direct observations; version/configuration are author-supplied provenance;
+> source and pre-protection-binary provenance remain pending.
 
 ## Cross-sample generality (observed)
 

@@ -530,8 +530,9 @@ target/release/examples/run_loader samples/test_target_protected.exe 60000000 20
 The documented sample now handles 15 calls rather than the former 8-call prefix;
 call 9 is `RtlInitializeCriticalSection`, and the run stops later at
 `ReachedUntil`. The two additional on-disk samples produce the same engineering
-result, but their missing version/config/provenance fields in `samples/SAMPLES.md`
-mean they are not yet formal milestone-acceptance evidence.
+result, but their incomplete source/pre-protection provenance in
+`samples/SAMPLES.md` means they are not yet formal milestone-acceptance
+evidence.
 
 Exact sample-1 output:
 
@@ -621,7 +622,7 @@ stop: ReachedUntil
 Returning the environment-policy LANGID advances each sample by approximately
 1.1 million instructions beyond the 15-call wall to this later
 `ReachedUntil`. Samples 2 and 3 corroborate the engineering result, but their
-incomplete version/config/source provenance in `samples/SAMPLES.md` means they
+incomplete source/pre-protection provenance in `samples/SAMPLES.md` means they
 are not formal milestone evidence.
 
 ### New frontier
@@ -1826,8 +1827,8 @@ slice is `a1beb21d9352fae2f9de0722bacc14350bb690a1`; both commits have tree
 `86f4ff658dd46e11a133b91ac6a857125e7d0c9a`. The diagnostic and merged
 starting code are therefore byte-identical. Formal sample 1 is the milestone
 artifact throughout this section. Samples 2 and 3 have the incomplete
-version/configuration/source provenance recorded in `samples/SAMPLES.md` and
-are cited only as engineering corroboration.
+source/pre-protection provenance recorded in `samples/SAMPLES.md` and are cited
+only as engineering corroboration.
 
 On that baseline, `GetVersion` traps at synthetic stub
 `0x00007fff00001090` with `RSP = 0x0000000fffffefc8`. Dispatch returns
@@ -2060,8 +2061,8 @@ thread-entry candidate also remains outside the CreateThread slice.
 The isolated diagnosis for this slice began from exact merged `CreateThread`
 commit `ca0daf054ec8bacd2f8d246387ed708d60b3d374`. Formal sample 1 is the
 milestone artifact. Samples 2 and 3 retain the incomplete
-version/configuration/source provenance recorded in `samples/SAMPLES.md` and
-are cited only as engineering corroboration.
+source/pre-protection provenance recorded in `samples/SAMPLES.md` and are cited
+only as engineering corroboration.
 
 A disposable narrow export seed added only `Sleep` to the reviewed baseline.
 The formal 38-call prefix remained behaviorally stable, then the loader reached
@@ -3411,25 +3412,31 @@ Three observation-driven API treatments are included:
 ### Normal production replay
 
 The ordinary release `run_loader` example, with no diagnostic control or
-manual child setup, leaves the repeated `Sleep` loop on both observed variants:
+manual child setup, leaves the repeated `Sleep` loop on all three deposited
+variants:
 
-| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
-|---|---:|---:|
-| Main API at yield | call 39, `Sleep` | call 38, `Sleep` |
-| Child instructions / stop | 65,203 / `NullControlTransfer` | 64,324 / `NullControlTransfer` |
-| Child handled suffix | `... CreateWindowExA, GetProcessHeap, RtlFreeHeap` | same |
-| First restored-main API | `GetCommandLineA` | `GetCommandLineA` |
-| Main instructions after yield | 77,870 | 147,854 |
-| Production output SHA-256 | `54ce9475a7ee8eab66d9024362edc2b7ddd7606637c18f598ec566d97a39074d` | `73b781dd781cc52bc59cd26aab3039988fe51a849682ef7bf9936a1ef9ba3be1` |
+| Observation | Formal sample 1 | Incomplete-provenance sample 2 | Incomplete-provenance sample 3 |
+|---|---:|---:|---:|
+| Main API at yield | call 39, `Sleep` | call 38, `Sleep` | call 38, `Sleep` |
+| Child instructions / stop | 65,203 / `NullControlTransfer` | 65,677 / `NullControlTransfer` | 64,324 / `NullControlTransfer` |
+| Child handled suffix | `... CreateWindowExA, GetProcessHeap, RtlFreeHeap` | same | same |
+| `GetCommandLineA` position | first restored-main API | pre-yield call 34 | first restored-main API |
+| Main instructions after yield | 77,870 | 84,748 | 147,854 |
+| Production output SHA-256 | `54ce9475a7ee8eab66d9024362edc2b7ddd7606637c18f598ec566d97a39074d` | `593e5846c96e9637b52749529287e6fa2eb194ae08407a675613a44eb2b71540` | `73b781dd781cc52bc59cd26aab3039988fe51a849682ef7bf9936a1ef9ba3be1` |
 
 Each output is byte-identical across two fresh invocations. Sample 1 then
 handles two `SetCurrentDirectoryW` calls and reaches a later null control
-transfer; sample 3 handles `GetVersion`, the same two directory calls, and its
-own later null. The child null is the first newly observed post-`RtlFreeHeap`
-child wall. It occurs after the release store, because restored main reaches
-`GetCommandLineA` without another child turn. This re-validates the coarse-yield
-assumption through that boundary only; it does not establish the assumption for
-future child execution.
+transfer. Sample 2 has already handled `GetCommandLineA` before `CreateThread`;
+after the yield it handles `RtlAddVectoredExceptionHandler`, `GetVersion`, and
+two `SetCurrentDirectoryW` calls before its later null. Sample 3 handles
+`GetVersion`, the same two directory calls, and its own later null. The child
+null is the first newly observed post-`RtlFreeHeap` child wall on all three.
+For samples 1 and 3 it occurs after the release store because restored main
+reaches `GetCommandLineA` without another child turn. Sample 2 independently
+validates the coarse one-turn release but has a different main ordering, with
+`GetCommandLineA` before the yield. The coarse-yield assumption remains scoped
+to these observed boundaries only; it is not established for future child
+execution.
 
 Reproduce locally:
 
@@ -3440,10 +3447,13 @@ target/release/examples/run_loader \
   samples/test_target_protected.exe 60000000 200 \
   > /tmp/midas-slice-b-production-s1.txt
 target/release/examples/run_loader \
+  samples/test_target2_protected.exe 60000000 200 \
+  > /tmp/midas-slice-b-production-s2.txt
+target/release/examples/run_loader \
   samples/test_target3_protected.exe 60000000 200 \
   > /tmp/midas-slice-b-production-s3.txt
 
-sha256sum /tmp/midas-slice-b-production-s{1,3}.txt
+sha256sum /tmp/midas-slice-b-production-s{1,2,3}.txt
 ```
 
 ### Durable post-release A/B check
@@ -3456,22 +3466,27 @@ the sole terminal change from target zero to the reverse-mapped named stub. The
 zero consumer must also match an exact `(global instruction index, RIP)` in the
 frozen tail. The formal sample retains 64,695 instructions past its
 runtime-derived poll; sample 3 retains 69,544. This replaces manual hash
-comparison as the option-(b) invariant.
+comparison as the option-(b) invariant. Sample 2 resolves `GetCommandLineA`
+before creating and yielding to its child, so it does not have this
+post-release missing-name boundary; its independent production replay above is
+the applicable scheduler artifact.
 
-The production runs do not classify either new null as original code or OEP.
+The production runs do not classify any newly observed null as original code or
+OEP.
 OEP detection, a general scheduler, an advancing clock, WndProc/message-loop
 dispatch, and full thread or heap lifecycle remain outside this slice. Formal
 two-sample acceptance also remains open: `samples/SAMPLES.md` records complete
-provenance only for sample 1, while samples 2 and 3 still require human-supplied
-version/config/source and pre-protection provenance.
+provenance only for sample 1. The author has supplied matching Themida
+version/configuration for samples 2 and 3, but their source and pre-protection
+binary hashes remain temporarily unavailable on the author's work notebook.
 
 Final-tree verification is green for `cargo fmt --all -- --check`,
 `cargo build --locked --all-targets`, `cargo test --locked --all-targets` (162
 library, 17 child-diagnostic, and 3 `trace_slot` tests),
 `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`, and
-the repository no-hype gate. Two fresh production invocations per observed
-variant are byte-identical at the SHA-256 values in the replay table. Fresh
-paired A/B artifacts retain SHA-256
+the repository no-hype gate. Two fresh production invocations for each of the
+three observed variants are byte-identical at the SHA-256 values in the replay
+table. Fresh paired A/B artifacts retain SHA-256
 `81e933a4a286bc2e3fc427374fa8f7c781bbfcb24d5f61e8872c54758f381a72`
 for formal sample 1 and
 `f160fea080e8e8871ee819e637af88dd2a3da0088a00d4929fe33534cc6300c6`
