@@ -2260,15 +2260,6 @@ cargo clippy --all-targets -- -D warnings
 git diff --check
 ```
 
-This is a scheduler prerequisite, not a scheduler. In particular, restoring a
-CPU context does not select `Win64Env.current_thread_id`, create stacks or TEBs,
-initialize TLS, model a clock, or classify thread termination. Because
-`Emu::resume` takes an explicit start address, a future context switch also has
-to read the restored `RIP` and pass it to resume. Context switches are intended
-at stopped or trapped boundaries, not from inside a running Unicorn hook. The
-child's unresolved zero-target edge still cannot be labeled a normal thread
-exit, and no result in this slice identifies an OEP.
-
 ## Dynamic Winmm `timeGetTime` keeps the child zero edge unresolved
 
 This bounded Win64 slice began from exact merged CPU-context commit
@@ -2433,3 +2424,201 @@ cargo test --all-targets              # 129 passed (126 library, 3 trace_slot)
 cargo clippy --all-targets -- -D warnings
 git diff --check
 ```
+
+## Bounded child post-mortem traces the internal zero through its handler slot
+
+This diagnostic slice starts from exact merged baseline
+`ce16825921d5bcce7a2881121093446d3ef751de`, whose production capabilities
+include persistent watching from `0130636b204f18c4ec1306ae7a6eadeb51690167`.
+Formal sample 1 remains the sole
+milestone artifact. Its SHA-256 was rechecked as
+`8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf`,
+matching `samples/SAMPLES.md`. Samples 2 and 3 retain incomplete provenance and
+were not used for this result.
+
+The committed reproducer is:
+
+```text
+cargo run --locked --release --example trace_child_postmortem -- \
+  samples/test_target_protected.exe 60000000 100000 4096
+```
+
+`trace_child_postmortem` does not hardcode the formal call position, thread ID,
+start address, parameter, `timeGetTime` stub, return address, VM handler slot,
+or terminal stack cell. It advances one trapped API at a time until the
+read-only stub-name projection identifies pending `Sleep`; obtains the sole
+runnable-unscheduled record from `Win64Env`; and then advances the recorded
+start until the same projection identifies pending `timeGetTime`.
+
+The direct-entry conditions remain deliberately diagnostic rather than a
+Windows startup model. Each pass uses a disjoint 1 MiB zeroed RW/NX stack, a
+separate minimal TEB containing `StackBase`, `StackLimit`, `Self`, and the shared
+PEB pointer, deterministic GPR/flags state, the recorded parameter in `RCX`,
+and a nonzero unmapped return sentinel. No scheduler selects this context; no
+TLS storage, startup thunk, DLL notification, or lifecycle state is created.
+
+### Four replay passes and bounds
+
+The example requires four fresh `Emu`/`Win64Env` replays to have identical
+main API lists, created-thread records, child instruction-address vectors,
+terminal result, and restored-main Sleep leg:
+
+1. A discovery pass derives the terminal cell from the final `ret` and final
+   `RSP`.
+2. A terminal-cell pass arms its eight-byte watch only at the pending
+   `timeGetTime` boundary, avoiding the 35-million-instruction main prefix.
+3. A handler-slot pass derives the double-dereference target from the terminal
+   VM bytecode and watches that exact slot from before the main PE entry.
+4. A source-edge pass watches the dynamically derived selector field, source
+   context qword, and handler slot. It rearms before each trapped main API leg
+   and immediately freezes and formats the first leg containing the exact
+   address, RIP, value, and global instruction index derived for the slot's last
+   writer by pass 3. No API name or call ordinal selects that leg.
+
+The CLI rejects a watch cap of zero or more than 16,384. The default and formal
+cap is 4,096. The source-edge pass also rejects any individual rearmed
+leg that reaches that cap; the frozen writer leg retains 801 hits. Any trace
+divergence, terminal instruction other than a qword near `ret` with zero extra
+stack adjustment and no operand-size override, unrecognized stop,
+mapping/register restore failure, missing handler-slot read, or incomplete
+source edge aborts the diagnostic without a provenance claim. The child per-leg
+cap is required to be nonzero and no larger than 250,000 because child and
+restored-Sleep RIPs are retained; fixed API-leg bounds keep that retention
+finite.
+
+All four passes reproduce:
+
+```text
+main prefix                 = 38 handled calls, pending Sleep
+created thread              = ID 2, start 0x0000000140058fa0, parameter 0
+child APIs                  = LoadLibraryA, GetProcAddress, timeGetTime
+timeGetTime return address  = 0x000000014021a15d
+child trace                 = 18,188 RIPs, digest 0xce52695f00082b00
+post-time suffix            = 4,102 RIPs, digest 0xf71d13ef9b4673bc
+terminal                    = NullControlTransfer; sentinel not reached
+restored main Sleep leg     = 3,527 RIPs, digest 0x7fce9fdb31fbfd70
+```
+
+The main stack and main TEB are byte-identical before and after the child in
+each replay. Restoring the owner-checked CPU context recovers all 20 tracked
+registers (`RIP`, `RSP`, flags, and FS/GS bases included) before reproducing
+the main Sleep leg. Guest memory, loaded Winmm state, hooks, and observation
+history remain live, consistent with the documented CPU-only context boundary.
+
+### Terminal stack cell and dispatcher source
+
+The last executed instruction is
+`0x000000014005cb7c: ret 0`. Final `RSP - 8` identifies consumed child-stack
+qword `0x0000000f500feed0`; its value is zero, not the installed sentinel
+`0x0000000edead0000`. This Unicorn build did not emit a `MEM_READ` hook for the
+`ret` stack access, so the consumed-cell evidence is the terminal instruction,
+the post-`ret` stack pointer, and the qword value rather than a claimed watch
+read.
+
+The terminal-cell watch records four writes during the 4,102-RIP suffix. The
+last is:
+
+```text
+global instruction 35,116,502
+0x000000014005cb1a: mov [rsi],r13
+RSI = 0x0000000f500feed0
+R13 = 0
+```
+
+The preceding runtime disassembly makes `R13`'s source explicit:
+
+```text
+mov rcx,[rbp+0xb2]
+add rcx,6
+mov r13w,[rcx]
+add r13,rbp
+mov r13,[r13]
+mov r13,[r13]
+...
+mov [rsi],r13
+```
+
+At this edge the bytecode cursor is `0x0000000140295f08`; selector word
+`[cursor+6]` is `0x88`. It selects context qword
+`[0x000000014006fa68] = 0x0000000140066c04`, and the second dereference reads
+zero from handler slot `0x0000000140066c04`.
+
+The whole-run slot watch captures its history without a sample constant in the
+diagnostic: the address is derived by the terminal-cell replay. Initial
+decompression writes the nonzero low bytes `a0 58 18 38` followed by four zero
+bytes. The last whole-qword writer occurs much later:
+
+```text
+global instruction 29,778,112
+0x00000001400accf7: mov [r9],rbx
+R9  = 0x0000000140066c04
+RBX = 0
+RBP = 0x000000014006f9e0
+R12 = 0
+```
+
+The fourth replay derives selector field `0x000000014006fb03` and source context
+qword `0x000000014006f9e0` from that writer snapshot, watches both together with
+the slot, and captures the selected edge in one rearmed API leg:
+
+```text
+29,778,101  W  0x00000001400acccb: mov [rsi],r12w
+                [0x000000014006fb03] <- selector 0
+29,778,109  R  0x00000001400acced: movzx rbx,word [rbx]
+                selector 0 <- [0x000000014006fb03]
+29,778,111  R  0x00000001400accf4: mov rbx,[rbx]
+                0 <- [0x000000014006f9e0]
+29,778,112  W  0x00000001400accf7: mov [r9],rbx
+                [0x0000000140066c04] <- 0
+```
+
+The validator anchors on the pass-3 writer identity, searches backward for the
+nearest matching source and selector events, requires strict order, and rejects
+conflicting writes to the selected field, source qword, or slot between their
+respective edges. It freezes and decodes the four-instruction
+`movzx`/`add rbx,rbp`/load/store fallthrough, then derives the required dynamic
+instruction-index spacing from that path. It does not depend on an exact
+handler byte signature or fixed per-sample instruction counts. The whole-run
+replay proves no later write touches the slot. At global instruction 35,116,494,
+`0x000000014005caf5: mov r13,[r13]` reads that same exact qword. The retained
+terminal tail and watched chronology agree on the eight-instruction distance to
+the terminal-cell writer, and decoded register access proves that none of the
+seven intervening instructions writes `R13`.
+
+This closes the immediate provenance chain for the tested direct entry:
+
+```text
+VM context selector 0 value 0
+  -> VM store zeros handler slot 0x0000000140066c04
+  -> terminal dispatcher loads R13 = 0 through selector 0x88
+  -> trampoline writes 0 to the return cell
+  -> ret transfers to RIP 0 instead of the diagnostic sentinel
+```
+
+It does not establish why context selector zero held zero at the earlier VM
+store. It also does not establish a clean thread-routine return, a Windows
+startup/TLS requirement, exception-handler execution, scheduling, thread
+termination, or an OEP. The direct-entry child's failure to access the main
+poll byte remains unchanged. The next causal question is the producer of the
+source context zero, not the already-traced terminal stack or handler-slot
+edges.
+
+The verification matrix for the committed slice is:
+
+```text
+cargo fmt --check
+cargo build --all-targets
+cargo test --all-targets              # 136 passed (127 library, 6 child diagnostic, 3 trace_slot)
+cargo clippy --all-targets -- -D warnings
+git diff --check
+cargo build --locked --release --example trace_child_postmortem
+```
+
+This is a scheduler prerequisite, not a scheduler. In particular, restoring a
+CPU context does not select `Win64Env.current_thread_id`, create stacks or TEBs,
+initialize TLS, model a clock, or classify thread termination. Because
+`Emu::resume` takes an explicit start address, a future context switch also has
+to read the restored `RIP` and pass it to resume. Context switches are intended
+at stopped or trapped boundaries, not from inside a running Unicorn hook. The
+child's unresolved zero-target edge still cannot be labeled a normal thread
+exit, and no result in this slice identifies an OEP.

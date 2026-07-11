@@ -358,12 +358,17 @@ struct KernelHandle {
     inheritable: bool,
 }
 
+/// Immutable record created by the bounded `CreateThread` model.
+///
+/// The record is runnable only in the sense that creation succeeded with
+/// supported arguments. Midas does not schedule it, allocate its runtime
+/// state, or assign lifecycle meaning to a later control transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RunnableUnscheduledThread {
-    start_address: u64,
-    parameter: u64,
-    requested_stack_size: u64,
-    creation_flags: u32,
+pub struct RunnableUnscheduledThread {
+    pub start_address: u64,
+    pub parameter: u64,
+    pub requested_stack_size: u64,
+    pub creation_flags: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +421,27 @@ impl Win64Env {
             proc_stubs: BTreeMap::new(),
             proc_stub_mapped_end: PROC_STUB_BASE,
         }
+    }
+
+    /// Iterate over immutable created-thread records in ascending thread-ID
+    /// order. Observing these records does not schedule or execute them.
+    pub fn runnable_unscheduled_threads(
+        &self,
+    ) -> impl Iterator<Item = (u32, &RunnableUnscheduledThread)> {
+        self.created_threads
+            .iter()
+            .map(|(&thread_id, thread)| (thread_id, thread))
+    }
+
+    /// Resolve a synthetic-module or dynamic procedure stub address to the API
+    /// name that the trap dispatcher would use.
+    ///
+    /// This is a read-only diagnostic projection. It does not dispatch the API
+    /// or classify arbitrary image addresses and unbound import-name RVAs.
+    pub fn callable_stub_name_at(&self, address: u64) -> Option<String> {
+        self.stub_export_at(address)
+            .or_else(|| self.proc_stub_at(address))
+            .map(|(name, _rva)| name)
     }
 
     fn add_vectored_exception_handler(&mut self, first: u32, handler: u64) -> u64 {
@@ -3657,6 +3683,20 @@ mod tests {
             })
         );
         assert_eq!(
+            env.runnable_unscheduled_threads()
+                .map(|(thread_id, thread)| (thread_id, *thread))
+                .collect::<Vec<_>>(),
+            vec![(
+                2,
+                RunnableUnscheduledThread {
+                    start_address: formal_start_address,
+                    parameter: 0,
+                    requested_stack_size: 0,
+                    creation_flags: 0,
+                }
+            )]
+        );
+        assert_eq!(
             env.kernel_handles.get(&handle),
             Some(&KernelHandle {
                 object: KernelObject::Thread { thread_id: 2 },
@@ -3745,6 +3785,12 @@ mod tests {
                 requested_stack_size: 0,
                 creation_flags: 0,
             })
+        );
+        assert_eq!(
+            env.runnable_unscheduled_threads()
+                .map(|(thread_id, _thread)| thread_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
         );
 
         let opened = call_open_thread(
@@ -5024,6 +5070,29 @@ mod tests {
             Some("VirtualAlloc")
         );
         assert_eq!(module.stub_name(module.base + 0x1234), None);
+    }
+
+    #[test]
+    fn callable_stub_name_projection_covers_seeded_and_dynamic_stubs() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let seeded = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("Sleep")
+            .unwrap();
+        let dynamic = env
+            .resolve_proc(&mut emu, kernel32, "DiagnosticOnlyName")
+            .unwrap();
+
+        assert_eq!(env.callable_stub_name_at(seeded).as_deref(), Some("Sleep"));
+        assert_eq!(
+            env.callable_stub_name_at(dynamic).as_deref(),
+            Some("DiagnosticOnlyName")
+        );
+        assert_eq!(env.callable_stub_name_at(IMAGE_BASE), None);
     }
 
     #[test]

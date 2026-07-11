@@ -372,7 +372,10 @@ impl Emu {
     }
 
     /// Map a nonzero, page-aligned region as explicitly zeroed RW/NX memory.
-    pub(crate) fn map_zeroed_rw(&mut self, base: u64, size: u64) -> Result<(), EmuError> {
+    ///
+    /// This is a raw emulator primitive. It does not attach stack, TEB, heap,
+    /// thread, or other Win64 semantics to the mapping.
+    pub fn map_zeroed_rw(&mut self, base: u64, size: u64) -> Result<(), EmuError> {
         let end = checked_end(base, size)?;
         map_region(&mut self.uc, base, size, Prot::READ | Prot::WRITE)?;
 
@@ -568,7 +571,13 @@ impl Emu {
         Ok(bytes)
     }
 
-    pub(crate) fn write_mem(&mut self, addr: u64, bytes: &[u8]) -> Result<(), EmuError> {
+    /// Write an already-mapped writable guest range after a complete preflight.
+    ///
+    /// The complete range is validated before Unicorn receives the write, so a
+    /// preflight failure caused by an unmapped gap, protected page, or address
+    /// overflow cannot leave a partial guest-memory update. This does not make
+    /// a broader atomicity claim about a failure inside Unicorn's write call.
+    pub fn write_mem(&mut self, addr: u64, bytes: &[u8]) -> Result<(), EmuError> {
         if bytes.is_empty() {
             return Ok(());
         }
