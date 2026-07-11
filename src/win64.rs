@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    emu::{Emu, EmuError, FaultKind, RegisterX86, StopReason},
+    emu::{
+        Emu, EmuError, FaultKind, RegisterX86, StopReason, PEB_BASE, STACK_BASE, STACK_SIZE,
+        TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_SIZE, TEB_STACKBASE_OFFSET, TEB_STACKLIMIT_OFFSET,
+    },
     pe,
 };
 
@@ -25,10 +28,22 @@ const HEAP_ALIGNMENT: u64 = 16;
 const HEAP_NO_SERIALIZE: u32 = 0x1;
 const HEAP_ZERO_MEMORY: u32 = 0x8;
 
+/// Total instruction budget for one cooperatively selected child run.
+const COOPERATIVE_CHILD_INSTRUCTION_CAP: u64 = 100_000;
+
+/// Maximum number of named APIs one cooperatively selected child may handle.
+const COOPERATIVE_CHILD_API_CAP: usize = 32;
+
+/// Fresh runtime layout for each cooperatively selected child. The arena starts
+/// immediately after the bounded process heap and ends before the main stack.
+const COOPERATIVE_THREAD_RUNTIME_BASE: u64 = HEAP_ARENA_BASE + HEAP_ARENA_SIZE;
+const COOPERATIVE_THREAD_RUNTIME_SIZE: u64 = STACK_SIZE + TEB_SIZE;
+const COOPERATIVE_THREAD_ENTRY_HEADROOM: u64 = 0x1000;
+
 /// Emulated-environment policy for the default user UI language: en-US.
 const EMULATED_USER_DEFAULT_UI_LANGID: u16 = 0x0409;
 
-/// Deterministic ID for the current thread exposed by the emulated environment.
+/// Deterministic ID assigned to the initial/main emulated thread.
 const EMULATED_CURRENT_THREAD_ID: u32 = 1;
 
 /// Deterministic uptime in milliseconds exposed by `timeGetTime`.
@@ -52,6 +67,12 @@ const EMULATED_EXECUTABLE_PATH: [u16; 12] = [
     0x43, 0x3a, 0x5c, 0x67, 0x75, 0x65, 0x73, 0x74, 0x2e, 0x65, 0x78, 0x65,
 ];
 
+/// Host-independent ANSI command line exposed by the emulated environment.
+const EMULATED_COMMAND_LINE_A: &[u8] = b"C:\\guest.exe\0";
+
+/// Dedicated read-only page for the process-owned ANSI command-line buffer.
+const EMULATED_COMMAND_LINE_A_BASE: u64 = 0x0000_7ffd_0000_0000;
+
 /// Opaque process-heap handle in the gap between the fixed PEB and heap arena.
 /// The handle remains unmapped and distinct from the allocator backing.
 const EMULATED_PROCESS_HEAP_HANDLE: u64 = 0x0000_000f_3000_0000;
@@ -71,6 +92,9 @@ const KERNEL_HANDLE_STRIDE: u64 = 0x10;
 /// unmapped gap after the process-heap handle and before the kernel-handle
 /// namespace.
 const EMULATED_HAND_CURSOR_HANDLE: u64 = 0x0000_000f_3000_0010;
+
+/// Stable opaque handle returned by the bounded window-creation treatment.
+const EMULATED_WINDOW_HANDLE: u64 = 0x0000_000f_3000_0020;
 
 /// `IDC_HAND`, encoded by Win32's `MAKEINTRESOURCE` convention.
 const PREDEFINED_HAND_CURSOR_ID: u64 = 32_649;
@@ -106,6 +130,7 @@ pub const KERNEL32_EXPORTS: &[&str] = &[
     "GetUserDefaultUILanguage",
     "GetCurrentThreadId",
     "GetCurrentDirectoryW",
+    "GetCommandLineA",
     "SetCurrentDirectoryW",
     "GetModuleFileNameW",
     "OpenThread",
@@ -128,7 +153,7 @@ const NTDLL_EXPORTS: &[&str] = &[
     "RtlFreeHeap",
 ];
 
-const USER32_EXPORTS: &[&str] = &["LoadCursorA", "RegisterClassExA"];
+const USER32_EXPORTS: &[&str] = &["CreateWindowExA", "LoadCursorA", "RegisterClassExA"];
 
 #[derive(Debug, Clone)]
 pub struct SyntheticModule {
@@ -381,9 +406,10 @@ struct KernelHandle {
 
 /// Immutable record created by the bounded `CreateThread` model.
 ///
-/// The record is runnable only in the sense that creation succeeded with
-/// supported arguments. Midas does not schedule it, allocate its runtime
-/// state, or assign lifecycle meaning to a later control transfer.
+/// Creation itself does not execute the record. The production cooperative
+/// runner may later claim it once at a supported main-thread `Sleep`; raw trap
+/// runs and diagnostics continue to leave it unscheduled. No lifecycle meaning
+/// is assigned to the child's eventual control-transfer boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnableUnscheduledThread {
     pub start_address: u64,
@@ -483,8 +509,11 @@ pub struct Win64Env {
     kernel_handles: BTreeMap<u64, KernelHandle>,
     next_thread_id: u64,
     created_threads: BTreeMap<u32, RunnableUnscheduledThread>,
+    scheduled_thread_ids: BTreeSet<u32>,
+    next_cooperative_runtime_base: u64,
     heap_cursor: u64,
     heap_allocations: BTreeMap<u64, HeapAllocation>,
+    command_line_a_mapped: bool,
     modules: BTreeMap<String, u64>,
     next_base: u64,
     synthetic_modules: BTreeMap<String, SyntheticModule>,
@@ -511,8 +540,11 @@ impl Win64Env {
             kernel_handles: BTreeMap::new(),
             next_thread_id: CREATED_THREAD_ID_BASE,
             created_threads: BTreeMap::new(),
+            scheduled_thread_ids: BTreeSet::new(),
+            next_cooperative_runtime_base: COOPERATIVE_THREAD_RUNTIME_BASE,
             heap_cursor: HEAP_ARENA_BASE,
             heap_allocations: BTreeMap::new(),
+            command_line_a_mapped: false,
             modules: BTreeMap::new(),
             next_base: FAKE_MODULE_BASE_START,
             synthetic_modules: BTreeMap::new(),
@@ -526,13 +558,15 @@ impl Win64Env {
         }
     }
 
-    /// Iterate over immutable created-thread records in ascending thread-ID
-    /// order. Observing these records does not schedule or execute them.
+    /// Iterate over not-yet-claimed created-thread records in ascending
+    /// thread-ID order. Observing these records does not schedule or execute
+    /// them.
     pub fn runnable_unscheduled_threads(
         &self,
     ) -> impl Iterator<Item = (u32, &RunnableUnscheduledThread)> {
         self.created_threads
             .iter()
+            .filter(|(thread_id, _)| !self.scheduled_thread_ids.contains(thread_id))
             .map(|(&thread_id, thread)| (thread_id, thread))
     }
 
@@ -707,8 +741,9 @@ impl Win64Env {
     fn open_thread(&mut self, desired_access: u32, inheritable: bool, thread_id: u32) -> u64 {
         // Bounded support policy: accept any subset of the legacy all-access
         // mask. This is not complete ACL, token, or security semantics.
-        let thread_exists =
-            thread_id == self.current_thread_id || self.created_threads.contains_key(&thread_id);
+        let thread_exists = thread_id == EMULATED_CURRENT_THREAD_ID
+            || thread_id == self.current_thread_id
+            || self.created_threads.contains_key(&thread_id);
         if desired_access & !LEGACY_THREAD_ALL_ACCESS != 0 || !thread_exists {
             return 0;
         }
@@ -830,6 +865,55 @@ impl Win64Env {
         self.heap_allocations.insert(allocation_base, allocation);
         self.heap_cursor = next_cursor;
         Ok(allocation_base)
+    }
+
+    fn can_free_heap(&self, heap_handle: u64, flags: u32, allocation_base: u64) -> bool {
+        heap_handle == self.process_heap
+            && flags & !HEAP_NO_SERIALIZE == 0
+            && self.heap_allocations.contains_key(&allocation_base)
+    }
+
+    fn commit_heap_free(&mut self, allocation_base: u64) {
+        // Logical free only: the bounded bump allocator does not reuse or
+        // unmap pages. Removing the live-allocation record makes duplicate and
+        // interior frees fail without assigning lifecycle to the guest mapping.
+        let removed = self.heap_allocations.remove(&allocation_base);
+        debug_assert!(removed.is_some());
+    }
+
+    fn ensure_command_line_a(&mut self, emu: &mut Emu) -> Result<u64, EmuError> {
+        if !self.command_line_a_mapped {
+            emu.map_readonly(EMULATED_COMMAND_LINE_A_BASE, EMULATED_COMMAND_LINE_A)?;
+            self.command_line_a_mapped = true;
+        }
+        Ok(EMULATED_COMMAND_LINE_A_BASE)
+    }
+
+    fn registered_window_class_a(&self, instance: u64, class_name: &str) -> bool {
+        self.window_class_atoms_by_name
+            .contains_key(&(instance, class_name.to_ascii_lowercase()))
+    }
+
+    fn cooperative_runtime_candidate(&self) -> Option<(u64, u64)> {
+        let base = self.next_cooperative_runtime_base;
+        let next = base.checked_add(COOPERATIVE_THREAD_RUNTIME_SIZE)?;
+        if base < COOPERATIVE_THREAD_RUNTIME_BASE
+            || !base.is_multiple_of(u64::from(PAGE_SIZE))
+            || next > STACK_BASE
+        {
+            return None;
+        }
+        Some((base, next))
+    }
+
+    fn claim_thread_for_cooperative_run(&mut self, thread_id: u32, next_runtime_base: u64) -> bool {
+        if !self.created_threads.contains_key(&thread_id)
+            || !self.scheduled_thread_ids.insert(thread_id)
+        {
+            return false;
+        }
+        self.next_cooperative_runtime_base = next_runtime_base;
+        true
     }
 
     fn module_base(&mut self, name: &str) -> u64 {
@@ -1118,6 +1202,19 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "GetCommandLineA" => {
+            // Validate the return frame before the first lazy mapping. The
+            // returned storage is process-owned, stable, host-independent, and
+            // read-only under the bounded environment policy.
+            let return_state = preflight_api_return(emu)?;
+            let ret = env.ensure_command_line_a(emu)?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
         "timeGetTime" => {
             // Validate and consume the return frame before changing RAX so a
             // bad frame leaves every register and the environment untouched.
@@ -1322,6 +1419,62 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "CreateWindowExA" => {
+            // DWORD/int arguments use their low 32 bits; pointer/handle
+            // arguments retain full width. Geometry and styles are consumed but
+            // have no stateful effect in this opaque-window model.
+            let _extended_style = emu.read_reg(RegisterX86::RCX)? as u32;
+            let class_name = emu.read_reg(RegisterX86::RDX)?;
+            let window_name = emu.read_reg(RegisterX86::R8)?;
+            let _style = emu.read_reg(RegisterX86::R9)? as u32;
+            let rsp = emu.read_reg(RegisterX86::RSP)?;
+            let _x = read_u32_at(emu, checked_stack_argument_address(rsp, 0x28, 4)?)? as i32;
+            let _y = read_u32_at(emu, checked_stack_argument_address(rsp, 0x30, 4)?)? as i32;
+            let width = read_u32_at(emu, checked_stack_argument_address(rsp, 0x38, 4)?)? as i32;
+            let height = read_u32_at(emu, checked_stack_argument_address(rsp, 0x40, 4)?)? as i32;
+            let parent = read_u64_at(emu, checked_stack_argument_address(rsp, 0x48, 8)?)?;
+            let menu = read_u64_at(emu, checked_stack_argument_address(rsp, 0x50, 8)?)?;
+            let instance = read_u64_at(emu, checked_stack_argument_address(rsp, 0x58, 8)?)?;
+            let parameter = read_u64_at(emu, checked_stack_argument_address(rsp, 0x60, 8)?)?;
+
+            // The observed loader asks for a top-level, untitled ANSI window
+            // using an already registered string class. Other valid USER32
+            // shapes remain unmodeled without dereferencing their pointers.
+            if window_name != 0
+                || parent != 0
+                || menu != 0
+                || parameter != 0
+                || width <= 0
+                || height <= 0
+                || class_name < 0x1_0000
+            {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+            let class_name =
+                match read_raw_ansi_class_name(emu, class_name, WINDOW_CLASS_NAME_BYTE_CAP)? {
+                    RawAnsiClassNameRead::Terminated(bytes) if !bytes.is_empty() => {
+                        bytes.into_iter().map(char::from).collect::<String>()
+                    }
+                    RawAnsiClassNameRead::Terminated(_)
+                    | RawAnsiClassNameRead::CapExhausted
+                    | RawAnsiClassNameRead::NonPrintable => {
+                        return Ok(ApiOutcome::Unhandled {
+                            name: name.to_owned(),
+                        });
+                    }
+                };
+            let ret = if env.registered_window_class_a(instance, &class_name) {
+                EMULATED_WINDOW_HANDLE
+            } else {
+                0
+            };
+
+            // Return only a stable opaque handle. No window record is created,
+            // and the registered WndProc is never invoked.
+            handled_scalar_api_return(emu, name, ret)
+        }
         "GetCurrentDirectoryW" => {
             // DWORD capacity consumes only ECX; the LPWSTR uses the full RDX.
             let capacity = emu.read_reg(RegisterX86::RCX)? as u32;
@@ -1478,6 +1631,27 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             let ret = env.allocate_heap(emu, heap_handle, flags, requested_size)?;
             emu.write_reg(RegisterX86::RAX, ret)?;
             api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "RtlFreeHeap" => {
+            let heap_handle = emu.read_reg(RegisterX86::RCX)?;
+            // Flags is ULONG, so only EDX participates in the Win64 ABI.
+            let flags = emu.read_reg(RegisterX86::RDX)? as u32;
+            let allocation_base = emu.read_reg(RegisterX86::R8)?;
+            let can_free = env.can_free_heap(heap_handle, flags, allocation_base);
+            let ret = u64::from(can_free);
+
+            // A bad return frame must not consume a live allocation. Commit
+            // control and the scalar result before changing allocator metadata.
+            let return_state = preflight_api_return(emu)?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            if can_free {
+                env.commit_heap_free(allocation_base);
+            }
             Ok(ApiOutcome::Handled {
                 name: name.to_owned(),
                 ret,
@@ -1724,6 +1898,389 @@ pub enum TrapStop {
 pub struct TrapRun {
     pub handled: Vec<String>,
     pub stop: TrapStop,
+}
+
+/// Boundary at which one coarse cooperative child run stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CooperativeThreadStop {
+    /// The child reached its per-runtime non-executable return guard with the
+    /// stack transition expected after consuming the entry return cell.
+    ReachedReturnGuard,
+    /// The child completed a supported `Sleep` call and yielded its CPU turn.
+    BlockedOnSleep,
+    /// The raw trap runner reached another bounded stop.
+    Trap(TrapStop),
+}
+
+/// Read-only evidence from one production cooperative yield.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooperativeYield {
+    pub thread_id: u32,
+    pub stack_base: u64,
+    pub stack_size: u64,
+    pub teb_base: u64,
+    pub entry_rsp: u64,
+    pub handled: Vec<String>,
+    pub stop: CooperativeThreadStop,
+    pub instructions_executed: u64,
+}
+
+/// Production trap result with coarse `Sleep`-as-yield observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooperativeTrapRun {
+    pub handled: Vec<String>,
+    pub cooperative_yields: Vec<CooperativeYield>,
+    pub main_instructions_after_first_yield: u64,
+    pub stop: TrapStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CooperativeRuntime {
+    stack_base: u64,
+    teb_base: u64,
+    entry_rsp: u64,
+    return_guard: u64,
+}
+
+fn pending_api_at(
+    env: &Win64Env,
+    emu: &Emu,
+    image: &pe::PeImage,
+    address: u64,
+) -> Option<(String, u32)> {
+    env.stub_export_at(address)
+        .or_else(|| env.proc_stub_at(address))
+        .or_else(|| {
+            (address < u64::from(image.size_of_image))
+                .then(|| {
+                    read_import_by_name(emu, image.image_base, image.size_of_image, address as u32)
+                        .map(|name| (name, address as u32))
+                })
+                .flatten()
+        })
+}
+
+fn is_call_bound_stop(stop: &TrapStop) -> bool {
+    matches!(stop, TrapStop::Other(message) if message == "max_calls reached")
+}
+
+fn write_guest_u64(emu: &mut Emu, address: u64, value: u64) -> Result<(), EmuError> {
+    emu.write_mem(address, &value.to_le_bytes())
+}
+
+fn configure_cooperative_runtime(
+    env: &mut Win64Env,
+    emu: &mut Emu,
+    thread_id: u32,
+    thread: RunnableUnscheduledThread,
+) -> Result<CooperativeRuntime, EmuError> {
+    let (runtime_base, next_runtime_base) =
+        env.cooperative_runtime_candidate()
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: env.next_cooperative_runtime_base,
+                size: COOPERATIVE_THREAD_RUNTIME_SIZE,
+            })?;
+    let stack_end = runtime_base
+        .checked_add(STACK_SIZE)
+        .ok_or(EmuError::AddressRangeOverflow {
+            base: runtime_base,
+            size: STACK_SIZE,
+        })?;
+    let teb_base = stack_end;
+    let entry_rsp = stack_end
+        .checked_sub(COOPERATIVE_THREAD_ENTRY_HEADROOM + 8)
+        .ok_or(EmuError::AddressRangeOverflow {
+            base: runtime_base,
+            size: STACK_SIZE,
+        })?;
+    if entry_rsp & 0xf != 8 {
+        return Err(EmuError::AddressRangeOverflow {
+            base: entry_rsp,
+            size: 8,
+        });
+    }
+
+    // One mapping makes each selected child stack + TEB fresh and zeroed.
+    emu.map_zeroed_rw(runtime_base, COOPERATIVE_THREAD_RUNTIME_SIZE)?;
+    if !env.claim_thread_for_cooperative_run(thread_id, next_runtime_base) {
+        return Err(EmuError::AddressRangeOverflow {
+            base: runtime_base,
+            size: COOPERATIVE_THREAD_RUNTIME_SIZE,
+        });
+    }
+
+    // The TEB is already mapped RW/NX. Reuse its base as a per-runtime return
+    // guard so the entry return target is both nonzero and reserved.
+    let return_guard = teb_base;
+    write_guest_u64(emu, entry_rsp, return_guard)?;
+    write_guest_u64(emu, teb_base + TEB_STACKBASE_OFFSET, stack_end)?;
+    write_guest_u64(emu, teb_base + TEB_STACKLIMIT_OFFSET, runtime_base)?;
+    write_guest_u64(emu, teb_base + TEB_SELF_OFFSET, teb_base)?;
+    write_guest_u64(emu, teb_base + TEB_PEB_OFFSET, PEB_BASE)?;
+
+    for register in [
+        RegisterX86::RAX,
+        RegisterX86::RBX,
+        RegisterX86::RCX,
+        RegisterX86::RDX,
+        RegisterX86::RSI,
+        RegisterX86::RDI,
+        RegisterX86::RBP,
+        RegisterX86::R8,
+        RegisterX86::R9,
+        RegisterX86::R10,
+        RegisterX86::R11,
+        RegisterX86::R12,
+        RegisterX86::R13,
+        RegisterX86::R14,
+        RegisterX86::R15,
+        RegisterX86::FS_BASE,
+    ] {
+        emu.write_reg(register, 0)?;
+    }
+    emu.write_reg(RegisterX86::RCX, thread.parameter)?;
+    emu.write_reg(RegisterX86::RSP, entry_rsp)?;
+    emu.write_reg(RegisterX86::RIP, thread.start_address)?;
+    emu.write_reg(RegisterX86::GS_BASE, teb_base)?;
+    emu.write_reg(RegisterX86::EFLAGS, 2)?;
+
+    Ok(CooperativeRuntime {
+        stack_base: runtime_base,
+        teb_base,
+        entry_rsp,
+        return_guard,
+    })
+}
+
+fn run_cooperative_child(
+    env: &mut Win64Env,
+    emu: &mut Emu,
+    image: &pe::PeImage,
+    begin: u64,
+    return_guard: u64,
+    entry_rsp: u64,
+) -> Result<(Vec<String>, CooperativeThreadStop, u64), EmuError> {
+    let start_count = emu.total_instructions_executed();
+    let mut handled = Vec::new();
+    let mut next = begin;
+
+    loop {
+        let elapsed = emu
+            .total_instructions_executed()
+            .saturating_sub(start_count);
+        let Some(remaining) = COOPERATIVE_CHILD_INSTRUCTION_CAP.checked_sub(elapsed) else {
+            return Ok((
+                handled,
+                CooperativeThreadStop::Trap(TrapStop::InstructionCap),
+                elapsed,
+            ));
+        };
+        if remaining == 0 {
+            return Ok((
+                handled,
+                CooperativeThreadStop::Trap(TrapStop::InstructionCap),
+                elapsed,
+            ));
+        }
+
+        // A zero API budget turns the raw runner into a bounded execution leg
+        // that stops immediately before the next recognized call boundary.
+        let leg = run_with_import_trap(env, emu, image, next, remaining, 0)?;
+        debug_assert!(leg.handled.is_empty());
+        if !is_call_bound_stop(&leg.stop) {
+            let final_rip = emu.read_reg(RegisterX86::RIP)?;
+            let final_rsp = emu.read_reg(RegisterX86::RSP)?;
+            let stop = if matches!(
+                leg.stop,
+                TrapStop::UnexpectedFault {
+                    address
+                } if address == return_guard
+            ) && final_rip == return_guard
+                && entry_rsp.checked_add(8) == Some(final_rsp)
+            {
+                CooperativeThreadStop::ReachedReturnGuard
+            } else {
+                CooperativeThreadStop::Trap(leg.stop)
+            };
+            let elapsed = emu
+                .total_instructions_executed()
+                .saturating_sub(start_count);
+            return Ok((handled, stop, elapsed));
+        }
+
+        next = emu.read_reg(RegisterX86::RIP)?;
+        let Some((name, rva)) = pending_api_at(env, emu, image, next) else {
+            return Ok((
+                handled,
+                CooperativeThreadStop::Trap(TrapStop::UnexpectedFault { address: next }),
+                emu.total_instructions_executed()
+                    .saturating_sub(start_count),
+            ));
+        };
+        if handled.len() >= COOPERATIVE_CHILD_API_CAP {
+            return Ok((
+                handled,
+                CooperativeThreadStop::Trap(TrapStop::Other(
+                    "cooperative child API cap reached".to_owned(),
+                )),
+                emu.total_instructions_executed()
+                    .saturating_sub(start_count),
+            ));
+        }
+
+        match dispatch(env, emu, &name)? {
+            ApiOutcome::Handled { name, .. } | ApiOutcome::HandledVoid { name } => {
+                let blocked = name == "Sleep";
+                handled.push(name);
+                if blocked {
+                    return Ok((
+                        handled,
+                        CooperativeThreadStop::BlockedOnSleep,
+                        emu.total_instructions_executed()
+                            .saturating_sub(start_count),
+                    ));
+                }
+                next = emu.read_reg(RegisterX86::RIP)?;
+            }
+            ApiOutcome::Unhandled { name } => {
+                return Ok((
+                    handled,
+                    CooperativeThreadStop::Trap(TrapStop::UnhandledApi { name, rva }),
+                    emu.total_instructions_executed()
+                        .saturating_sub(start_count),
+                ));
+            }
+        }
+    }
+}
+
+fn yield_to_next_runnable_thread(
+    env: &mut Win64Env,
+    emu: &mut Emu,
+    image: &pe::PeImage,
+) -> Result<Option<CooperativeYield>, EmuError> {
+    let next_thread = env
+        .runnable_unscheduled_threads()
+        .next()
+        .map(|(thread_id, &thread)| (thread_id, thread));
+    let Some((thread_id, thread)) = next_thread else {
+        return Ok(None);
+    };
+
+    // CPU-only context capture is the switch primitive. Guest memory, module
+    // state, heap metadata, and Win64Env remain live while the child runs.
+    let main_context = emu.capture_cpu_context()?;
+    let previous_thread_id = env.current_thread_id;
+    let child_result = (|| {
+        let runtime = configure_cooperative_runtime(env, emu, thread_id, thread)?;
+        env.current_thread_id = thread_id;
+        let (handled, stop, instructions_executed) = run_cooperative_child(
+            env,
+            emu,
+            image,
+            thread.start_address,
+            runtime.return_guard,
+            runtime.entry_rsp,
+        )?;
+        Ok(CooperativeYield {
+            thread_id,
+            stack_base: runtime.stack_base,
+            stack_size: STACK_SIZE,
+            teb_base: runtime.teb_base,
+            entry_rsp: runtime.entry_rsp,
+            handled,
+            stop,
+            instructions_executed,
+        })
+    })();
+    env.current_thread_id = previous_thread_id;
+    let restore_result = emu.restore_cpu_context(&main_context);
+    restore_result?;
+    child_result.map(Some)
+}
+
+/// Run the loader with one bounded cooperative policy: a supported main-thread
+/// `Sleep` yields once to the lowest-ID runnable-unscheduled child, if present.
+///
+/// The child runs coarsely until it returns, completes its own `Sleep`, reaches
+/// an API/fault wall, or exhausts an independent instruction/API cap. Its CPU
+/// state is then discarded, the main CPU context is restored, and all guest
+/// memory and environment writes remain live. This is not general scheduling
+/// or a thread-lifecycle model.
+pub fn run_with_cooperative_scheduler(
+    env: &mut Win64Env,
+    emu: &mut Emu,
+    image: &pe::PeImage,
+    begin: u64,
+    per_run_cap: u64,
+    max_calls: usize,
+) -> Result<CooperativeTrapRun, EmuError> {
+    let mut handled = Vec::new();
+    let mut cooperative_yields = Vec::new();
+    let mut main_instructions_after_first_yield = 0u64;
+    let mut has_yielded = false;
+    let mut next = begin;
+
+    loop {
+        let before = emu.total_instructions_executed();
+        let leg = run_with_import_trap(env, emu, image, next, per_run_cap, 0)?;
+        let main_delta = emu.total_instructions_executed().saturating_sub(before);
+        if has_yielded {
+            main_instructions_after_first_yield =
+                main_instructions_after_first_yield.saturating_add(main_delta);
+        }
+        debug_assert!(leg.handled.is_empty());
+        if !is_call_bound_stop(&leg.stop) {
+            return Ok(CooperativeTrapRun {
+                handled,
+                cooperative_yields,
+                main_instructions_after_first_yield,
+                stop: leg.stop,
+            });
+        }
+
+        next = emu.read_reg(RegisterX86::RIP)?;
+        let Some((name, rva)) = pending_api_at(env, emu, image, next) else {
+            return Ok(CooperativeTrapRun {
+                handled,
+                cooperative_yields,
+                main_instructions_after_first_yield,
+                stop: TrapStop::UnexpectedFault { address: next },
+            });
+        };
+        if handled.len() >= max_calls {
+            return Ok(CooperativeTrapRun {
+                handled,
+                cooperative_yields,
+                main_instructions_after_first_yield,
+                stop: TrapStop::Other("max_calls reached".to_owned()),
+            });
+        }
+
+        match dispatch(env, emu, &name)? {
+            ApiOutcome::Handled { name, .. } | ApiOutcome::HandledVoid { name } => {
+                let should_yield =
+                    name == "Sleep" && env.runnable_unscheduled_threads().next().is_some();
+                handled.push(name);
+                next = emu.read_reg(RegisterX86::RIP)?;
+                if should_yield {
+                    if let Some(yielded) = yield_to_next_runnable_thread(env, emu, image)? {
+                        cooperative_yields.push(yielded);
+                        has_yielded = true;
+                        next = emu.read_reg(RegisterX86::RIP)?;
+                    }
+                }
+            }
+            ApiOutcome::Unhandled { name } => {
+                return Ok(CooperativeTrapRun {
+                    handled,
+                    cooperative_yields,
+                    main_instructions_after_first_yield,
+                    stop: TrapStop::UnhandledApi { name, rva },
+                });
+            }
+        }
+    }
 }
 
 pub fn run_with_import_trap(
@@ -2162,6 +2719,93 @@ mod tests {
         ret
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CreateWindowExAArgs {
+        extended_style: u64,
+        class_name: u64,
+        window_name: u64,
+        style: u64,
+        x: u64,
+        y: u64,
+        width: u64,
+        height: u64,
+        parent: u64,
+        menu: u64,
+        instance: u64,
+        parameter: u64,
+    }
+
+    impl CreateWindowExAArgs {
+        fn observed(class_name: u64) -> Self {
+            Self {
+                extended_style: 0xaaaa_bbbb_0000_0008,
+                class_name,
+                window_name: 0,
+                style: 0xcccc_dddd_9000_0000,
+                x: 0x1111_2222_0000_8000,
+                y: 0x3333_4444_0000_8000,
+                width: 0x5555_6666_0000_0237,
+                height: 0x7777_8888_0000_012b,
+                parent: 0,
+                menu: 0,
+                instance: IMAGE_BASE,
+                parameter: 0,
+            }
+        }
+    }
+
+    fn prepare_create_window_ex_a_call(
+        emu: &mut Emu,
+        args: CreateWindowExAArgs,
+        rsp: u64,
+        return_address: Option<u64>,
+    ) {
+        if let Some(return_address) = return_address {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        }
+        for (offset, value) in [
+            (0x28, args.x),
+            (0x30, args.y),
+            (0x38, args.width),
+            (0x40, args.height),
+            (0x48, args.parent),
+            (0x50, args.menu),
+            (0x58, args.instance),
+            (0x60, args.parameter),
+        ] {
+            emu.write_mem(rsp + offset, &value.to_le_bytes()).unwrap();
+        }
+        seed_sleep_machine_state(emu, args.extended_style, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, args.class_name).unwrap();
+        emu.write_reg(RegisterX86::R8, args.window_name).unwrap();
+        emu.write_reg(RegisterX86::R9, args.style).unwrap();
+    }
+
+    fn call_create_window_ex_a(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        args: CreateWindowExAArgs,
+        rsp: u64,
+        return_address: u64,
+    ) -> ApiOutcome {
+        prepare_create_window_ex_a_call(emu, args, rsp, Some(return_address));
+        dispatch(env, emu, "CreateWindowExA").unwrap()
+    }
+
+    fn register_test_window_class(env: &mut Win64Env, emu: &mut Emu, rsp: u64) {
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"MidasTestClass\0")
+            .unwrap();
+        let ret = call_register_class_ex_a(
+            env,
+            emu,
+            RegisterClassExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            b"MidasTestClass\0",
+            rsp,
+            0x1357_2468_ace0_bdf1,
+        );
+        assert_ne!(ret, 0);
+    }
+
     fn call_rtl_allocate_heap(
         env: &mut Win64Env,
         emu: &mut Emu,
@@ -2182,6 +2826,32 @@ mod tests {
             panic!("expected RtlAllocateHeap to be handled");
         };
         assert_eq!(name, "RtlAllocateHeap");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn call_rtl_free_heap(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        heap_handle: u64,
+        flags: u64,
+        allocation_base: u64,
+        rsp: u64,
+        return_address: u64,
+    ) -> u64 {
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, heap_handle).unwrap();
+        emu.write_reg(RegisterX86::RDX, flags).unwrap();
+        emu.write_reg(RegisterX86::R8, allocation_base).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "RtlFreeHeap").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected RtlFreeHeap to be handled");
+        };
+        assert_eq!(name, "RtlFreeHeap");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
@@ -3013,6 +3683,84 @@ mod tests {
     }
 
     #[test]
+    fn get_command_line_a_returns_stable_readonly_environment_storage() {
+        let call = |env: &mut Win64Env, emu: &mut Emu, rsp: u64, return_address: u64| -> u64 {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(emu, u64::MAX, rsp, 0x1111_2222_3333_4444);
+            let outcome = dispatch(env, emu, "GetCommandLineA").unwrap();
+            let ApiOutcome::Handled { name, ret } = outcome else {
+                panic!("expected GetCommandLineA to be handled");
+            };
+            assert_eq!(name, "GetCommandLineA");
+            assert_eq!(ret, EMULATED_COMMAND_LINE_A_BASE);
+            assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+            assert_eq!(
+                emu.read_mem(ret, EMULATED_COMMAND_LINE_A.len()).unwrap(),
+                EMULATED_COMMAND_LINE_A
+            );
+            ret
+        };
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first = call(
+            &mut env,
+            &mut emu,
+            STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        let second = call(
+            &mut env,
+            &mut emu,
+            STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+        assert_eq!(first, second);
+        assert!(matches!(
+            emu.write_mem(first, b"X"),
+            Err(EmuError::WriteProt { .. })
+        ));
+
+        let mut fresh_emu = Emu::new().unwrap();
+        let mut fresh_env = Win64Env::new(IMAGE_BASE);
+        assert_eq!(
+            call(
+                &mut fresh_env,
+                &mut fresh_emu,
+                STACK_BASE + 0x600,
+                0x1357_2468_ace0_bdf1,
+            ),
+            first
+        );
+    }
+
+    #[test]
+    fn get_command_line_a_invalid_return_frame_does_not_map_storage() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.write_reg(RegisterX86::RAX, 0xaaaa_bbbb_cccc_dddd)
+            .unwrap();
+        emu.write_reg(RegisterX86::RIP, 0x1111_2222_3333_4444)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, 0x0000_000d_0000_0000)
+            .unwrap();
+
+        assert!(dispatch(&mut env, &mut emu, "GetCommandLineA").is_err());
+        assert!(!env.command_line_a_mapped);
+        assert!(emu.read_mem(EMULATED_COMMAND_LINE_A_BASE, 1).is_err());
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            0xaaaa_bbbb_cccc_dddd
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            0x1111_2222_3333_4444
+        );
+    }
+
+    #[test]
     fn time_get_time_returns_stable_zero_without_arguments() {
         let call_and_assert =
             |env: &mut Win64Env, emu: &mut Emu, rsp: u64, return_address: u64, rcx: u64| {
@@ -3557,6 +4305,157 @@ mod tests {
             assert_eq!(sleep_machine_state(&emu), machine_before);
             assert_eq!(sleep_environment_state(&env), environment_before);
         }
+    }
+
+    #[test]
+    fn create_window_ex_a_returns_stable_opaque_handle_without_window_state() {
+        let call_and_assert = |env: &mut Win64Env, emu: &mut Emu, rsp: u64, return_address: u64| {
+            let args = CreateWindowExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS);
+            prepare_create_window_ex_a_call(emu, args, rsp, Some(return_address));
+            let machine_before = sleep_machine_state(emu);
+            let environment_before = sleep_environment_state(env);
+
+            let outcome = dispatch(env, emu, "CreateWindowExA").unwrap();
+
+            assert_eq!(
+                outcome,
+                ApiOutcome::Handled {
+                    name: "CreateWindowExA".to_owned(),
+                    ret: EMULATED_WINDOW_HANDLE,
+                }
+            );
+            for (register, value) in machine_before {
+                let expected = match register {
+                    RegisterX86::RAX => EMULATED_WINDOW_HANDLE,
+                    RegisterX86::RIP => return_address,
+                    RegisterX86::RSP => value + 8,
+                    _ => value,
+                };
+                assert_eq!(emu.read_reg(register).unwrap(), expected);
+            }
+            assert_eq!(sleep_environment_state(env), environment_before);
+            assert!(emu.read_mem(EMULATED_WINDOW_HANDLE, 1).is_err());
+            EMULATED_WINDOW_HANDLE
+        };
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        register_test_window_class(&mut env, &mut emu, STACK_BASE + 0x300);
+        let first = call_and_assert(
+            &mut env,
+            &mut emu,
+            STACK_BASE + 0x400,
+            0x1234_5678_9abc_def0,
+        );
+        let second = call_and_assert(
+            &mut env,
+            &mut emu,
+            STACK_BASE + 0x500,
+            0x0fed_cba9_8765_4321,
+        );
+        let mut fresh_emu = Emu::new().unwrap();
+        let mut fresh_env = Win64Env::new(IMAGE_BASE);
+        register_test_window_class(&mut fresh_env, &mut fresh_emu, STACK_BASE + 0x300);
+        let fresh = call_and_assert(
+            &mut fresh_env,
+            &mut fresh_emu,
+            STACK_BASE + 0x600,
+            0x1357_2468_ace0_bdf1,
+        );
+        assert_eq!(first, second);
+        assert_eq!(second, fresh);
+    }
+
+    #[test]
+    fn create_window_ex_a_rejects_unmodeled_or_unregistered_shapes() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"MidasTestClass\0")
+            .unwrap();
+        let rsp = STACK_BASE + 0x700;
+        let return_address = 0x1234_5678_9abc_def0;
+        let observed = CreateWindowExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS);
+
+        assert_eq!(
+            call_create_window_ex_a(&mut env, &mut emu, observed, rsp, return_address),
+            ApiOutcome::Handled {
+                name: "CreateWindowExA".to_owned(),
+                ret: 0,
+            }
+        );
+        for args in [
+            CreateWindowExAArgs {
+                window_name: 0x0000_000d_0000_0000,
+                ..observed
+            },
+            CreateWindowExAArgs {
+                parent: 1,
+                ..observed
+            },
+            CreateWindowExAArgs {
+                menu: 1,
+                ..observed
+            },
+            CreateWindowExAArgs {
+                parameter: 1,
+                ..observed
+            },
+            CreateWindowExAArgs {
+                width: 0,
+                ..observed
+            },
+            CreateWindowExAArgs {
+                height: u64::from(u32::MAX),
+                ..observed
+            },
+            CreateWindowExAArgs {
+                class_name: 1,
+                ..observed
+            },
+        ] {
+            assert_eq!(
+                call_create_window_ex_a(&mut env, &mut emu, args, rsp, return_address),
+                ApiOutcome::Unhandled {
+                    name: "CreateWindowExA".to_owned(),
+                }
+            );
+        }
+
+        register_test_window_class(&mut env, &mut emu, STACK_BASE + 0x300);
+        assert_eq!(
+            call_create_window_ex_a(
+                &mut env,
+                &mut emu,
+                CreateWindowExAArgs {
+                    instance: IMAGE_BASE + 1,
+                    ..observed
+                },
+                rsp,
+                return_address,
+            ),
+            ApiOutcome::Handled {
+                name: "CreateWindowExA".to_owned(),
+                ret: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn create_window_ex_a_invalid_stack_is_failure_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = 0x0000_000d_0000_0000;
+        let args = CreateWindowExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS);
+        seed_sleep_machine_state(&mut emu, args.extended_style, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, args.class_name).unwrap();
+        emu.write_reg(RegisterX86::R8, args.window_name).unwrap();
+        emu.write_reg(RegisterX86::R9, args.style).unwrap();
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+
+        assert!(dispatch(&mut env, &mut emu, "CreateWindowExA").is_err());
+        assert_eq!(sleep_machine_state(&emu), machine_before);
+        assert_eq!(sleep_environment_state(&env), environment_before);
     }
 
     #[test]
@@ -4212,6 +5111,349 @@ mod tests {
             assert_eq!(sleep_machine_state(&emu), before);
             assert_eq!(sleep_environment_state(&env), environment_before);
         }
+    }
+
+    #[test]
+    fn cooperative_sleep_yield_runs_child_once_and_restores_main_cpu() {
+        const SHARED_BASE: u64 = 0x0000_0001_6000_0000;
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        const PARAMETER: u64 = 0x0123_4567_89ab_cdef;
+        const MAIN_R15: u64 = 0xa1a2_a3a4_a5a6_a7a8;
+
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.map_zeroed_rw(SHARED_BASE, u64::from(PAGE_SIZE))
+            .unwrap();
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env
+            .export_stub_by_base(kernel32, "Sleep")
+            .expect("Sleep seed");
+        let thread_id_stub = env
+            .export_stub_by_base(kernel32, "GetCurrentThreadId")
+            .expect("GetCurrentThreadId seed");
+
+        let mut child_code = Vec::new();
+        child_code.extend_from_slice(&[0x48, 0xbb]); // mov rbx, SHARED_BASE
+        child_code.extend_from_slice(&SHARED_BASE.to_le_bytes());
+        child_code.extend_from_slice(&[0x48, 0x89, 0x0b]); // mov [rbx], rcx
+        child_code.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]); // shadow + alignment
+        child_code.extend_from_slice(&[0x48, 0xb8]); // mov rax, GetCurrentThreadId
+        child_code.extend_from_slice(&thread_id_stub.to_le_bytes());
+        child_code.extend_from_slice(&[0xff, 0xd0]); // call rax
+        child_code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28]);
+        child_code.extend_from_slice(&[0x48, 0x89, 0x43, 0x08]); // mov [rbx+8], rax
+        child_code.extend_from_slice(&[0x65, 0x48, 0x8b, 0x04, 0x25, 0x30, 0, 0, 0]);
+        child_code.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+16], rax
+        child_code.extend_from_slice(&[0x48, 0x89, 0xe0]); // mov rax, rsp
+        child_code.extend_from_slice(&[0x48, 0x89, 0x43, 0x18]); // mov [rbx+24], rax
+        child_code.extend_from_slice(&[0xc6, 0x43, 0x20, 0x01]); // mov byte [rbx+32], 1
+        child_code.push(0xc3); // ret
+        emu.map_code(CHILD_START, &child_code).unwrap();
+
+        let marker = SHARED_BASE + 32;
+        let mut main_code = Vec::new();
+        main_code.extend_from_slice(&[0x48, 0xbb]); // mov rbx, marker
+        main_code.extend_from_slice(&marker.to_le_bytes());
+        main_code.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzx eax, byte [rbx]
+        main_code.push(0xc3); // ret to zero
+        emu.map_code(image.entry_point_va(), &main_code).unwrap();
+
+        let handle = env
+            .create_thread(&mut emu, 0, 0, CHILD_START, PARAMETER, 0, 0)
+            .unwrap();
+        assert_ne!(handle, 0);
+        let main_rsp = STACK_BASE + 0x20_000;
+        emu.write_mem(main_rsp, &image.entry_point_va().to_le_bytes())
+            .unwrap();
+        emu.write_mem(main_rsp + 8, &0u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, 1).unwrap();
+        emu.write_reg(RegisterX86::RSP, main_rsp).unwrap();
+        emu.write_reg(RegisterX86::RIP, sleep_stub).unwrap();
+        emu.write_reg(RegisterX86::R15, MAIN_R15).unwrap();
+
+        let result =
+            run_with_cooperative_scheduler(&mut env, &mut emu, &image, sleep_stub, 1_000, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["Sleep".to_owned()]);
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
+        assert_eq!(result.main_instructions_after_first_yield, 3);
+        let [yielded] = result.cooperative_yields.as_slice() else {
+            panic!("expected one cooperative yield");
+        };
+        assert_eq!(yielded.thread_id, 2);
+        assert_eq!(yielded.handled, vec!["GetCurrentThreadId".to_owned()]);
+        assert_eq!(yielded.stop, CooperativeThreadStop::ReachedReturnGuard);
+        assert!(yielded.instructions_executed > 0);
+        assert_eq!(yielded.stack_size, STACK_SIZE);
+        assert_eq!(yielded.entry_rsp & 0xf, 8);
+        assert!((yielded.stack_base..yielded.stack_base + STACK_SIZE).contains(&yielded.entry_rsp));
+        assert_eq!(yielded.teb_base, yielded.stack_base + STACK_SIZE);
+        assert_eq!(
+            read_u64_le(
+                &emu.read_mem(yielded.teb_base + TEB_STACKBASE_OFFSET, 8)
+                    .unwrap()
+            ),
+            yielded.stack_base + STACK_SIZE
+        );
+        assert_eq!(
+            read_u64_le(
+                &emu.read_mem(yielded.teb_base + TEB_STACKLIMIT_OFFSET, 8)
+                    .unwrap()
+            ),
+            yielded.stack_base
+        );
+        assert_eq!(
+            read_u64_le(&emu.read_mem(yielded.teb_base + TEB_SELF_OFFSET, 8).unwrap()),
+            yielded.teb_base
+        );
+        assert_eq!(
+            read_u64_le(&emu.read_mem(yielded.teb_base + TEB_PEB_OFFSET, 8).unwrap()),
+            PEB_BASE
+        );
+        assert_eq!(emu.read_mem(yielded.stack_base, 16).unwrap(), vec![0; 16]);
+        assert_eq!(
+            read_u64_le(&emu.read_mem(yielded.entry_rsp, 8).unwrap()),
+            yielded.teb_base
+        );
+        assert_eq!(
+            read_u64_le(&emu.read_mem(SHARED_BASE, 8).unwrap()),
+            PARAMETER
+        );
+        assert_eq!(read_u64_le(&emu.read_mem(SHARED_BASE + 8, 8).unwrap()), 2);
+        assert_eq!(
+            read_u64_le(&emu.read_mem(SHARED_BASE + 16, 8).unwrap()),
+            yielded.teb_base
+        );
+        assert_eq!(
+            read_u64_le(&emu.read_mem(SHARED_BASE + 24, 8).unwrap()),
+            yielded.entry_rsp
+        );
+        assert_eq!(emu.read_mem(marker, 1).unwrap(), vec![1]);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::R15).unwrap(), MAIN_R15);
+        assert_eq!(
+            emu.read_reg(RegisterX86::GS_BASE).unwrap(),
+            crate::emu::TEB_BASE
+        );
+        assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+        assert!(env.runnable_unscheduled_threads().next().is_none());
+        assert!(env.scheduled_thread_ids.contains(&2));
+        let guard = emu.resume(yielded.teb_base, 1).unwrap();
+        assert!(matches!(
+            guard.stop_reason,
+            StopReason::MemoryFault(crate::emu::MemFault {
+                kind: FaultKind::FetchProt,
+                address
+            }) if address == yielded.teb_base
+        ));
+    }
+
+    #[test]
+    fn raw_trap_runner_keeps_created_thread_unscheduled() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+        emu.map_code(image.entry_point_va(), &[0xeb, 0xfe]).unwrap();
+        emu.map_code(CHILD_START, &[0xc3]).unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+        let rsp = STACK_BASE + 0x20_000;
+        emu.write_mem(rsp, &image.entry_point_va().to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, 1).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, sleep_stub, 32, 8).unwrap();
+
+        assert_eq!(result.handled, vec!["Sleep".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(env.runnable_unscheduled_threads().count(), 1);
+        assert!(env.scheduled_thread_ids.is_empty());
+        assert!(emu.read_mem(COOPERATIVE_THREAD_RUNTIME_BASE, 1).is_err());
+    }
+
+    #[test]
+    fn cooperative_child_sleep_and_named_api_wall_restore_main() {
+        for child_sleeps in [true, false] {
+            let image = test_image();
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+            let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+            let child_start = if child_sleeps {
+                sleep_stub
+            } else {
+                env.resolve_proc(&mut emu, kernel32, "FutureObservedApi")
+                    .unwrap()
+            };
+            emu.map_code(image.entry_point_va(), &[0xc3]).unwrap();
+            env.create_thread(&mut emu, 0, 0, child_start, 1, 0, 0)
+                .unwrap();
+            let rsp = STACK_BASE + 0x20_000;
+            emu.write_mem(rsp, &image.entry_point_va().to_le_bytes())
+                .unwrap();
+            emu.write_mem(rsp + 8, &0u64.to_le_bytes()).unwrap();
+            emu.write_reg(RegisterX86::RCX, 1).unwrap();
+            emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+            let result =
+                run_with_cooperative_scheduler(&mut env, &mut emu, &image, sleep_stub, 1_000, 8)
+                    .unwrap();
+
+            assert_eq!(result.stop, TrapStop::NullControlTransfer);
+            let [yielded] = result.cooperative_yields.as_slice() else {
+                panic!("expected one cooperative yield");
+            };
+            if child_sleeps {
+                assert_eq!(yielded.handled, vec!["Sleep".to_owned()]);
+                assert_eq!(yielded.stop, CooperativeThreadStop::BlockedOnSleep);
+            } else {
+                assert!(yielded.handled.is_empty());
+                assert_eq!(
+                    yielded.stop,
+                    CooperativeThreadStop::Trap(TrapStop::UnhandledApi {
+                        name: "FutureObservedApi".to_owned(),
+                        rva: 0,
+                    })
+                );
+            }
+            assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+            assert_eq!(
+                emu.read_reg(RegisterX86::GS_BASE).unwrap(),
+                crate::emu::TEB_BASE
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_main_sleep_does_not_claim_pending_child() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+        emu.map_code(CHILD_START, &[0xc3]).unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, 0).unwrap();
+
+        let result =
+            run_with_cooperative_scheduler(&mut env, &mut emu, &image, sleep_stub, 1_000, 8)
+                .unwrap();
+
+        assert_eq!(
+            result.stop,
+            TrapStop::UnhandledApi {
+                name: "Sleep".to_owned(),
+                rva: env.stub_export_at(sleep_stub).unwrap().1,
+            }
+        );
+        assert!(result.cooperative_yields.is_empty());
+        assert_eq!(env.runnable_unscheduled_threads().count(), 1);
+    }
+
+    #[test]
+    fn cooperative_child_instruction_cap_restores_and_resumes_main() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        const MAIN_R15: u64 = 0xfeed_face_cafe_beef;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+        emu.map_code(image.entry_point_va(), &[0xc3]).unwrap();
+        emu.map_code(CHILD_START, &[0xeb, 0xfe]).unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+        let rsp = STACK_BASE + 0x20_000;
+        emu.write_mem(rsp, &image.entry_point_va().to_le_bytes())
+            .unwrap();
+        emu.write_mem(rsp + 8, &0u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, 1).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        emu.write_reg(RegisterX86::R15, MAIN_R15).unwrap();
+
+        let result =
+            run_with_cooperative_scheduler(&mut env, &mut emu, &image, sleep_stub, 1_000, 8)
+                .unwrap();
+
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
+        let [yielded] = result.cooperative_yields.as_slice() else {
+            panic!("expected one cooperative yield");
+        };
+        assert_eq!(
+            yielded.stop,
+            CooperativeThreadStop::Trap(TrapStop::InstructionCap)
+        );
+        assert_eq!(
+            yielded.instructions_executed,
+            COOPERATIVE_CHILD_INSTRUCTION_CAP
+        );
+        assert_eq!(emu.read_reg(RegisterX86::R15).unwrap(), MAIN_R15);
+        assert_eq!(
+            emu.read_reg(RegisterX86::GS_BASE).unwrap(),
+            crate::emu::TEB_BASE
+        );
+        assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+    }
+
+    #[test]
+    fn cooperative_child_api_cap_is_independent_of_main_call_cap() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+        let thread_id_stub = env
+            .export_stub_by_base(kernel32, "GetCurrentThreadId")
+            .unwrap();
+        emu.map_code(image.entry_point_va(), &[0xc3]).unwrap();
+        let mut child_code = Vec::new();
+        for _ in 0..=COOPERATIVE_CHILD_API_CAP {
+            child_code.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]);
+            child_code.extend_from_slice(&[0x48, 0xb8]);
+            child_code.extend_from_slice(&thread_id_stub.to_le_bytes());
+            child_code.extend_from_slice(&[0xff, 0xd0]);
+            child_code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28]);
+        }
+        child_code.push(0xc3);
+        emu.map_code(CHILD_START, &child_code).unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+        let rsp = STACK_BASE + 0x20_000;
+        emu.write_mem(rsp, &image.entry_point_va().to_le_bytes())
+            .unwrap();
+        emu.write_mem(rsp + 8, &0u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, 1).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let result =
+            run_with_cooperative_scheduler(&mut env, &mut emu, &image, sleep_stub, 1_000, 1)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["Sleep".to_owned()]);
+        let [yielded] = result.cooperative_yields.as_slice() else {
+            panic!("expected one cooperative yield");
+        };
+        assert_eq!(yielded.handled.len(), COOPERATIVE_CHILD_API_CAP);
+        assert!(yielded
+            .handled
+            .iter()
+            .all(|name| name == "GetCurrentThreadId"));
+        assert_eq!(
+            yielded.stop,
+            CooperativeThreadStop::Trap(TrapStop::Other(
+                "cooperative child API cap reached".to_owned()
+            ))
+        );
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
     }
 
     #[test]
@@ -6015,6 +7257,96 @@ mod tests {
     }
 
     #[test]
+    fn rtl_free_heap_logically_frees_exact_live_allocations() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let allocation = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, 32);
+        emu.write_mem(allocation, &[0xa5; 32]).unwrap();
+        let cursor_after_allocation = env.heap_cursor;
+        let rsp = STACK_BASE + 0x800;
+
+        for (heap, flags, address) in [
+            (process_heap + 1, 0, allocation),
+            (process_heap, 0x2, allocation),
+            (process_heap, 0, 0),
+            (process_heap, 0, allocation + 1),
+            (process_heap, 0, allocation + u64::from(PAGE_SIZE)),
+        ] {
+            assert_eq!(
+                call_rtl_free_heap(
+                    &mut env,
+                    &mut emu,
+                    heap,
+                    flags,
+                    address,
+                    rsp,
+                    0x1234_5678_9abc_def0,
+                ),
+                0
+            );
+            assert!(env.heap_allocations.contains_key(&allocation));
+        }
+
+        assert_eq!(
+            call_rtl_free_heap(
+                &mut env,
+                &mut emu,
+                process_heap,
+                0xa5a5_5a5a_0000_0000 | u64::from(HEAP_NO_SERIALIZE),
+                allocation,
+                rsp,
+                0x0fed_cba9_8765_4321,
+            ),
+            1
+        );
+        assert!(!env.heap_allocations.contains_key(&allocation));
+        assert_eq!(env.heap_cursor, cursor_after_allocation);
+        assert_eq!(emu.read_mem(allocation, 32).unwrap(), vec![0xa5; 32]);
+        assert_eq!(
+            call_rtl_free_heap(
+                &mut env,
+                &mut emu,
+                process_heap,
+                0,
+                allocation,
+                rsp,
+                0x1357_2468_ace0_bdf1,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn rtl_free_heap_invalid_return_frame_preserves_live_allocation() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let allocation = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, 16);
+        let invalid_rsp = 0x0000_000d_0000_0000;
+        emu.write_reg(RegisterX86::RCX, process_heap).unwrap();
+        emu.write_reg(RegisterX86::RDX, 0).unwrap();
+        emu.write_reg(RegisterX86::R8, allocation).unwrap();
+        emu.write_reg(RegisterX86::RAX, 0xaaaa_bbbb_cccc_dddd)
+            .unwrap();
+        emu.write_reg(RegisterX86::RIP, 0x1111_2222_3333_4444)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, invalid_rsp).unwrap();
+
+        assert!(dispatch(&mut env, &mut emu, "RtlFreeHeap").is_err());
+        assert!(env.heap_allocations.contains_key(&allocation));
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            0xaaaa_bbbb_cccc_dddd
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RIP).unwrap(),
+            0x1111_2222_3333_4444
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), invalid_rsp);
+    }
+
+    #[test]
     fn trap_dispatches_get_process_heap_via_export_stub() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
@@ -6165,6 +7497,94 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_user32_export_traps_create_window_ex_a() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let user32 = env.ensure_loaded_module(&mut emu, "user32.dll").unwrap();
+        let stub = env
+            .export_stub_by_base(user32, "CreateWindowExA")
+            .expect("CreateWindowExA seed");
+        emu.map_code(image.entry_point_va(), &[0xeb, 0xfe]).unwrap();
+        register_test_window_class(&mut env, &mut emu, STACK_BASE + 0x300);
+        let rsp = STACK_BASE + 0x700;
+        prepare_create_window_ex_a_call(
+            &mut emu,
+            CreateWindowExAArgs::observed(WINDOW_CLASS_NAME_ADDRESS),
+            rsp,
+            Some(image.entry_point_va()),
+        );
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, stub, 32, 8).unwrap();
+
+        assert_eq!(result.handled, vec!["CreateWindowExA".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            EMULATED_WINDOW_HANDLE
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn synthetic_kernel32_export_traps_get_command_line_a() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let stub = env
+            .export_stub_by_base(kernel32, "GetCommandLineA")
+            .expect("GetCommandLineA seed");
+        emu.map_code(image.entry_point_va(), &[0xeb, 0xfe]).unwrap();
+        let rsp = STACK_BASE + 0x400;
+        emu.write_mem(rsp, &image.entry_point_va().to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, stub, 32, 8).unwrap();
+
+        assert_eq!(result.handled, vec!["GetCommandLineA".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            EMULATED_COMMAND_LINE_A_BASE
+        );
+        assert_eq!(
+            emu.read_mem(EMULATED_COMMAND_LINE_A_BASE, EMULATED_COMMAND_LINE_A.len())
+                .unwrap(),
+            EMULATED_COMMAND_LINE_A
+        );
+    }
+
+    #[test]
+    fn synthetic_ntdll_export_traps_rtl_free_heap() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let process_heap = env.process_heap;
+        let allocation = call_rtl_allocate_heap(&mut env, &mut emu, process_heap, 0, 16);
+        let ntdll = env.ensure_loaded_module(&mut emu, "ntdll.dll").unwrap();
+        let stub = env
+            .export_stub_by_base(ntdll, "RtlFreeHeap")
+            .expect("RtlFreeHeap seed");
+        emu.map_code(image.entry_point_va(), &[0xeb, 0xfe]).unwrap();
+        let rsp = STACK_BASE + 0x800;
+        emu.write_mem(rsp, &image.entry_point_va().to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, process_heap).unwrap();
+        emu.write_reg(RegisterX86::RDX, 0).unwrap();
+        emu.write_reg(RegisterX86::R8, allocation).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, stub, 32, 8).unwrap();
+
+        assert_eq!(result.handled, vec!["RtlFreeHeap".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert!(!env.heap_allocations.contains_key(&allocation));
+    }
+
+    #[test]
     fn synthetic_user32_export_traps_load_cursor_a() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
@@ -6177,7 +7597,7 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["LoadCursorA", "RegisterClassExA"]
+            vec!["CreateWindowExA", "LoadCursorA", "RegisterClassExA"]
         );
         let stub = module.export_stub("LoadCursorA").unwrap();
         assert_eq!(

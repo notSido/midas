@@ -19,10 +19,7 @@ use midas::{
         TEB_STACKLIMIT_OFFSET,
     },
     pe::PeImage,
-    win64::{
-        run_with_import_trap, RunnableUnscheduledThread, TrapRun, TrapStop, Win64Env,
-        KERNEL32_EXPORTS,
-    },
+    win64::{run_with_import_trap, RunnableUnscheduledThread, TrapRun, TrapStop, Win64Env},
 };
 
 const DEFAULT_MAIN_PER_LEG_CAP: u64 = 60_000_000;
@@ -37,6 +34,9 @@ const MAIN_API_BOUND: usize = 128;
 const CHILD_PREFIX_API_BOUND: usize = 16;
 const CHILD_TAIL_API_BOUND: usize = 16;
 const POST_POLL_API_BOUND: usize = 16;
+const POST_POLL_TAIL_LEN: usize = 64;
+const POST_POLL_API_NAME: &str = "GetCommandLineA";
+const POST_CREATE_CHILD_API_NAME: &str = "RtlFreeHeap";
 
 const CHILD_STACK_BASE: u64 = 0x0000_000f_5000_0000;
 const CHILD_STACK_SIZE: u64 = 0x0010_0000;
@@ -220,6 +220,7 @@ struct FormattedWatchHit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FormattedInstruction {
+    global_instruction_index: u64,
     address: u64,
     instruction: String,
     writes_r13: Option<bool>,
@@ -273,6 +274,35 @@ struct ZeroTargetProvenance {
     zero_writer_instruction: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiagnosticBoundary {
+    Natural(TrapStop),
+    PendingApi { name: String },
+}
+
+#[derive(Debug, Clone)]
+struct PollWindowControls {
+    baseline: ExportNameControl,
+    treatment: ExportNameControl,
+    added_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostPollTerminalObservation {
+    boundary: DiagnosticBoundary,
+    pending_api: Option<String>,
+    pending_address: Option<u64>,
+    call: Option<RegisterCallTerminal>,
+    tail_rips: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostPollAbInvariant {
+    baseline_call: RegisterCallTerminal,
+    treatment_target: u64,
+    tail_digest: u64,
+}
+
 #[derive(Debug, Clone)]
 struct PollWindowEvidence {
     poll: MainPollObservation,
@@ -283,18 +313,18 @@ struct PollWindowEvidence {
     create_window: CreateWindowExAObservation,
     window_procedure: u64,
     post_create_handled: Vec<String>,
-    post_create_stop: TrapStop,
+    post_create_boundary: DiagnosticBoundary,
     post_create_rips: Vec<u64>,
     hits: Vec<FormattedWatchHit>,
     post_create_hit_start: usize,
     post_create_hit_end: usize,
     release_writer_index: Option<usize>,
     poll_final: u8,
-    main_stop: TrapStop,
+    main_boundary: DiagnosticBoundary,
     main_handled: Vec<String>,
     main_pending_api: Option<String>,
+    main_pending_address: Option<u64>,
     restored_main_cap: u64,
-    restored_main_watch_hit_cap: usize,
     main_rips: Vec<u64>,
     main_tail_instructions: Vec<FormattedInstruction>,
     main_terminal_call: Option<RegisterCallTerminal>,
@@ -368,9 +398,32 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to parse {:?}: {error}", config.path))?;
 
     if config.poll_window_only {
-        let poll = discover_main_poll(&config, &image, &bytes)?;
-        let evidence = run_poll_window_return(&config, &image, &bytes, poll)?;
-        print_poll_window_summary(&config, &image, &evidence);
+        if config.export_name_control.is_some() {
+            return Err(
+                "--poll-window owns its frozen kernel32 baseline/treatment controls".to_owned(),
+            );
+        }
+        let controls = frozen_poll_window_controls()?;
+        let mut baseline_config = config.clone();
+        baseline_config.export_name_control = Some(controls.baseline.clone());
+        let poll = discover_main_poll(&baseline_config, &image, &bytes)?;
+        let baseline = run_poll_window_return(&baseline_config, &image, &bytes, poll, None)?;
+
+        let mut treatment_config = config.clone();
+        treatment_config.export_name_control = Some(controls.treatment.clone());
+        let treatment = run_poll_window_return(
+            &treatment_config,
+            &image,
+            &bytes,
+            poll,
+            Some(&controls.added_name),
+        )?;
+        let invariant = validate_post_poll_ab(
+            &post_poll_terminal_observation(&baseline),
+            &post_poll_terminal_observation(&treatment),
+            &controls.added_name,
+        )?;
+        print_poll_window_summary(&config, &image, &baseline, &controls, &invariant);
         return Ok(());
     }
     let first = run_pass(&config, &image, &bytes, None)?;
@@ -683,7 +736,8 @@ fn usage(program: &str) -> String {
          the diagnostic derives the pending Sleep, created thread, and timeGetTime stub at runtime;\n\
          an optional newline-delimited name list changes one synthetic module's names only;\n\
          --frontier-only prints the first child terminal without provenance replays;\n\
-         --poll-window returns a diagnostic nonzero HWND at the confirmed CreateWindowExA boundary and watches the child/main suffix"
+         --poll-window rejects an external name control, runs the frozen kernel32 A/B controls,\n\
+         returns a diagnostic nonzero HWND at the confirmed CreateWindowExA boundary, and watches the child/main suffix"
     )
 }
 
@@ -707,6 +761,34 @@ fn parse_export_name_control(contents: &str) -> Result<Vec<String>, String> {
         return Err("export-name control contains an invalid name".to_owned());
     }
     Ok(names)
+}
+
+fn frozen_poll_window_controls() -> Result<PollWindowControls, String> {
+    let baseline = ExportNameControl {
+        module_name: "kernel32.dll".to_owned(),
+        names: parse_export_name_control(include_str!(
+            "../docs/controls/kernel32-with-widechar.txt"
+        ))?,
+    };
+    let treatment = ExportNameControl {
+        module_name: "kernel32.dll".to_owned(),
+        names: parse_export_name_control(include_str!(
+            "../docs/controls/kernel32-with-getcommandlinea.txt"
+        ))?,
+    };
+    let added_name = single_added_export_name(&baseline, &treatment).ok_or_else(|| {
+        "frozen post-poll controls do not differ by exactly one export name".to_owned()
+    })?;
+    if added_name != POST_POLL_API_NAME {
+        return Err(format!(
+            "frozen post-poll treatment adds {added_name:?}, expected {POST_POLL_API_NAME:?}"
+        ));
+    }
+    Ok(PollWindowControls {
+        baseline,
+        treatment,
+        added_name,
+    })
 }
 
 fn parse_optional<T>(value: Option<String>, default: T, name: &str) -> Result<T, String>
@@ -882,6 +964,7 @@ fn run_poll_window_return(
     image: &PeImage,
     bytes: &[u8],
     poll: MainPollObservation,
+    treatment_pending_api: Option<&str>,
 ) -> Result<PollWindowEvidence, String> {
     if config
         .export_name_control
@@ -965,15 +1048,32 @@ fn run_poll_window_return(
     let post_create_begin = emu
         .read_reg(RegisterX86::RIP)
         .map_err(|error| format!("failed to read post-CreateWindowExA RIP: {error}"))?;
-    let post_create = run_with_import_trap(
+    let post_create = run_until_pending_api(
         &mut env,
         &mut emu,
         image,
         post_create_begin,
+        POST_CREATE_CHILD_API_NAME,
         config.child_per_leg_cap,
         CHILD_TAIL_API_BOUND,
     )
     .map_err(|error| format!("post-CreateWindowExA child treatment failed: {error}"))?;
+    let post_create_pending_name = env
+        .callable_stub_name_at(post_create.pending_address)
+        .ok_or_else(|| {
+            format!(
+                "post-CreateWindowExA boundary 0x{:016x} is not a named stub",
+                post_create.pending_address
+            )
+        })?;
+    if post_create_pending_name != POST_CREATE_CHILD_API_NAME {
+        return Err(format!(
+            "post-CreateWindowExA child stopped at {post_create_pending_name:?}, expected {POST_CREATE_CHILD_API_NAME:?}"
+        ));
+    }
+    let post_create_boundary = DiagnosticBoundary::PendingApi {
+        name: post_create_pending_name,
+    };
     let post_create_hit_end = emu.persistent_watch_hits().len();
     let post_create_trace_end = emu.executed_addresses().len();
     let pre_main_raw_hits = emu.persistent_watch_hits();
@@ -994,15 +1094,16 @@ fn run_poll_window_return(
     let main_stack_end = STACK_BASE
         .checked_add(STACK_SIZE)
         .ok_or_else(|| "restored-main stack watch range overflows".to_owned())?;
-    let restored_main_watch_ranges = if config.export_name_control.is_some() {
-        vec![(poll.address, watch_end)]
-    } else {
+    let capture_zero_provenance = treatment_pending_api.is_none();
+    let restored_main_watch_ranges = if capture_zero_provenance {
         vec![(poll.address, watch_end), (STACK_BASE, main_stack_end)]
-    };
-    let restored_main_watch_hit_cap = if config.export_name_control.is_some() {
-        config.watch_hit_cap
     } else {
+        vec![(poll.address, watch_end)]
+    };
+    let restored_main_watch_hit_cap = if capture_zero_provenance {
         MAX_WATCH_HIT_CAP
+    } else {
+        config.watch_hit_cap
     };
     emu.configure_persistent_watch(&restored_main_watch_ranges, restored_main_watch_hit_cap)
         .map_err(|error| format!("failed to arm restored-main watch: {error}"))?;
@@ -1012,15 +1113,53 @@ fn run_poll_window_return(
     let main_hit_start = pre_main_raw_hits.len();
     let main_trace_start = emu.executed_addresses().len();
     let restored_main_cap = config.main_per_leg_cap.min(MAX_POLL_MAIN_TRACE_CAP);
-    let main_leg = run_with_import_trap(
-        &mut env,
-        &mut emu,
-        image,
-        main_begin,
-        restored_main_cap,
-        POST_POLL_API_BOUND,
-    )
-    .map_err(|error| format!("post-CreateWindowExA restored-main leg failed: {error}"))?;
+    let (main_handled, main_boundary) = match treatment_pending_api {
+        None => {
+            let main_leg = run_with_import_trap(
+                &mut env,
+                &mut emu,
+                image,
+                main_begin,
+                restored_main_cap,
+                POST_POLL_API_BOUND,
+            )
+            .map_err(|error| {
+                format!("post-CreateWindowExA restored-main baseline failed: {error}")
+            })?;
+            (main_leg.handled, DiagnosticBoundary::Natural(main_leg.stop))
+        }
+        Some(pending_api) => {
+            let main_leg = run_until_pending_api(
+                &mut env,
+                &mut emu,
+                image,
+                main_begin,
+                pending_api,
+                restored_main_cap,
+                POST_POLL_API_BOUND,
+            )
+            .map_err(|error| {
+                format!("post-CreateWindowExA restored-main treatment failed: {error}")
+            })?;
+            let pending_name = env
+                .callable_stub_name_at(main_leg.pending_address)
+                .ok_or_else(|| {
+                    format!(
+                        "restored-main treatment boundary 0x{:016x} is not a named stub",
+                        main_leg.pending_address
+                    )
+                })?;
+            if pending_name != pending_api {
+                return Err(format!(
+                    "restored-main treatment stopped at {pending_name:?}, expected {pending_api:?}"
+                ));
+            }
+            (
+                main_leg.handled,
+                DiagnosticBoundary::PendingApi { name: pending_name },
+            )
+        }
+    };
     let main_raw_hits = emu.persistent_watch_hits();
     let main_hit_end = main_hit_start + main_raw_hits.len();
     let main_trace_end = emu.executed_addresses().len();
@@ -1028,6 +1167,7 @@ fn run_poll_window_return(
         .read_reg(RegisterX86::RIP)
         .map_err(|error| format!("failed to read post-CreateWindowExA main stop RIP: {error}"))?;
     let main_pending_api = env.callable_stub_name_at(main_pending_rip);
+    let main_pending_address = main_pending_api.as_ref().map(|_| main_pending_rip);
     if main_raw_hits.len() >= restored_main_watch_hit_cap {
         return Err(format!(
             "restored-main watch reached its {}-hit cap",
@@ -1054,15 +1194,20 @@ fn run_poll_window_return(
         &main_terminal_registers,
         &main_frozen_tail,
     )?;
-    if matches!(&main_leg.stop, TrapStop::NullControlTransfer)
-        && main_terminal_call.is_none_or(|call| call.target_value != 0)
+    if matches!(
+        &main_boundary,
+        DiagnosticBoundary::Natural(TrapStop::NullControlTransfer)
+    ) && main_terminal_call.is_none_or(|call| call.target_value != 0)
     {
         return Err("restored-main null is not a validated zero-target register call".to_owned());
     }
-    let main_tail_instructions = format_tail(&main_frozen_tail, &main_rips, 64)?;
-    let main_loop_repeated = !main_leg.handled.is_empty()
-        && main_leg.handled.iter().all(|name| name == "Sleep")
-        && is_call_bound_stop(&main_leg.stop)
+    let main_tail_instructions = format_tail(&main_frozen_tail, &main_rips, POST_POLL_TAIL_LEN)?;
+    let main_loop_repeated = !main_handled.is_empty()
+        && main_handled.iter().all(|name| name == "Sleep")
+        && matches!(
+            &main_boundary,
+            DiagnosticBoundary::Natural(stop) if is_call_bound_stop(stop)
+        )
         && main_pending_api.as_deref() == Some("Sleep");
     let instructions_past_poll = if main_loop_repeated {
         0
@@ -1082,7 +1227,7 @@ fn run_poll_window_return(
     }
     let hits = format_watch_hits(raw_hits)?;
     let zero_target_provenance = match main_terminal_call {
-        Some(call) if call.target_value == 0 && config.export_name_control.is_none() => {
+        Some(call) if call.target_value == 0 && capture_zero_provenance => {
             derive_zero_target_provenance(
                 hits.get(main_hit_start..main_hit_end)
                     .ok_or_else(|| "restored-main watch-hit bounds are inconsistent".to_owned())?,
@@ -1092,8 +1237,10 @@ fn run_poll_window_return(
         }
         _ => None,
     };
-    if matches!(&main_leg.stop, TrapStop::NullControlTransfer)
-        && config.export_name_control.is_none()
+    if matches!(
+        &main_boundary,
+        DiagnosticBoundary::Natural(TrapStop::NullControlTransfer)
+    ) && capture_zero_provenance
         && zero_target_provenance.is_none()
     {
         return Err("restored-main null has no bounded deliberate-zero provenance".to_owned());
@@ -1104,18 +1251,6 @@ fn run_poll_window_return(
                 "export-name control for {:?} was never applied",
                 control.module_name
             ));
-        }
-        if let Some(added_name) = single_added_kernel32_name(control) {
-            let classified = matches!(
-                &main_leg.stop,
-                TrapStop::UnhandledApi { name, .. } if name == &added_name
-            ) && main_pending_api.as_deref() == Some(added_name.as_str())
-                && main_terminal_call.is_some_and(|call| call.target_value != 0);
-            if !classified {
-                return Err(format!(
-                    "single-name kernel32 control did not expose {added_name:?} as the nonzero post-poll boundary"
-                ));
-            }
         }
     }
     if !hits[..post_create_hit_start]
@@ -1138,18 +1273,18 @@ fn run_poll_window_return(
         create_window,
         window_procedure,
         post_create_handled: post_create.handled,
-        post_create_stop: post_create.stop,
+        post_create_boundary,
         post_create_rips,
         hits,
         post_create_hit_start,
         post_create_hit_end,
         release_writer_index,
         poll_final,
-        main_stop: main_leg.stop,
-        main_handled: main_leg.handled,
+        main_boundary,
+        main_handled,
         main_pending_api,
+        main_pending_address,
         restored_main_cap,
-        restored_main_watch_hit_cap,
         main_rips,
         main_tail_instructions,
         main_terminal_call,
@@ -2019,9 +2154,10 @@ fn decode_watch_instruction(hit: &PersistentWatchHit) -> Option<iced_x86::Instru
 fn is_full_qword_frame_push(entry: &FormattedWatchHit, tail: &[FormattedInstruction]) -> bool {
     if entry.hit.is_write
         || entry.hit.size != 8
-        || !tail
-            .iter()
-            .any(|instruction| instruction.address == entry.hit.rip)
+        || !tail.iter().any(|instruction| {
+            instruction.global_instruction_index == entry.hit.global_instruction_index
+                && instruction.address == entry.hit.rip
+        })
     {
         return false;
     }
@@ -2132,28 +2268,116 @@ fn derive_zero_target_provenance(
     }
 }
 
-fn single_added_kernel32_name(control: &ExportNameControl) -> Option<String> {
-    if !control.module_name.eq_ignore_ascii_case("kernel32.dll") {
-        return None;
-    }
-    let mut baseline = KERNEL32_EXPORTS
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect::<Vec<_>>();
-    baseline.sort_unstable();
-    baseline.dedup();
-    if control.names.len() != baseline.len() + 1
+fn single_added_export_name(
+    baseline: &ExportNameControl,
+    treatment: &ExportNameControl,
+) -> Option<String> {
+    if !baseline.module_name.eq_ignore_ascii_case("kernel32.dll")
         || !baseline
-            .iter()
-            .all(|name| control.names.binary_search(name).is_ok())
+            .module_name
+            .eq_ignore_ascii_case(&treatment.module_name)
     {
         return None;
     }
-    control
+    if treatment.names.len() != baseline.names.len() + 1
+        || !baseline
+            .names
+            .iter()
+            .all(|name| treatment.names.binary_search(name).is_ok())
+    {
+        return None;
+    }
+    treatment
         .names
         .iter()
-        .find(|name| baseline.binary_search(name).is_err())
+        .find(|name| baseline.names.binary_search(name).is_err())
         .cloned()
+}
+
+fn post_poll_terminal_observation(evidence: &PollWindowEvidence) -> PostPollTerminalObservation {
+    PostPollTerminalObservation {
+        boundary: evidence.main_boundary.clone(),
+        pending_api: evidence.main_pending_api.clone(),
+        pending_address: evidence.main_pending_address,
+        call: evidence.main_terminal_call,
+        tail_rips: evidence
+            .main_tail_instructions
+            .iter()
+            .map(|instruction| instruction.address)
+            .collect(),
+    }
+}
+
+fn validate_post_poll_ab(
+    baseline: &PostPollTerminalObservation,
+    treatment: &PostPollTerminalObservation,
+    added_name: &str,
+) -> Result<PostPollAbInvariant, String> {
+    let require =
+        |condition: bool, message: &str| condition.then_some(()).ok_or_else(|| message.to_owned());
+    require(
+        baseline.boundary == DiagnosticBoundary::Natural(TrapStop::NullControlTransfer),
+        "post-poll baseline is not a natural null",
+    )?;
+    require(
+        baseline.pending_api.is_none() && baseline.pending_address.is_none(),
+        "post-poll baseline unexpectedly has a pending stub",
+    )?;
+    require(
+        matches!(
+            &treatment.boundary,
+            DiagnosticBoundary::PendingApi { name } if name == added_name
+        ),
+        "post-poll treatment did not stop before the added API",
+    )?;
+    require(
+        treatment.pending_api.as_deref() == Some(added_name),
+        "post-poll treatment pending API does not match the added name",
+    )?;
+    let treatment_pending_address = treatment
+        .pending_address
+        .ok_or_else(|| "post-poll treatment has no pending stub address".to_owned())?;
+    let baseline_call = baseline
+        .call
+        .ok_or_else(|| "post-poll baseline has no register-call terminal".to_owned())?;
+    let treatment_call = treatment
+        .call
+        .ok_or_else(|| "post-poll treatment has no register-call terminal".to_owned())?;
+    require(
+        baseline_call.target_value == 0,
+        "post-poll baseline target is nonzero",
+    )?;
+    require(
+        treatment_call.target_value != 0
+            && treatment_call.target_value == treatment_pending_address,
+        "post-poll treatment target is not the named pending stub",
+    )?;
+    let shape = |call: RegisterCallTerminal| {
+        (
+            call.instruction_address,
+            call.target_register,
+            call.pushed_return_cell,
+            call.pushed_return_address,
+        )
+    };
+    require(
+        shape(baseline_call) == shape(treatment_call),
+        "post-poll A/B terminal call shapes differ",
+    )?;
+    require(
+        baseline.tail_rips.len() == POST_POLL_TAIL_LEN
+            && treatment.tail_rips.len() == POST_POLL_TAIL_LEN,
+        "post-poll A/B terminal tail is not exactly 64 RIPs",
+    )?;
+    require(
+        baseline.tail_rips == treatment.tail_rips,
+        "post-poll A/B terminal tails differ",
+    )?;
+    Ok(PostPollAbInvariant {
+        baseline_call,
+        treatment_target: treatment_call.target_value,
+        tail_digest: trace_digest(&baseline.tail_rips),
+    })
 }
 
 #[cfg(test)]
@@ -2259,6 +2483,7 @@ fn format_frozen_instruction(frozen: &FrozenInstruction) -> Result<FormattedInst
         ));
     }
     Ok(FormattedInstruction {
+        global_instruction_index: frozen.global_instruction_index,
         address: frozen.address,
         instruction: format_instruction(&instruction),
         writes_r13: Some(instruction_writes_r13(&instruction)),
@@ -3513,7 +3738,13 @@ fn print_module_writer_provenance(pass: &PassEvidence, modules: &[(String, u64, 
     }
 }
 
-fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWindowEvidence) {
+fn print_poll_window_summary(
+    config: &Config,
+    image: &PeImage,
+    evidence: &PollWindowEvidence,
+    controls: &PollWindowControls,
+    invariant: &PostPollAbInvariant,
+) {
     println!("image:                 {:?}", config.path);
     println!("image_base:            0x{:016x}", image.image_base);
     println!("entry_va:              0x{:016x}", image.entry_point_va());
@@ -3523,23 +3754,13 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
     println!("poll_window_only:      true");
     println!("window_control_module: \"user32.dll\"");
     println!("window_control_names:  3");
-    match &config.export_name_control {
-        Some(control) => {
-            println!("extra_control_module:  {:?}", control.module_name);
-            println!("extra_control_names:   {}", control.names.len());
-            println!("extra_control_applied: true");
-            println!(
-                "single_added_export:   {:?}",
-                single_added_kernel32_name(control)
-            );
-        }
-        None => {
-            println!("extra_control_module:  <none>");
-            println!("extra_control_names:   0");
-            println!("extra_control_applied: false");
-            println!("single_added_export:   None");
-        }
-    }
+    println!(
+        "ab_controls:           module={:?} names={}->{} added={:?}",
+        controls.baseline.module_name,
+        controls.baseline.names.len(),
+        controls.treatment.names.len(),
+        controls.added_name
+    );
     println!(
         "main_prefix_calls:     {}",
         evidence.main_prefix_handled.len()
@@ -3614,7 +3835,7 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
     );
     println!("diagnostic_hwnd:       0x{DIAGNOSTIC_WINDOW_HANDLE:016x}");
     println!("post_create_handled:   {:?}", evidence.post_create_handled);
-    println!("post_create_stop:      {:?}", evidence.post_create_stop);
+    println!("post_create_boundary:  {:?}", evidence.post_create_boundary);
     println!(
         "post_create_hits:      {}..{}",
         evidence.post_create_hit_start, evidence.post_create_hit_end
@@ -3624,21 +3845,10 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
         "post_create_digest:    0x{:016x}",
         trace_digest(&evidence.post_create_rips)
     );
-    println!("main_stop:             {:?}", evidence.main_stop);
+    println!("main_boundary:         {:?}", evidence.main_boundary);
     println!("main_handled:          {:?}", evidence.main_handled);
     println!("main_pending_api:      {:?}", evidence.main_pending_api);
     println!("restored_main_cap:     {}", evidence.restored_main_cap);
-    println!(
-        "restored_watch_hits:   {}",
-        evidence
-            .hits
-            .len()
-            .saturating_sub(evidence.post_create_hit_end)
-    );
-    println!(
-        "restored_watch_cap:    {}",
-        evidence.restored_main_watch_hit_cap
-    );
     println!("main_rips:             {}", evidence.main_rips.len());
     println!(
         "main_digest:           0x{:016x}",
@@ -3691,29 +3901,23 @@ fn print_poll_window_summary(config: &Config, image: &PeImage, evidence: &PollWi
         }
         None => println!("zero_target_writer:    <not applicable>"),
     }
-    let classification = match (
-        config.export_name_control.is_some(),
-        config
-            .export_name_control
-            .as_ref()
-            .and_then(single_added_kernel32_name),
-        &evidence.main_stop,
-        evidence.main_pending_api.as_deref(),
-    ) {
-        (true, Some(added), TrapStop::UnhandledApi { name, .. }, Some(pending))
-            if added == *name && added == pending =>
-        {
-            format!("(b) missing API/return: {added}")
-        }
-        (true, None, TrapStop::UnhandledApi { name, .. }, Some(pending)) if name == pending => {
-            format!("names-only discovery exposes missing API candidate: {name}")
-        }
-        (false, None, TrapStop::NullControlTransfer, None) => {
-            "baseline zero-target register call; apply a names-only control to classify".to_owned()
-        }
-        _ => "control does not classify this terminal".to_owned(),
-    };
-    println!("post_poll_classification: {classification}");
+    println!(
+        "ab_terminal:           call=0x{:016x} register={:?} cell=0x{:016x} fallthrough=0x{:016x} target=0x{:016x}->0x{:016x}",
+        invariant.baseline_call.instruction_address,
+        invariant.baseline_call.target_register,
+        invariant.baseline_call.pushed_return_cell,
+        invariant.baseline_call.pushed_return_address,
+        invariant.baseline_call.target_value,
+        invariant.treatment_target
+    );
+    println!("ab_tail_digest:        0x{:016x}", invariant.tail_digest);
+    println!(
+        "post_poll_ab_invariant: same call site/register/pushed cell/fallthrough/exact 64-RIP tail; only target changed zero-to-named-stub"
+    );
+    println!(
+        "post_poll_classification: (b) missing API/return: {}",
+        controls.added_name
+    );
     println!("poll watch hits:");
     for (index, entry) in evidence.hits.iter().enumerate() {
         let Some(watched_value) = watched_byte(&entry.hit, evidence.poll.address) else {
@@ -4237,26 +4441,114 @@ mod tests {
     }
 
     #[test]
-    fn committed_kernel32_control_adds_exactly_one_runtime_name() {
-        let names = parse_export_name_control(include_str!(
-            "../docs/controls/kernel32-with-getcommandlinea.txt"
-        ))
-        .unwrap();
-        let control = ExportNameControl {
-            module_name: "kernel32.dll".to_owned(),
-            names,
-        };
+    fn committed_post_poll_controls_add_only_getcommandlinea() {
+        let controls = frozen_poll_window_controls().unwrap();
+        assert_eq!(controls.added_name, "GetCommandLineA");
+
+        let mut same_length_replacement = controls.treatment.clone();
+        same_length_replacement.names.retain(|name| name != "Sleep");
+        same_length_replacement
+            .names
+            .push("ZZZReplacement".to_owned());
         assert_eq!(
-            single_added_kernel32_name(&control).as_deref(),
-            Some("GetCommandLineA")
+            single_added_export_name(&controls.baseline, &same_length_replacement),
+            None
         );
 
-        let mut missing_baseline = control.clone();
-        missing_baseline.names.retain(|name| name != "Sleep");
-        assert_eq!(single_added_kernel32_name(&missing_baseline), None);
-        let mut wrong_module = control;
+        let mut two_additions = controls.treatment.clone();
+        two_additions.names.push("ZZZSecondAddition".to_owned());
+        assert_eq!(
+            single_added_export_name(&controls.baseline, &two_additions),
+            None
+        );
+
+        let mut wrong_module = controls.treatment;
         wrong_module.module_name = "user32.dll".to_owned();
-        assert_eq!(single_added_kernel32_name(&wrong_module), None);
+        assert_eq!(
+            single_added_export_name(&controls.baseline, &wrong_module),
+            None
+        );
+    }
+
+    #[test]
+    fn post_poll_ab_validator_rejects_every_composition_mutation() {
+        let tail_rips = (0..POST_POLL_TAIL_LEN)
+            .map(|index| 0x0000_0001_4000_0000 + index as u64)
+            .collect::<Vec<_>>();
+        let baseline_call = RegisterCallTerminal {
+            global_instruction_index: 100,
+            instruction_address: 0x0000_0001_4020_0000,
+            target_register: Register::RAX,
+            target_value: 0,
+            pushed_return_cell: STACK_BASE + 0x1000,
+            pushed_return_address: 0x0000_0001_4020_0002,
+        };
+        let treatment_call = RegisterCallTerminal {
+            global_instruction_index: 200,
+            target_value: 0x0000_7fff_0000_1020,
+            ..baseline_call
+        };
+        let baseline = PostPollTerminalObservation {
+            boundary: DiagnosticBoundary::Natural(TrapStop::NullControlTransfer),
+            pending_api: None,
+            pending_address: None,
+            call: Some(baseline_call),
+            tail_rips: tail_rips.clone(),
+        };
+        let treatment = PostPollTerminalObservation {
+            boundary: DiagnosticBoundary::PendingApi {
+                name: POST_POLL_API_NAME.to_owned(),
+            },
+            pending_api: Some(POST_POLL_API_NAME.to_owned()),
+            pending_address: Some(treatment_call.target_value),
+            call: Some(treatment_call),
+            tail_rips,
+        };
+        let invariant = validate_post_poll_ab(&baseline, &treatment, POST_POLL_API_NAME).unwrap();
+        assert_eq!(invariant.baseline_call, baseline_call);
+        assert_eq!(invariant.treatment_target, treatment_call.target_value);
+
+        type Mutation = fn(&mut PostPollTerminalObservation, &mut PostPollTerminalObservation);
+        let mutations: &[Mutation] = &[
+            |baseline, _| baseline.boundary = DiagnosticBoundary::Natural(TrapStop::InstructionCap),
+            |baseline, _| baseline.pending_api = Some(POST_POLL_API_NAME.to_owned()),
+            |baseline, _| baseline.pending_address = Some(0x1000),
+            |_, treatment| {
+                treatment.boundary = DiagnosticBoundary::Natural(TrapStop::NullControlTransfer)
+            },
+            |_, treatment| {
+                treatment.boundary = DiagnosticBoundary::PendingApi {
+                    name: "WrongName".to_owned(),
+                }
+            },
+            |_, treatment| treatment.pending_api = Some("WrongName".to_owned()),
+            |_, treatment| treatment.pending_api = None,
+            |_, treatment| treatment.pending_address = None,
+            |_, treatment| treatment.pending_address = Some(0x0000_7fff_0000_1030),
+            |baseline, _| baseline.call = None,
+            |_, treatment| treatment.call = None,
+            |baseline, _| baseline.call.as_mut().unwrap().target_value = 1,
+            |_, treatment| treatment.call.as_mut().unwrap().target_value = 0,
+            |_, treatment| treatment.call.as_mut().unwrap().target_value += 0x10,
+            |_, treatment| treatment.call.as_mut().unwrap().instruction_address += 1,
+            |_, treatment| treatment.call.as_mut().unwrap().target_register = Register::R10,
+            |_, treatment| treatment.call.as_mut().unwrap().pushed_return_cell += 8,
+            |_, treatment| treatment.call.as_mut().unwrap().pushed_return_address += 1,
+            |_, treatment| treatment.tail_rips[0] += 1,
+            |_, treatment| {
+                treatment.tail_rips.pop();
+            },
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut mutated_baseline = baseline.clone();
+            let mut mutated_treatment = treatment.clone();
+            mutate(&mut mutated_baseline, &mut mutated_treatment);
+            assert!(
+                validate_post_poll_ab(&mutated_baseline, &mutated_treatment, POST_POLL_API_NAME)
+                    .is_err(),
+                "validator accepted mutation {index}"
+            );
+        }
     }
 
     #[test]
@@ -4641,6 +4933,63 @@ mod tests {
     }
 
     #[test]
+    fn full_qword_frame_push_rejects_rsp_and_unresolved_bases() {
+        let source_cell = STACK_BASE + 0x5008;
+        let consumer_rip = 0x1010;
+        let global_instruction_index = 20;
+        let tail = vec![FormattedInstruction {
+            global_instruction_index,
+            address: consumer_rip,
+            instruction: "push qword [rbp-8]".to_owned(),
+            writes_r13: Some(false),
+        }];
+        let format_read =
+            |address: u64, registers: Vec<(RegisterX86, u64)>, code_window: Vec<u8>| {
+                format_watch_hits(vec![PersistentWatchHit {
+                    global_instruction_index,
+                    is_write: false,
+                    address,
+                    size: 8,
+                    rip: consumer_rip,
+                    value: Some(0),
+                    registers,
+                    code_window,
+                }])
+                .unwrap()
+                .remove(0)
+            };
+
+        let valid = format_read(
+            source_cell,
+            vec![(RegisterX86::RBP, source_cell + 8)],
+            vec![0xff, 0x75, 0xf8],
+        );
+        assert!(is_full_qword_frame_push(&valid, &tail));
+
+        let invalid = [
+            format_read(
+                source_cell,
+                vec![(RegisterX86::RSP, source_cell - 8)],
+                vec![0xff, 0x74, 0x24, 0x08],
+            ),
+            format_read(
+                0x5000,
+                Vec::new(),
+                vec![0xff, 0x34, 0x25, 0x00, 0x50, 0x00, 0x00],
+            ),
+            format_read(source_cell, Vec::new(), vec![0xff, 0x75, 0xf8]),
+            format_read(
+                source_cell,
+                vec![(RegisterX86::RBP, source_cell + 16)],
+                vec![0xff, 0x75, 0xf8],
+            ),
+        ];
+        assert!(invalid
+            .iter()
+            .all(|entry| !is_full_qword_frame_push(entry, &tail)));
+    }
+
+    #[test]
     fn zero_target_provenance_requires_a_paired_nonzero_to_zero_writer() {
         let source_cell = STACK_BASE + 0x5008;
         let rbp = source_cell + 8;
@@ -4685,6 +5034,7 @@ mod tests {
         ];
         let hits = format_watch_hits(raw_hits).unwrap();
         let tail = vec![FormattedInstruction {
+            global_instruction_index: 20,
             address: consumer_rip,
             instruction: "push qword [rbp-8]".to_owned(),
             writes_r13: Some(false),
@@ -4703,6 +5053,20 @@ mod tests {
         assert_eq!(provenance.source_cell, source_cell);
         assert_eq!(provenance.zero_writer_input, 0x55);
         assert_eq!(provenance.zero_writer_output, 0);
+
+        let mut before_frozen_tail = hits.clone();
+        before_frozen_tail[2].hit.global_instruction_index = 19;
+        assert_eq!(
+            derive_zero_target_provenance(&before_frozen_tail, &tail, terminal).unwrap(),
+            None
+        );
+
+        let mut after_frozen_tail = hits.clone();
+        after_frozen_tail[2].hit.global_instruction_index = 21;
+        assert_eq!(
+            derive_zero_target_provenance(&after_frozen_tail, &tail, terminal).unwrap(),
+            None
+        );
 
         let mut zero_input = hits.clone();
         zero_input[0].hit.value = Some(0);
@@ -4738,7 +5102,14 @@ mod tests {
         let mut second_consumer = duplicate[2].clone();
         second_consumer.hit.global_instruction_index = 21;
         duplicate.push(second_consumer);
-        assert!(derive_zero_target_provenance(&duplicate, &tail, terminal).is_err());
+        let mut duplicate_tail = tail;
+        duplicate_tail.push(FormattedInstruction {
+            global_instruction_index: 21,
+            address: consumer_rip,
+            instruction: "push qword [rbp-8]".to_owned(),
+            writes_r13: Some(false),
+        });
+        assert!(derive_zero_target_provenance(&duplicate, &duplicate_tail, terminal).is_err());
     }
 
     #[test]

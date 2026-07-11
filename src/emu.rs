@@ -537,6 +537,16 @@ impl Emu {
             .map_err(|source| EmuError::ReadReg { reg, source })
     }
 
+    /// Return the monotonically increasing count of guest instructions run by
+    /// this emulator across every resume leg and CPU-context restore.
+    ///
+    /// The counter is observation state, not CPU state. In particular, running
+    /// a cooperatively selected thread advances it, and restoring another CPU
+    /// context does not rewind it.
+    pub fn total_instructions_executed(&self) -> u64 {
+        self.uc.get_data().total_instr_count
+    }
+
     /// Capture the current Unicorn CPU state into a new reusable context.
     ///
     /// See [`CpuContext`] for the intentionally narrow snapshot scope.

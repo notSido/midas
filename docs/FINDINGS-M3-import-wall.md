@@ -3310,12 +3310,11 @@ instructions past the poll and stops at
 `0x00007fff0000c7a0`. The output artifact SHA-256 is
 `b2495d093d4bd407e621751b8e8248ed744ea364c219bfe7a0aa3571bebd0f50`.
 
-The committed narrow control
-`docs/controls/kernel32-with-getcommandlinea.txt` is the current 20-name
-kernel32 seed plus exactly one sorted name. A unit test derives the production
-seed from `KERNEL32_EXPORTS` and rejects the control unless the sole addition is
-`GetCommandLineA`. The prior 20-name control and the new 21-name control have
-SHA-256 values
+At the Slice A checkpoint, the committed narrow control
+`docs/controls/kernel32-with-getcommandlinea.txt` was the 20-name production
+kernel32 seed plus exactly one sorted name. Slice B retains that 20/21-name pair
+as a frozen diagnostic control after `GetCommandLineA` joins production. The
+two controls have SHA-256 values
 `dfd7ed5f8d57f01047b511334aa6e45c42362964b7b0baba56c74561bc2490db`
 and
 `244487c6d6d693668111a3d5d13f19cf881eec9fef86fe7b8d919312fda45832`.
@@ -3336,29 +3335,26 @@ the baseline. The invariant is the 64-RIP protected tail address sequence,
 register-call site, and pushed fallthrough; only the runtime export-walk result
 changes from zero to the named synthetic stub.
 
-Reproduce the bounded baseline and one-name treatment locally:
+The rows above are the original separate Slice A artifacts. Slice B replaces
+manual comparison with a paired assertion in one invocation:
 
 ```text
 cargo build --locked --release --example trace_child_postmortem
 
 target/release/examples/trace_child_postmortem \
   samples/test_target_protected.exe 60000000 100000 4096 \
-  --poll-window > /tmp/midas-slice-a-final-baseline-s1.txt
-target/release/examples/trace_child_postmortem \
-  samples/test_target_protected.exe 60000000 100000 4096 \
-  kernel32.dll docs/controls/kernel32-with-getcommandlinea.txt \
-  --poll-window > /tmp/midas-slice-a-final-getcommandlinea-s1.txt
+  --poll-window > /tmp/midas-slice-b-poll-ab-s1.txt
 
 target/release/examples/trace_child_postmortem \
   samples/test_target3_protected.exe 60000000 100000 4096 \
-  --poll-window > /tmp/midas-slice-a-final-baseline-s3.txt
-target/release/examples/trace_child_postmortem \
-  samples/test_target3_protected.exe 60000000 100000 4096 \
-  kernel32.dll docs/controls/kernel32-with-getcommandlinea.txt \
-  --poll-window > /tmp/midas-slice-a-final-getcommandlinea-s3.txt
+  --poll-window > /tmp/midas-slice-b-poll-ab-s3.txt
 
-sha256sum /tmp/midas-slice-a-final-{baseline,getcommandlinea}-s{1,3}.txt
+sha256sum /tmp/midas-slice-b-poll-ab-s{1,3}.txt
 ```
+
+The paired output SHA-256 values are
+`81e933a4a286bc2e3fc427374fa8f7c781bbfcb24d5f61e8872c54758f381a72`
+and `f160fea080e8e8871ee819e637af88dd2a3da0088a00d4929fe33534cc6300c6`.
 
 The formal sample SHA-256 remains
 `8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf`.
@@ -3381,3 +3377,102 @@ stub. It does not reach or prove original code or OEP, and no OEP criterion is
 claimed. Verification for this diagnostic slice is `cargo test --locked
 --all-targets` with 164 tests (146 library, 15 child diagnostic, and 3
 `trace_slot`), plus the full build and `clippy -D warnings`.
+
+## Production cooperative `Sleep` yield releases the poll
+
+Slice B moves the established release mechanism into the normal `run_loader`
+path. The production assumption is deliberately narrow: a supported finite
+main-thread `Sleep` is a cooperative yield when an unclaimed created thread
+exists. The runner completes that `Sleep`, captures the returned main CPU
+context, claims the lowest thread ID once, and starts it with its recorded
+parameter in `RCX` on a fresh zeroed 1 MiB stack plus a minimal TEB selected by
+`GS`. The child has a 100,000-instruction and 32-API bound. It runs until its
+per-runtime NX return guard, child `Sleep`, API/fault wall, or cap; main CPU
+state is then restored while guest memory, mappings, hooks, and `Win64Env`
+remain live.
+
+No poll address, instruction address, register allocation, or sample index is
+used by the scheduler. `Sleep` is the only yield trigger. The mechanism is not
+a thread-lifecycle model and does not retain the stopped child CPU state.
+
+Three observation-driven API treatments are included:
+
+- `CreateWindowExA` consumes the complete ABI frame and supports the observed
+  top-level/null-title subset only for an already registered ANSI class and
+  instance. It returns the stable opaque unmapped HWND
+  `0x0000000f30000020`, creates no window state, and does not invoke a WndProc or
+  message loop.
+- `RtlFreeHeap` accepts the modeled process heap, the supported low-`ULONG`
+  flags, and an exact live allocation base. Success removes allocation metadata
+  but does not unmap or reuse the page backing.
+- `GetCommandLineA` returns stable read-only guest storage containing the
+  host-independent process command line `C:\guest.exe`.
+
+### Normal production replay
+
+The ordinary release `run_loader` example, with no diagnostic control or
+manual child setup, leaves the repeated `Sleep` loop on both observed variants:
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---:|---:|
+| Main API at yield | call 39, `Sleep` | call 38, `Sleep` |
+| Child instructions / stop | 65,203 / `NullControlTransfer` | 64,324 / `NullControlTransfer` |
+| Child handled suffix | `... CreateWindowExA, GetProcessHeap, RtlFreeHeap` | same |
+| First restored-main API | `GetCommandLineA` | `GetCommandLineA` |
+| Main instructions after yield | 77,870 | 147,854 |
+| Production output SHA-256 | `54ce9475a7ee8eab66d9024362edc2b7ddd7606637c18f598ec566d97a39074d` | `73b781dd781cc52bc59cd26aab3039988fe51a849682ef7bf9936a1ef9ba3be1` |
+
+Each output is byte-identical across two fresh invocations. Sample 1 then
+handles two `SetCurrentDirectoryW` calls and reaches a later null control
+transfer; sample 3 handles `GetVersion`, the same two directory calls, and its
+own later null. The child null is the first newly observed post-`RtlFreeHeap`
+child wall. It occurs after the release store, because restored main reaches
+`GetCommandLineA` without another child turn. This re-validates the coarse-yield
+assumption through that boundary only; it does not establish the assumption for
+future child execution.
+
+Reproduce locally:
+
+```text
+cargo build --locked --release --example run_loader
+
+target/release/examples/run_loader \
+  samples/test_target_protected.exe 60000000 200 \
+  > /tmp/midas-slice-b-production-s1.txt
+target/release/examples/run_loader \
+  samples/test_target3_protected.exe 60000000 200 \
+  > /tmp/midas-slice-b-production-s3.txt
+
+sha256sum /tmp/midas-slice-b-production-s{1,3}.txt
+```
+
+### Durable post-release A/B check
+
+`trace_child_postmortem --poll-window` now owns a paired control: one invocation
+runs fresh 20-name target-absent and 21-name `GetCommandLineA`-present kernel32
+environments. It programmatically requires an exact 64-RIP tail match, the same
+register-call site, target register, pushed return cell, and fallthrough, and
+the sole terminal change from target zero to the reverse-mapped named stub. The
+zero consumer must also match an exact `(global instruction index, RIP)` in the
+frozen tail. The formal sample retains 64,695 instructions past its
+runtime-derived poll; sample 3 retains 69,544. This replaces manual hash
+comparison as the option-(b) invariant.
+
+The production runs do not classify either new null as original code or OEP.
+OEP detection, a general scheduler, an advancing clock, WndProc/message-loop
+dispatch, and full thread or heap lifecycle remain outside this slice. Formal
+two-sample acceptance also remains open: `samples/SAMPLES.md` records complete
+provenance only for sample 1, while samples 2 and 3 still require human-supplied
+version/config/source and pre-protection provenance.
+
+Final-tree verification is green for `cargo fmt --all -- --check`,
+`cargo build --locked --all-targets`, `cargo test --locked --all-targets` (162
+library, 17 child-diagnostic, and 3 `trace_slot` tests),
+`cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`, and
+the repository no-hype gate. Two fresh production invocations per observed
+variant are byte-identical at the SHA-256 values in the replay table. Fresh
+paired A/B artifacts retain SHA-256
+`81e933a4a286bc2e3fc427374fa8f7c781bbfcb24d5f61e8872c54758f381a72`
+for formal sample 1 and
+`f160fea080e8e8871ee819e637af88dd2a3da0088a00d4929fe33534cc6300c6`
+for incomplete-provenance sample 3.
