@@ -235,6 +235,10 @@ pub enum IndirectTransferKind {
 }
 
 /// One bounded source-to-target observation frozen before the target executes.
+///
+/// The configured watch emits this payload only when the exact target RIP has
+/// not executed since watch configuration. Target coverage persists across
+/// resume legs and CPU-context restores.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndirectTransferObservation {
     pub global_instruction_index: u64,

@@ -8,7 +8,10 @@
 use goblin::pe::section_table::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 use thiserror::Error;
 
-use crate::pe::{PeImage, Section};
+use crate::{
+    emu::{IndirectTransferKind, IndirectTransferObservation},
+    pe::{PeImage, Section},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionRegion {
@@ -311,6 +314,16 @@ impl TransferKind {
     }
 }
 
+impl From<IndirectTransferKind> for TransferKind {
+    fn from(kind: IndirectTransferKind) -> Self {
+        match kind {
+            IndirectTransferKind::Branch => Self::IndirectBranch,
+            IndirectTransferKind::Call => Self::IndirectCall,
+            IndirectTransferKind::Return => Self::Return,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferObservation {
     pub source_rip: u64,
@@ -364,6 +377,26 @@ impl OepCriterion {
             kind: observation.kind,
             source_section_index: source.section_index,
             target_section_index: target.section_index,
+        })
+    }
+
+    /// Evaluate a proof payload captured by [`crate::emu::Emu`]'s bounded
+    /// indirect-transfer watch.
+    ///
+    /// The emulator watch emits an observation only for the first entry to its
+    /// exact target RIP. Keeping that invariant at this consuming boundary
+    /// avoids implying that an arbitrary transfer has unseen-target history.
+    /// Keeping the conversion in the library also makes the production FIRE
+    /// path share the same tested mapping as the criterion.
+    pub fn evaluate_indirect_transfer_observation(
+        &self,
+        observation: &IndirectTransferObservation,
+    ) -> Option<OepCandidate> {
+        self.evaluate(TransferObservation {
+            source_rip: observation.source_rip,
+            target_rip: observation.target_rip,
+            kind: observation.kind.into(),
+            target_previously_executed: false,
         })
     }
 }
@@ -439,6 +472,7 @@ fn is_executable_code(section: &Section) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emu::{Emu, StopReason};
     use std::{fs, path::Path};
 
     const PREFERRED_BASE: u64 = 0x0000_0001_4000_0000;
@@ -526,6 +560,73 @@ mod tests {
         assert!(criterion
             .evaluate(observation(PREFERRED_BASE, TransferKind::Return))
             .is_some());
+    }
+
+    #[test]
+    fn emulator_transfer_kinds_map_without_losing_indirectness() {
+        for (emulator, criterion) in [
+            (IndirectTransferKind::Branch, TransferKind::IndirectBranch),
+            (IndirectTransferKind::Call, TransferKind::IndirectCall),
+            (IndirectTransferKind::Return, TransferKind::Return),
+        ] {
+            assert_eq!(TransferKind::from(emulator), criterion);
+        }
+    }
+
+    #[test]
+    fn real_emulator_observation_reaches_candidate_through_fire_bridge() {
+        const SOURCE: u64 = PREFERRED_BASE + 0x4000;
+        const TARGET: u64 = PREFERRED_BASE + 0x1000;
+
+        let image = protected_image();
+        let criterion = OepCriterion::new(&image, PREFERRED_BASE).unwrap();
+        let mut source_bytes = vec![0x48, 0xb8]; // mov rax, TARGET
+        source_bytes.extend_from_slice(&TARGET.to_le_bytes());
+        source_bytes.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(SOURCE, &source_bytes).unwrap();
+        emu.map_code(TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        let layout = criterion.layout();
+        let source_ranges = layout
+            .loader_executable_sections
+            .iter()
+            .map(|section| {
+                (
+                    layout.mapped_base + u64::from(section.start_rva),
+                    layout.mapped_base + u64::from(section.end_rva),
+                )
+            })
+            .collect::<Vec<_>>();
+        let target_ranges = layout
+            .original_executable_sections
+            .iter()
+            .map(|section| {
+                (
+                    layout.mapped_base + u64::from(section.start_rva),
+                    layout.mapped_base + u64::from(section.end_rva),
+                )
+            })
+            .collect::<Vec<_>>();
+        emu.configure_indirect_transfer_watch(&source_ranges, &target_ranges, false)
+            .unwrap();
+
+        let report = emu.resume(SOURCE, 16).unwrap();
+        assert_eq!(report.stop_reason, StopReason::IndirectTransferObserved);
+        let observation = emu.indirect_transfer_observation().unwrap();
+        assert_eq!(observation.kind, IndirectTransferKind::Branch);
+        assert_eq!(observation.source_rip, SOURCE + 10);
+        assert_eq!(observation.target_rip, TARGET);
+        assert_eq!(
+            criterion.evaluate_indirect_transfer_observation(&observation),
+            Some(OepCandidate {
+                rip: TARGET,
+                source_rip: SOURCE + 10,
+                kind: TransferKind::IndirectBranch,
+                source_section_index: 2,
+                target_section_index: 0,
+            })
+        );
     }
 
     #[test]

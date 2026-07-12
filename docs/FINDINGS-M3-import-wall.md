@@ -3641,6 +3641,25 @@ readable and decodable and all 18 registers must be captured before the watch
 can latch a candidate. An incomplete payload is retained as an explicit
 capture failure and `run_loader` emits no OEP candidate.
 
+Four fail-closed margins bound how a future firing should be interpreted:
+
+- The watch stops at the first edge that satisfies the runtime rule. That edge
+  is a first candidate, not proof that it is the OEP: an earlier loader
+  transfer into original code could precede the true entry, so every firing
+  still requires repeatability and disassembly adjudication.
+- The first potential source/target edge whose proof payload cannot be
+  completed retains one explicit capture failure and suppresses later
+  observations for that run. The failure is reported rather than silently
+  skipped, but the watch does not rearm automatically.
+- Layout derivation requires the rawless bridge's `PointerToRawData` to equal
+  the entry section's earlier raw-data frontier. Because that field carries no
+  raw bytes when `SizeOfRawData` is zero, a structurally equivalent variant
+  that writes zero there can fail to arm.
+- `SizeOfCode` validation currently requires exact equality with the sum of
+  each pre-boundary executable section's `VirtualSize` aligned to
+  `FileAlignment`. A producer using another accounting convention can fail to
+  arm; this is a false-negative margin, not a path to a candidate.
+
 This is criterion readiness, not M4 acceptance. Neither raised-cap production
 run below produced a qualifying observation, so both print `OEP criterion: did
 not fire`. There is no reproducible candidate RIP and therefore no candidate

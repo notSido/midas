@@ -2,8 +2,8 @@ use std::{env, fs, process};
 
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 use midas::{
-    emu::{Emu, IndirectTransferKind, IndirectTransferObservation},
-    oep::{OepCandidate, OepCriterion, TransferKind, TransferObservation},
+    emu::{Emu, IndirectTransferObservation},
+    oep::{OepCandidate, OepCriterion},
     pe::PeImage,
     win64::{run_with_cooperative_scheduler, TrapStop, Win64Env},
 };
@@ -108,10 +108,11 @@ fn run() -> Result<(), String> {
         emu.indirect_transfer_capture_failure(),
     ) {
         (Some(criterion), Some(observation), None) => {
-            let transfer = transfer_observation(&observation);
-            let candidate = criterion.evaluate(transfer).ok_or_else(|| {
-                "latched indirect transfer did not satisfy the armed OEP criterion".to_owned()
-            })?;
+            let candidate = criterion
+                .evaluate_indirect_transfer_observation(&observation)
+                .ok_or_else(|| {
+                    "latched indirect transfer did not satisfy the armed OEP criterion".to_owned()
+                })?;
             print_oep_candidate(&candidate, &observation);
         }
         (Some(_), None, Some(failure)) => println!(
@@ -144,22 +145,6 @@ fn section_va_ranges(
             Ok((start, end))
         })
         .collect()
-}
-
-fn transfer_observation(observation: &IndirectTransferObservation) -> TransferObservation {
-    let kind = match observation.kind {
-        IndirectTransferKind::Branch => TransferKind::IndirectBranch,
-        IndirectTransferKind::Call => TransferKind::IndirectCall,
-        IndirectTransferKind::Return => TransferKind::Return,
-    };
-    TransferObservation {
-        source_rip: observation.source_rip,
-        target_rip: observation.target_rip,
-        kind,
-        // The emulator watch latches only the first entry to an exact target
-        // RIP and tracks target coverage from the first guest instruction.
-        target_previously_executed: false,
-    }
 }
 
 fn print_oep_candidate(candidate: &OepCandidate, observation: &IndirectTransferObservation) {
