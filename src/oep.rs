@@ -58,7 +58,7 @@ pub enum OepLayoutError {
     EntrySectionMissingOrAmbiguous,
     #[error("the entry-point section is not executable code")]
     EntrySectionNotExecutableCode,
-    #[error("the entry-point section has no raw backing")]
+    #[error("the entry-point section has no structurally valid raw backing")]
     EntrySectionNotRawBacked,
     #[error("the entry-point section has no immediate predecessor")]
     MissingBridgeSection,
@@ -66,11 +66,11 @@ pub enum OepLayoutError {
     InvalidBridgeSection,
     #[error("the rawless bridge is not mapped-adjacent to the entry-point section")]
     BridgeNotAdjacent,
-    #[error("the bridge and entry-point sections do not begin at the earlier raw-data frontier")]
+    #[error("the bridge/entry raw pointers do not match an accepted earlier raw-data frontier convention")]
     RawFrontierMismatch,
     #[error("no pre-boundary executable code section was found")]
     NoOriginalExecutableSection,
-    #[error("a pre-boundary executable code section has no raw backing")]
+    #[error("a pre-boundary executable code section has no structurally valid raw backing")]
     OriginalExecutableNotRawBacked,
     #[error("a pre-boundary executable section is not marked as code")]
     OriginalExecutableNotCode,
@@ -87,7 +87,6 @@ struct IndexedSection<'a> {
     index: usize,
     section: &'a Section,
     declared_end: u32,
-    content_end: u32,
     mapped_end: u32,
 }
 
@@ -148,7 +147,7 @@ impl OepLayout {
             .enumerate()
             .filter_map(|(position, indexed)| {
                 (indexed.section.virtual_address <= image.entry_point_rva
-                    && image.entry_point_rva < indexed.content_end)
+                    && image.entry_point_rva < indexed.declared_end)
                     .then_some(position)
             })
             .collect::<Vec<_>>();
@@ -160,7 +159,7 @@ impl OepLayout {
         if !is_executable_code(entry.section) {
             return Err(OepLayoutError::EntrySectionNotExecutableCode);
         }
-        if entry.section.size_of_raw_data == 0 {
+        if structurally_file_backed_raw_range(entry.section, image).is_none() {
             return Err(OepLayoutError::EntrySectionNotRawBacked);
         }
 
@@ -183,8 +182,8 @@ impl OepLayout {
             .iter()
             .filter(|indexed| indexed.section.size_of_raw_data != 0)
             .map(|indexed| {
-                u64::from(indexed.section.pointer_to_raw_data)
-                    .checked_add(u64::from(indexed.section.size_of_raw_data))
+                structurally_file_backed_raw_range(indexed.section, image)
+                    .map(|(_, end)| end)
                     .ok_or(OepLayoutError::RawFrontierMismatch)
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -192,8 +191,9 @@ impl OepLayout {
             .max()
             .ok_or(OepLayoutError::RawFrontierMismatch)?;
         let entry_raw = u64::from(entry.section.pointer_to_raw_data);
+        let bridge_raw = u64::from(bridge.section.pointer_to_raw_data);
         if earlier_raw_frontier != entry_raw
-            || bridge.section.pointer_to_raw_data != entry.section.pointer_to_raw_data
+            || (bridge_raw != 0 && bridge_raw != earlier_raw_frontier)
         {
             return Err(OepLayoutError::RawFrontierMismatch);
         }
@@ -209,7 +209,7 @@ impl OepLayout {
         }
         if executable
             .iter()
-            .any(|indexed| indexed.section.size_of_raw_data == 0)
+            .any(|indexed| structurally_file_backed_raw_range(indexed.section, image).is_none())
         {
             return Err(OepLayoutError::OriginalExecutableNotRawBacked);
         }
@@ -231,7 +231,16 @@ impl OepLayout {
             return Err(OepLayoutError::BaseOfCodeMismatch);
         }
 
-        let accounted_code_size = executable.iter().try_fold(0u64, |total, indexed| {
+        // PE producers use two exact SizeOfCode accounting conventions for
+        // executable code: on-disk raw bytes, or each section's VirtualSize
+        // rounded independently to FileAlignment. These are recognized
+        // conventions, not a range or tolerance around the declared value.
+        let raw_accounted_code_size = executable.iter().try_fold(0u64, |total, indexed| {
+            total
+                .checked_add(u64::from(indexed.section.size_of_raw_data))
+                .ok_or(OepLayoutError::SizeOfCodeMismatch)
+        })?;
+        let virtual_accounted_code_size = executable.iter().try_fold(0u64, |total, indexed| {
             let aligned = align_up(
                 u64::from(indexed.section.virtual_size),
                 image.file_alignment,
@@ -241,7 +250,14 @@ impl OepLayout {
                 .checked_add(aligned)
                 .ok_or(OepLayoutError::SizeOfCodeMismatch)
         })?;
-        if accounted_code_size != u64::from(image.size_of_code) {
+        let declared_code_size = u64::from(image.size_of_code);
+        let matches_raw_convention = declared_code_size == raw_accounted_code_size;
+        // When both conventions produce the same value, treat that value as
+        // one recognized accounting result rather than two independent votes.
+        let matches_distinct_virtual_convention = virtual_accounted_code_size
+            != raw_accounted_code_size
+            && declared_code_size == virtual_accounted_code_size;
+        if !matches_raw_convention && !matches_distinct_virtual_convention {
             return Err(OepLayoutError::SizeOfCodeMismatch);
         }
 
@@ -442,7 +458,6 @@ fn indexed_section<'a>(
         index,
         section,
         declared_end,
-        content_end,
         mapped_end,
     })
 }
@@ -455,6 +470,27 @@ fn align_up(value: u64, alignment: u32) -> Option<u64> {
     } else {
         value.checked_add(alignment - remainder)
     }
+}
+
+/// Return the structurally valid file range declared by a raw-backed section.
+///
+/// `PeImage` does not retain the source file length, so this cannot establish
+/// the final EOF bound. It still rejects absent or header-aliased storage,
+/// FileAlignment violations, and a 32-bit file-range overflow.
+fn structurally_file_backed_raw_range(section: &Section, image: &PeImage) -> Option<(u64, u64)> {
+    let raw_start = section.pointer_to_raw_data;
+    let raw_size = section.size_of_raw_data;
+    if raw_start == 0
+        || raw_size == 0
+        || raw_start < image.size_of_headers
+        || raw_start.checked_rem(image.file_alignment)? != 0
+        || raw_size.checked_rem(image.file_alignment)? != 0
+    {
+        return None;
+    }
+
+    let raw_end = raw_start.checked_add(raw_size)?;
+    Some((u64::from(raw_start), u64::from(raw_end)))
 }
 
 fn is_executable(section: &Section) -> bool {
@@ -719,6 +755,18 @@ mod tests {
     }
 
     #[test]
+    fn entry_point_in_raw_tail_beyond_declared_virtual_size_is_rejected() {
+        let mut image = protected_image();
+        image.sections[3].virtual_size = 0x1000;
+        image.entry_point_rva = 0xa100;
+
+        assert_eq!(
+            OepLayout::derive(&image, PREFERRED_BASE),
+            Err(OepLayoutError::EntrySectionMissingOrAmbiguous)
+        );
+    }
+
+    #[test]
     fn section_table_order_does_not_change_relational_roles() {
         let original = protected_image();
         let mut shuffled = original.clone();
@@ -757,6 +805,27 @@ mod tests {
     }
 
     #[test]
+    fn rawless_bridge_accepts_only_zero_or_the_earlier_raw_frontier() {
+        for pointer_to_raw_data in [0, 0x1a00] {
+            let mut image = protected_image();
+            image.sections[2].pointer_to_raw_data = pointer_to_raw_data;
+
+            OepLayout::derive(&image, PREFERRED_BASE)
+                .expect("recognized rawless bridge pointer convention should derive");
+        }
+
+        for pointer_to_raw_data in [0x200, 0x1800, 0x1c00, u32::MAX] {
+            let mut image = protected_image();
+            image.sections[2].pointer_to_raw_data = pointer_to_raw_data;
+
+            assert_eq!(
+                OepLayout::derive(&image, PREFERRED_BASE),
+                Err(OepLayoutError::RawFrontierMismatch)
+            );
+        }
+    }
+
+    #[test]
     fn rejects_mutated_legacy_code_metadata() {
         let mut image = protected_image();
         image.base_of_code += 0x10;
@@ -771,6 +840,82 @@ mod tests {
             OepLayout::derive(&image, PREFERRED_BASE),
             Err(OepLayoutError::SizeOfCodeMismatch)
         );
+    }
+
+    #[test]
+    fn recognizes_only_exact_size_of_code_producer_conventions() {
+        let mut two_code_sections = protected_image();
+        two_code_sections.sections[1].characteristics = CODE_XR;
+
+        // Raw accounting is 0x1000 + 0x600. Per-section virtual accounting is
+        // align(0x1780) + align(0x600), or 0x1800 + 0x600.
+        for size_of_code in [0x1600, 0x1e00] {
+            let mut image = two_code_sections.clone();
+            image.size_of_code = size_of_code;
+
+            OepLayout::derive(&image, PREFERRED_BASE)
+                .expect("recognized exact SizeOfCode convention should derive");
+        }
+
+        for size_of_code in [0x15ff, 0x1601, 0x1800, 0x1dff, 0x1e01] {
+            let mut image = two_code_sections.clone();
+            image.size_of_code = size_of_code;
+
+            assert_eq!(
+                OepLayout::derive(&image, PREFERRED_BASE),
+                Err(OepLayoutError::SizeOfCodeMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn equal_size_of_code_conventions_collapse_to_one_exact_value() {
+        let mut image = protected_image();
+        image.sections[0].virtual_size = image.sections[0].size_of_raw_data;
+        image.size_of_code = 0x1000;
+        OepLayout::derive(&image, PREFERRED_BASE)
+            .expect("shared exact accounting value should derive");
+
+        image.size_of_code += image.file_alignment;
+        assert_eq!(
+            OepLayout::derive(&image, PREFERRED_BASE),
+            Err(OepLayoutError::SizeOfCodeMismatch)
+        );
+    }
+
+    #[test]
+    fn raw_backing_requires_all_structural_file_range_evidence_available() {
+        let image = protected_image();
+        assert_eq!(
+            structurally_file_backed_raw_range(&image.sections[0], &image),
+            Some((0x400, 0x1400))
+        );
+
+        let mut entry_without_storage = protected_image();
+        entry_without_storage.sections[3].pointer_to_raw_data = 0;
+        assert_eq!(
+            OepLayout::derive(&entry_without_storage, PREFERRED_BASE),
+            Err(OepLayoutError::EntrySectionNotRawBacked)
+        );
+
+        let mut original_without_storage = protected_image();
+        original_without_storage.sections[0].size_of_raw_data = 0;
+        assert_eq!(
+            OepLayout::derive(&original_without_storage, PREFERRED_BASE),
+            Err(OepLayoutError::OriginalExecutableNotRawBacked)
+        );
+
+        for (pointer_to_raw_data, size_of_raw_data) in [
+            (0x200, 0x1000),
+            (0x401, 0x1000),
+            (0x400, 0x1001),
+            (0xffff_fe00, 0x200),
+        ] {
+            let mut section = image.sections[0].clone();
+            section.pointer_to_raw_data = pointer_to_raw_data;
+            section.size_of_raw_data = size_of_raw_data;
+            assert_eq!(structurally_file_backed_raw_range(&section, &image), None);
+        }
     }
 
     #[test]

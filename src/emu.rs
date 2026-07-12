@@ -105,6 +105,28 @@ pub enum EmuError {
         source: uc_error,
     },
 
+    #[error("failed to unmap memory at 0x{addr:016x} ({size:#x} bytes): {source}")]
+    Unmap {
+        addr: u64,
+        size: u64,
+        #[source]
+        source: uc_error,
+    },
+
+    #[error("failed to protect memory at 0x{addr:016x} ({size:#x} bytes): {source}")]
+    Protect {
+        addr: u64,
+        size: u64,
+        #[source]
+        source: uc_error,
+    },
+
+    #[error("memory-protection range must be nonempty and page-aligned: 0x{base:016x}+{size:#x}")]
+    InvalidProtectionRange { base: u64, size: u64 },
+
+    #[error("unsupported Unicorn memory permissions {permissions:#x}")]
+    UnsupportedMemoryPermissions { permissions: u32 },
+
     #[error("failed to write memory at 0x{addr:016x} ({size:#x} bytes): {source}")]
     WriteMem {
         addr: u64,
@@ -144,6 +166,13 @@ pub enum EmuError {
         source: uc_error,
     },
 
+    #[error("register {reg:?} returned {actual} bytes, expected {expected}")]
+    UnexpectedRegisterWidth {
+        reg: RegisterX86,
+        actual: usize,
+        expected: usize,
+    },
+
     #[error(
         "failed to start emulation at 0x{begin:016x} until 0x{until:016x} with count {count}: {source}"
     )]
@@ -174,6 +203,47 @@ pub enum EmuError {
         maximum: usize,
     },
 
+    #[error("no indirect-transfer watch is configured")]
+    IndirectTransferWatchNotConfigured,
+
+    #[error("the indirect-transfer watch has no complete latched observation to rearm")]
+    IndirectTransferWatchNotLatched,
+
+    #[error(
+        "the indirect-transfer watch has a complete observation awaiting explicit disposition"
+    )]
+    IndirectTransferObservationLatched,
+
+    #[error(
+        "the indirect-transfer watch is frozen on an incomplete capture and cannot be rearmed"
+    )]
+    IndirectTransferCaptureFailureLatched,
+
+    #[error("the supplied indirect-transfer observation does not match the latched observation")]
+    IndirectTransferObservationMismatch,
+
+    #[error(
+        "cannot rearm an indirect-transfer observation at target 0x{target:016x} while RIP is 0x{current_rip:016x}"
+    )]
+    IndirectTransferRearmRipMismatch { current_rip: u64, target: u64 },
+
+    #[error(
+        "cannot rearm an indirect-transfer observation after register {reg:?} changed from 0x{expected:016x} to 0x{actual:016x}"
+    )]
+    IndirectTransferRearmRegisterMismatch {
+        reg: RegisterX86,
+        expected: u64,
+        actual: u64,
+    },
+
+    #[error(
+        "cannot rearm an indirect-transfer observation after target bytes changed at 0x{target:016x}"
+    )]
+    IndirectTransferRearmTargetBytesMismatch { target: u64 },
+
+    #[error("the indirect-transfer watch failed to stop emulation at its latched edge")]
+    IndirectTransferStopRequestFailed,
+
     #[error("address range overflows: base 0x{base:016x}, size {size:#x}")]
     AddressRangeOverflow { base: u64, size: u64 },
 
@@ -201,6 +271,45 @@ pub enum FaultKind {
     Other,
 }
 
+/// Page permissions that can be represented by both Unicorn and the bounded
+/// Win64 `VirtualProtect` model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageProtection {
+    NoAccess,
+    ReadOnly,
+    ReadWrite,
+    Execute,
+    ExecuteRead,
+    ExecuteReadWrite,
+}
+
+impl PageProtection {
+    fn from_unicorn_permissions(permissions: u32) -> Result<Self, EmuError> {
+        match permissions {
+            value if value == Prot::NONE.0 => Ok(Self::NoAccess),
+            value if value == Prot::READ.0 => Ok(Self::ReadOnly),
+            value if value == (Prot::READ | Prot::WRITE).0 => Ok(Self::ReadWrite),
+            value if value == Prot::EXEC.0 => Ok(Self::Execute),
+            value if value == (Prot::READ | Prot::EXEC).0 => Ok(Self::ExecuteRead),
+            value if value == (Prot::READ | Prot::WRITE | Prot::EXEC).0 => {
+                Ok(Self::ExecuteReadWrite)
+            }
+            permissions => Err(EmuError::UnsupportedMemoryPermissions { permissions }),
+        }
+    }
+
+    fn unicorn_permissions(self) -> Prot {
+        match self {
+            Self::NoAccess => Prot::NONE,
+            Self::ReadOnly => Prot::READ,
+            Self::ReadWrite => Prot::READ | Prot::WRITE,
+            Self::Execute => Prot::EXEC,
+            Self::ExecuteRead => Prot::READ | Prot::EXEC,
+            Self::ExecuteReadWrite => Prot::READ | Prot::WRITE | Prot::EXEC,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemFault {
     pub kind: FaultKind,
@@ -212,6 +321,8 @@ pub enum StopReason {
     ReachedInstructionCap,
     ReachedUntil,
     IndirectTransferObserved,
+    IndirectTransferCaptureFailed,
+    IndirectTransferStopFailed,
     MemoryFault(MemFault),
     InvalidInstruction,
     Other(String),
@@ -368,6 +479,7 @@ struct IndirectTransferWatch {
     previous: Option<PreviousInstruction>,
     observation: Option<IndirectTransferObservation>,
     capture_failure: Option<IndirectTransferCaptureFailure>,
+    stop_request_failed: bool,
 }
 
 /// An opaque, reusable snapshot of Unicorn CPU state owned by one [`Emu`].
@@ -500,6 +612,78 @@ impl Emu {
         Ok(())
     }
 
+    /// Unmap an exact guest range after validating its address arithmetic.
+    ///
+    /// This is a raw emulator primitive and does not change any Win64-owned
+    /// allocation metadata.
+    pub fn unmap(&mut self, base: u64, size: u64) -> Result<(), EmuError> {
+        checked_end(base, size)?;
+        self.uc
+            .mem_unmap(base, size)
+            .map_err(|source| EmuError::Unmap {
+                addr: base,
+                size,
+                source,
+            })
+    }
+
+    /// Return the protection of the first page when an entire page-aligned
+    /// range is mapped. An unmapped gap returns `Ok(None)`.
+    pub(crate) fn page_range_protection(
+        &self,
+        base: u64,
+        size: u64,
+    ) -> Result<Option<PageProtection>, EmuError> {
+        if size == 0 || !base.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) {
+            return Err(EmuError::InvalidProtectionRange { base, size });
+        }
+        let end = checked_end(base, size)?;
+        let regions = self.uc.mem_regions().map_err(EmuError::MemoryRegions)?;
+        let mut cursor = base;
+        let mut first_protection = None;
+        while cursor < end {
+            let Some(region) = regions
+                .iter()
+                .find(|region| region.begin <= cursor && cursor <= region.end)
+            else {
+                return Ok(None);
+            };
+            let current = PageProtection::from_unicorn_permissions(region.perms)?;
+            first_protection.get_or_insert(current);
+            let region_end = region
+                .end
+                .checked_add(1)
+                .ok_or(EmuError::AddressRangeOverflow { base, size })?;
+            cursor = end.min(region_end);
+        }
+
+        Ok(first_protection)
+    }
+
+    /// Change one complete page-aligned mapped range and return the previous
+    /// protection of its first page. An unmapped gap returns `Ok(None)` without
+    /// changing any page. This is a raw emulator primitive and does not attach
+    /// Win64 allocation semantics to the range.
+    pub(crate) fn protect_pages(
+        &mut self,
+        base: u64,
+        size: u64,
+        protection: PageProtection,
+    ) -> Result<Option<PageProtection>, EmuError> {
+        let Some(first_protection) = self.page_range_protection(base, size)? else {
+            return Ok(None);
+        };
+
+        self.uc
+            .mem_protect(base, size, protection.unicorn_permissions())
+            .map_err(|source| EmuError::Protect {
+                addr: base,
+                size,
+                source,
+            })?;
+        Ok(Some(first_protection))
+    }
+
     pub fn map_image(
         &mut self,
         image: &pe::PeImage,
@@ -619,6 +803,61 @@ impl Emu {
             .map_err(|source| EmuError::ReadReg { reg, source })
     }
 
+    /// Read one 128-bit register without truncating it through the scalar
+    /// Unicorn register API.
+    pub(crate) fn read_reg_128(&self, reg: RegisterX86) -> Result<[u8; 16], EmuError> {
+        let value = self
+            .uc
+            .reg_read_long(reg)
+            .map_err(|source| EmuError::ReadReg { reg, source })?;
+        value
+            .as_ref()
+            .try_into()
+            .map_err(|_| EmuError::UnexpectedRegisterWidth {
+                reg,
+                actual: value.len(),
+                expected: 16,
+            })
+    }
+
+    /// Write one complete 128-bit register without scalar truncation.
+    pub(crate) fn write_reg_128(
+        &mut self,
+        reg: RegisterX86,
+        value: &[u8; 16],
+    ) -> Result<(), EmuError> {
+        self.uc
+            .reg_write_long(reg, value)
+            .map_err(|source| EmuError::WriteReg { reg, source })
+    }
+
+    /// Read one x87 80-bit data register without truncation.
+    pub(crate) fn read_reg_80(&self, reg: RegisterX86) -> Result<[u8; 10], EmuError> {
+        let value = self
+            .uc
+            .reg_read_long(reg)
+            .map_err(|source| EmuError::ReadReg { reg, source })?;
+        value
+            .as_ref()
+            .try_into()
+            .map_err(|_| EmuError::UnexpectedRegisterWidth {
+                reg,
+                actual: value.len(),
+                expected: 10,
+            })
+    }
+
+    /// Write one complete x87 80-bit data register.
+    pub(crate) fn write_reg_80(
+        &mut self,
+        reg: RegisterX86,
+        value: &[u8; 10],
+    ) -> Result<(), EmuError> {
+        self.uc
+            .reg_write_long(reg, value)
+            .map_err(|source| EmuError::WriteReg { reg, source })
+    }
+
     /// Return the monotonically increasing count of guest instructions run by
     /// this emulator across every resume leg and CPU-context restore.
     ///
@@ -633,10 +872,11 @@ impl Emu {
     /// address into any `target_ranges` address through an indirect branch,
     /// return, or (when requested) indirect call.
     ///
-    /// Ranges are half-open. Coverage and a latched observation persist across
-    /// resume legs and CPU-context restores, while predecessor continuity is
-    /// deliberately reset at each host-driven resume boundary. Reconfiguring
-    /// replaces all prior watch state.
+    /// Ranges are half-open. Coverage and a latched terminal state persist
+    /// across resume legs and CPU-context restores, while predecessor
+    /// continuity is deliberately reset at each host-driven resume boundary.
+    /// An idle watch may be replaced, but a latched observation, capture
+    /// failure, or stop failure requires a fresh emulator run.
     pub fn configure_indirect_transfer_watch(
         &mut self,
         source_ranges: &[(u64, u64)],
@@ -646,6 +886,18 @@ impl Emu {
         validate_indirect_transfer_ranges("source", source_ranges)?;
         validate_indirect_transfer_ranges("target", target_ranges)?;
 
+        if let Some(watch) = self.uc.get_data().indirect_transfer_watch.as_ref() {
+            if watch.capture_failure.is_some() {
+                return Err(EmuError::IndirectTransferCaptureFailureLatched);
+            }
+            if watch.stop_request_failed {
+                return Err(EmuError::IndirectTransferStopRequestFailed);
+            }
+            if watch.observation.is_some() {
+                return Err(EmuError::IndirectTransferObservationLatched);
+            }
+        }
+
         self.uc.get_data_mut().indirect_transfer_watch = Some(IndirectTransferWatch {
             source_ranges: source_ranges.to_vec(),
             target_ranges: target_ranges.to_vec(),
@@ -654,8 +906,89 @@ impl Emu {
             previous: None,
             observation: None,
             capture_failure: None,
+            stop_request_failed: false,
         });
         self.uc.get_data_mut().indirect_transfer_stop_requested = false;
+        Ok(())
+    }
+
+    /// Rearm after the caller has explicitly adjudicated one complete
+    /// observation as not being the OEP.
+    ///
+    /// Unlike [`Self::configure_indirect_transfer_watch`], this transition
+    /// preserves every target RIP seen before the firing. The supplied payload
+    /// must exactly match the retained observation, and execution must still be
+    /// stopped at its not-yet-executed target with the captured registers and
+    /// target bytes unchanged. Incomplete captures deliberately cannot be
+    /// bypassed: their missing proof payload must be fixed and the run restarted
+    /// instead.
+    pub fn rearm_indirect_transfer_watch_after_refuted(
+        &mut self,
+        expected: &IndirectTransferObservation,
+    ) -> Result<(), EmuError> {
+        let watch = self
+            .uc
+            .get_data()
+            .indirect_transfer_watch
+            .as_ref()
+            .ok_or(EmuError::IndirectTransferWatchNotConfigured)?;
+        if watch.capture_failure.is_some() {
+            return Err(EmuError::IndirectTransferCaptureFailureLatched);
+        }
+        if watch.stop_request_failed {
+            return Err(EmuError::IndirectTransferStopRequestFailed);
+        }
+        let observation = watch
+            .observation
+            .as_ref()
+            .ok_or(EmuError::IndirectTransferWatchNotLatched)?
+            .clone();
+        if &observation != expected {
+            return Err(EmuError::IndirectTransferObservationMismatch);
+        }
+        if !self.uc.get_data().indirect_transfer_stop_requested {
+            return Err(EmuError::IndirectTransferWatchNotLatched);
+        }
+
+        let current_rip =
+            self.uc
+                .reg_read(RegisterX86::RIP)
+                .map_err(|source| EmuError::ReadReg {
+                    reg: RegisterX86::RIP,
+                    source,
+                })?;
+        if current_rip != observation.target_rip {
+            return Err(EmuError::IndirectTransferRearmRipMismatch {
+                current_rip,
+                target: observation.target_rip,
+            });
+        }
+        for &(reg, expected) in &observation.registers {
+            let actual = self.read_reg(reg)?;
+            if actual != expected {
+                return Err(EmuError::IndirectTransferRearmRegisterMismatch {
+                    reg,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        if self.read_mem(observation.target_rip, observation.target_bytes.len())?
+            != observation.target_bytes
+        {
+            return Err(EmuError::IndirectTransferRearmTargetBytesMismatch {
+                target: observation.target_rip,
+            });
+        }
+
+        let data = self.uc.get_data_mut();
+        let watch = data
+            .indirect_transfer_watch
+            .as_mut()
+            .ok_or(EmuError::IndirectTransferWatchNotConfigured)?;
+        watch.observation = None;
+        watch.previous = None;
+        data.indirect_transfer_stop_requested = false;
         Ok(())
     }
 
@@ -745,7 +1078,26 @@ impl Emu {
         if bytes.is_empty() {
             return Ok(());
         }
-        let size = bytes.len();
+        self.preflight_write_mem(addr, bytes.len())?;
+        self.uc
+            .mem_write(addr, bytes)
+            .map_err(|source| EmuError::WriteMem {
+                addr,
+                size: bytes.len(),
+                source,
+            })
+    }
+
+    /// Validate that an entire guest range is mapped writable without changing
+    /// guest memory.
+    ///
+    /// This supports API implementations with multiple output buffers: every
+    /// range can be checked before the first write, avoiding a partial update
+    /// when a later pointer crosses an unmapped or protected boundary.
+    pub fn preflight_write_mem(&self, addr: u64, size: usize) -> Result<(), EmuError> {
+        if size == 0 {
+            return Ok(());
+        }
         let size_u64 = u64::try_from(size).map_err(|_| EmuError::CodeTooLarge)?;
         let end = addr
             .checked_add(size_u64 - 1)
@@ -774,13 +1126,7 @@ impl Emu {
                     size: size_u64,
                 })?;
         }
-        self.uc
-            .mem_write(addr, bytes)
-            .map_err(|source| EmuError::WriteMem {
-                addr,
-                size: bytes.len(),
-                source,
-            })
+        Ok(())
     }
 
     fn write_u64(&mut self, addr: u64, value: u64) -> Result<(), EmuError> {
@@ -788,6 +1134,7 @@ impl Emu {
     }
 
     pub fn run(&mut self, begin: u64, until: u64, count: usize) -> Result<(), EmuError> {
+        self.ensure_indirect_transfer_watch_can_run()?;
         self.reset_indirect_transfer_leg();
         self.uc
             .emu_start(begin, until, 0, count)
@@ -805,6 +1152,7 @@ impl Emu {
     /// current run slice.
     pub fn resume(&mut self, begin: u64, max_instructions: u64) -> Result<RunReport, EmuError> {
         self.ensure_observation_hooks()?;
+        self.ensure_indirect_transfer_watch_can_run()?;
 
         let count =
             usize::try_from(max_instructions).map_err(|_| EmuError::InstructionCapTooLarge {
@@ -915,6 +1263,7 @@ impl Emu {
         ranges: &[(u64, u64)],
         hit_cap: usize,
     ) -> Result<(RunReport, Vec<WatchHit>), EmuError> {
+        self.ensure_indirect_transfer_watch_can_run()?;
         let count =
             usize::try_from(max_instructions).map_err(|_| EmuError::InstructionCapTooLarge {
                 count: max_instructions,
@@ -1001,6 +1350,7 @@ impl Emu {
         max_instructions: u64,
         trace_window: u64,
     ) -> Result<(RunReport, Vec<TraceEvent>), EmuError> {
+        self.ensure_indirect_transfer_watch_can_run()?;
         let count =
             usize::try_from(max_instructions).map_err(|_| EmuError::InstructionCapTooLarge {
                 count: max_instructions,
@@ -1111,8 +1461,28 @@ impl Emu {
     ) -> Result<RunReport, EmuError> {
         let instructions_executed = self.uc.get_data().instr_count;
         let stop_reason = match run_result {
+            _ if self
+                .uc
+                .get_data()
+                .indirect_transfer_watch
+                .as_ref()
+                .is_some_and(|watch| watch.stop_request_failed) =>
+            {
+                StopReason::IndirectTransferStopFailed
+            }
             Ok(()) if self.uc.get_data().indirect_transfer_stop_requested => {
-                StopReason::IndirectTransferObserved
+                self.uc.get_data().indirect_transfer_watch.as_ref().map_or(
+                    StopReason::IndirectTransferStopFailed,
+                    |watch| {
+                        if watch.observation.is_some() {
+                            StopReason::IndirectTransferObserved
+                        } else if watch.capture_failure.is_some() {
+                            StopReason::IndirectTransferCaptureFailed
+                        } else {
+                            StopReason::IndirectTransferStopFailed
+                        }
+                    },
+                )
             }
             Ok(()) => {
                 if instructions_executed >= max_instructions {
@@ -1207,6 +1577,22 @@ impl Emu {
         if let Some(watch) = data.indirect_transfer_watch.as_mut() {
             watch.previous = None;
         }
+    }
+
+    fn ensure_indirect_transfer_watch_can_run(&self) -> Result<(), EmuError> {
+        let Some(watch) = self.uc.get_data().indirect_transfer_watch.as_ref() else {
+            return Ok(());
+        };
+        if watch.capture_failure.is_some() {
+            return Err(EmuError::IndirectTransferCaptureFailureLatched);
+        }
+        if watch.stop_request_failed {
+            return Err(EmuError::IndirectTransferStopRequestFailed);
+        }
+        if watch.observation.is_some() {
+            return Err(EmuError::IndirectTransferObservationLatched);
+        }
+        Ok(())
     }
 
     fn ensure_persistent_watch_hook(&mut self) -> Result<(), EmuError> {
@@ -1347,11 +1733,11 @@ fn retain_indirect_transfer_capture_failure(
     previous: PreviousInstruction,
     target_rip: u64,
     reason: IndirectTransferCaptureFailureReason,
-) {
+) -> bool {
     let global_instruction_index = uc.get_data().total_instr_count;
     let data = uc.get_data_mut();
     let Some(watch) = data.indirect_transfer_watch.as_mut() else {
-        return;
+        return false;
     };
     if watch.observation.is_none() && watch.capture_failure.is_none() {
         watch.capture_failure = Some(IndirectTransferCaptureFailure {
@@ -1360,6 +1746,30 @@ fn retain_indirect_transfer_capture_failure(
             target_rip,
             reason,
         });
+        return true;
+    }
+    false
+}
+
+fn request_indirect_transfer_stop(uc: &mut Unicorn<'_, EmuData>) {
+    match uc.emu_stop() {
+        Ok(()) => uc.get_data_mut().indirect_transfer_stop_requested = true,
+        Err(_) => {
+            if let Some(watch) = uc.get_data_mut().indirect_transfer_watch.as_mut() {
+                watch.stop_request_failed = true;
+            }
+        }
+    }
+}
+
+fn retain_indirect_transfer_capture_failure_and_stop(
+    uc: &mut Unicorn<'_, EmuData>,
+    previous: PreviousInstruction,
+    target_rip: u64,
+    reason: IndirectTransferCaptureFailureReason,
+) {
+    if retain_indirect_transfer_capture_failure(uc, previous, target_rip, reason) {
+        request_indirect_transfer_stop(uc);
     }
 }
 
@@ -1401,7 +1811,7 @@ fn observe_indirect_transfer(uc: &mut Unicorn<'_, EmuData>, address: u64, size: 
     // are frozen by this hook before the target instruction executes.
     let source_bytes = read_code_bytes(uc, previous.address, previous.size as usize);
     if source_bytes.len() != previous.size as usize {
-        retain_indirect_transfer_capture_failure(
+        retain_indirect_transfer_capture_failure_and_stop(
             uc,
             previous,
             address,
@@ -1412,7 +1822,7 @@ fn observe_indirect_transfer(uc: &mut Unicorn<'_, EmuData>, address: u64, size: 
     let Some(source_flow_control) =
         decode_exact_flow_control(previous.address, previous.size, &source_bytes)
     else {
-        retain_indirect_transfer_capture_failure(
+        retain_indirect_transfer_capture_failure_and_stop(
             uc,
             previous,
             address,
@@ -1432,7 +1842,7 @@ fn observe_indirect_transfer(uc: &mut Unicorn<'_, EmuData>, address: u64, size: 
 
     let target_exact_bytes = read_code_bytes(uc, address, size as usize);
     if target_exact_bytes.len() != size as usize {
-        retain_indirect_transfer_capture_failure(
+        retain_indirect_transfer_capture_failure_and_stop(
             uc,
             previous,
             address,
@@ -1441,7 +1851,7 @@ fn observe_indirect_transfer(uc: &mut Unicorn<'_, EmuData>, address: u64, size: 
         return;
     }
     if decode_exact_flow_control(address, size, &target_exact_bytes).is_none() {
-        retain_indirect_transfer_capture_failure(
+        retain_indirect_transfer_capture_failure_and_stop(
             uc,
             previous,
             address,
@@ -1451,7 +1861,7 @@ fn observe_indirect_transfer(uc: &mut Unicorn<'_, EmuData>, address: u64, size: 
     }
     let registers = snapshot_registers(uc);
     if registers.len() != REGISTER_SNAPSHOT_ORDER.len() {
-        retain_indirect_transfer_capture_failure(
+        retain_indirect_transfer_capture_failure_and_stop(
             uc,
             previous,
             address,
@@ -1480,8 +1890,7 @@ fn observe_indirect_transfer(uc: &mut Unicorn<'_, EmuData>, address: u64, size: 
         return;
     }
     watch.observation = Some(observation);
-    data.indirect_transfer_stop_requested = true;
-    let _ = uc.emu_stop();
+    request_indirect_transfer_stop(uc);
 }
 
 fn read_hook_value(uc: &Unicorn<'_, EmuData>, address: u64, size: usize) -> u64 {
@@ -1702,11 +2111,12 @@ mod tests {
 
     use super::{
         access_overlaps_ranges, map_region, read_hook_value_opt,
-        retain_indirect_transfer_capture_failure, write_hook_value_opt, Emu, EmuError, FaultKind,
-        IndirectTransferCaptureFailure, IndirectTransferCaptureFailureReason, IndirectTransferKind,
-        PreviousInstruction, RegisterX86, StopReason, TraceEvent, PAGE_SIZE, PEB_BASE,
-        PEB_IMAGEBASE_OFFSET, RECENT_RIPS_CAP, REGISTER_SNAPSHOT_ORDER, STACK_BASE, STACK_SIZE,
-        TEB_BASE, TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_STACKBASE_OFFSET,
+        retain_indirect_transfer_capture_failure_and_stop, write_hook_value_opt, Emu, EmuError,
+        FaultKind, IndirectTransferCaptureFailure, IndirectTransferCaptureFailureReason,
+        IndirectTransferKind, IndirectTransferObservation, PageProtection, PreviousInstruction,
+        RegisterX86, StopReason, TraceEvent, PAGE_SIZE, PEB_BASE, PEB_IMAGEBASE_OFFSET,
+        RECENT_RIPS_CAP, REGISTER_SNAPSHOT_ORDER, STACK_BASE, STACK_SIZE, TEB_BASE, TEB_PEB_OFFSET,
+        TEB_SELF_OFFSET, TEB_STACKBASE_OFFSET,
     };
     use unicorn_engine::unicorn_const::Prot;
 
@@ -2116,6 +2526,85 @@ mod tests {
     }
 
     #[test]
+    fn unmap_removes_exact_pages_and_checks_address_overflow() {
+        let mut emu = Emu::new().unwrap();
+        let base = 0x0000_0000_0710_0000;
+        emu.map_zeroed_rw(base, PAGE_SIZE * 2).unwrap();
+        emu.write_mem(base, &[0xa5; 16]).unwrap();
+        emu.write_mem(base + PAGE_SIZE, &[0x5a; 16]).unwrap();
+
+        emu.unmap(base, PAGE_SIZE).unwrap();
+        assert!(emu.read_mem(base, 1).is_err());
+        assert_eq!(emu.read_mem(base + PAGE_SIZE, 16).unwrap(), vec![0x5a; 16]);
+        assert!(matches!(
+            emu.unmap(u64::MAX - PAGE_SIZE + 1, PAGE_SIZE),
+            Err(EmuError::AddressRangeOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn protect_pages_changes_complete_ranges_and_reports_first_page() {
+        let mut emu = Emu::new().unwrap();
+        let base = 0x0000_0000_0720_0000;
+        map_region(&mut emu.uc, base, PAGE_SIZE, Prot::READ | Prot::EXEC).unwrap();
+        map_region(
+            &mut emu.uc,
+            base + PAGE_SIZE,
+            PAGE_SIZE,
+            Prot::READ | Prot::EXEC,
+        )
+        .unwrap();
+
+        assert_eq!(
+            emu.protect_pages(base, PAGE_SIZE * 2, PageProtection::ReadWrite)
+                .unwrap(),
+            Some(PageProtection::ExecuteRead)
+        );
+        emu.write_mem(base, &[0xc3]).unwrap();
+        emu.write_mem(base + PAGE_SIZE, &[0xc3]).unwrap();
+        let report = emu.resume(base, 1).unwrap();
+        assert_eq!(
+            report.stop_reason,
+            StopReason::MemoryFault(super::MemFault {
+                kind: FaultKind::FetchProt,
+                address: base,
+            })
+        );
+
+        assert_eq!(
+            emu.protect_pages(base, PAGE_SIZE * 2, PageProtection::ExecuteRead)
+                .unwrap(),
+            Some(PageProtection::ReadWrite)
+        );
+        assert!(matches!(
+            emu.write_mem(base, &[0x90]),
+            Err(EmuError::WriteProt { .. })
+        ));
+        let report = emu.resume(base, 1).unwrap();
+        assert_eq!(report.stop_reason, StopReason::ReachedInstructionCap);
+    }
+
+    #[test]
+    fn protect_pages_rejects_bad_shapes_and_preserves_mapped_prefix_on_gap() {
+        let mut emu = Emu::new().unwrap();
+        let base = 0x0000_0000_0730_0000;
+        emu.map_zeroed_rw(base, PAGE_SIZE).unwrap();
+
+        for (address, size) in [(base + 1, PAGE_SIZE), (base, 0), (base, PAGE_SIZE - 1)] {
+            assert!(matches!(
+                emu.protect_pages(address, size, PageProtection::ReadOnly),
+                Err(EmuError::InvalidProtectionRange { .. })
+            ));
+        }
+        assert_eq!(
+            emu.protect_pages(base, PAGE_SIZE * 2, PageProtection::ReadOnly)
+                .unwrap(),
+            None
+        );
+        emu.write_mem(base, &[0xa5]).unwrap();
+    }
+
+    #[test]
     fn write_mem_rejects_readonly_mapping() {
         let mut emu = Emu::new().unwrap();
         emu.map_readonly(CODE_BASE, &[0; 8]).unwrap();
@@ -2148,6 +2637,8 @@ mod tests {
         )
         .unwrap();
         let address = base + PAGE_SIZE - 2;
+        emu.preflight_write_mem(address, 4).unwrap();
+        assert_eq!(emu.read_mem(address, 4).unwrap(), vec![0, 0, 0, 0]);
         emu.write_mem(address, &[1, 2, 3, 4]).unwrap();
         assert_eq!(emu.read_mem(address, 4).unwrap(), vec![1, 2, 3, 4]);
     }
@@ -2159,6 +2650,10 @@ mod tests {
         map_region(&mut emu.uc, base, PAGE_SIZE, Prot::READ | Prot::WRITE).unwrap();
         map_region(&mut emu.uc, base + PAGE_SIZE, PAGE_SIZE, Prot::READ).unwrap();
         let address = base + PAGE_SIZE - 2;
+        assert!(matches!(
+            emu.preflight_write_mem(address, 4),
+            Err(EmuError::WriteProt { .. })
+        ));
         assert!(matches!(
             emu.write_mem(address, &[1, 2, 3, 4]),
             Err(EmuError::WriteProt { .. })
@@ -2562,6 +3057,7 @@ mod tests {
 
         let report = emu.resume(SOURCE, 16).unwrap();
         assert_eq!(report.stop_reason, StopReason::IndirectTransferObserved);
+        assert_eq!(report.final_rip, TARGET);
         let observation = emu.indirect_transfer_observation().unwrap();
         assert_eq!(observation.global_instruction_index, 3);
         assert_eq!(observation.source_rip, SOURCE + 10);
@@ -2592,6 +3088,68 @@ mod tests {
             Some(TARGET)
         );
         assert!(emu.indirect_transfer_capture_failure().is_none());
+        let latched_before_invalid_reconfiguration = observation.clone();
+        assert!(matches!(
+            emu.configure_indirect_transfer_watch(
+                &[(SOURCE, SOURCE)],
+                &[(TARGET, TARGET + PAGE_SIZE)],
+                false,
+            ),
+            Err(EmuError::InvalidIndirectTransferWatchRange { .. })
+        ));
+        assert_eq!(
+            emu.indirect_transfer_observation(),
+            Some(latched_before_invalid_reconfiguration)
+        );
+        assert!(matches!(
+            emu.configure_indirect_transfer_watch(
+                &[(SOURCE, SOURCE + PAGE_SIZE)],
+                &[(TARGET, TARGET + PAGE_SIZE)],
+                false,
+            ),
+            Err(EmuError::IndirectTransferObservationLatched)
+        ));
+        assert_eq!(emu.indirect_transfer_observation(), Some(observation));
+        let count_before_rejected_resume = emu.total_instructions_executed();
+        assert!(matches!(
+            emu.resume(TARGET, 1),
+            Err(EmuError::IndirectTransferObservationLatched)
+        ));
+        assert_eq!(
+            emu.total_instructions_executed(),
+            count_before_rejected_resume
+        );
+    }
+
+    #[test]
+    fn indirect_transfer_rearm_rejects_missing_watch_and_idle_watch() {
+        const SOURCE: u64 = 0x0000_0000_0204_0000;
+        const TARGET: u64 = SOURCE + PAGE_SIZE;
+        let expected = IndirectTransferObservation {
+            global_instruction_index: 1,
+            source_rip: SOURCE,
+            target_rip: TARGET,
+            kind: IndirectTransferKind::Branch,
+            source_bytes: vec![0xff, 0xe0],
+            target_bytes: vec![0x90],
+            registers: Vec::new(),
+        };
+
+        let mut emu = Emu::new().unwrap();
+        assert!(matches!(
+            emu.rearm_indirect_transfer_watch_after_refuted(&expected),
+            Err(EmuError::IndirectTransferWatchNotConfigured)
+        ));
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + PAGE_SIZE)],
+            &[(TARGET, TARGET + PAGE_SIZE)],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            emu.rearm_indirect_transfer_watch_after_refuted(&expected),
+            Err(EmuError::IndirectTransferWatchNotLatched)
+        ));
     }
 
     #[test]
@@ -2628,7 +3186,145 @@ mod tests {
     }
 
     #[test]
-    fn indirect_transfer_watch_retains_and_resets_explicit_capture_failure() {
+    fn indirect_transfer_watch_rearms_exact_refuted_observation_without_losing_coverage() {
+        const SOURCE: u64 = 0x0000_0000_0208_0000;
+        const SECOND_SOURCE: u64 = SOURCE + 0x20;
+        const THIRD_SOURCE: u64 = SOURCE + 0x40;
+        const PRESEEN_TARGET: u64 = SOURCE + 0x2000;
+        const FIRST_TARGET: u64 = SOURCE + 0x4000;
+        const SECOND_TARGET: u64 = SOURCE + 0x6000;
+
+        let mut source = vec![0x48, 0xb8]; // mov rax, FIRST_TARGET
+        source.extend_from_slice(&FIRST_TARGET.to_le_bytes());
+        source.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        source.resize((SECOND_SOURCE - SOURCE) as usize, 0x90);
+        source.extend_from_slice(&[0x48, 0xb8]); // mov rax, PRESEEN_TARGET
+        source.extend_from_slice(&PRESEEN_TARGET.to_le_bytes());
+        source.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        source.resize((THIRD_SOURCE - SOURCE) as usize, 0x90);
+        source.extend_from_slice(&[0x48, 0xb8]); // mov rax, SECOND_TARGET
+        source.extend_from_slice(&SECOND_TARGET.to_le_bytes());
+        source.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+
+        let first_fallthrough = FIRST_TARGET + 5;
+        let displacement = i32::try_from(SECOND_SOURCE as i64 - first_fallthrough as i64).unwrap();
+        let mut first_target = vec![0xe9]; // jmp SECOND_SOURCE
+        first_target.extend_from_slice(&displacement.to_le_bytes());
+
+        let preseen_fallthrough = PRESEEN_TARGET + 5;
+        let displacement = i32::try_from(THIRD_SOURCE as i64 - preseen_fallthrough as i64).unwrap();
+        let mut preseen_target = vec![0xe9]; // jmp THIRD_SOURCE
+        preseen_target.extend_from_slice(&displacement.to_le_bytes());
+
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(SOURCE, &source).unwrap();
+        emu.map_code(PRESEEN_TARGET, &preseen_target).unwrap();
+        emu.map_code(FIRST_TARGET, &first_target).unwrap();
+        emu.map_code(SECOND_TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + PAGE_SIZE)],
+            &[
+                (PRESEEN_TARGET, PRESEEN_TARGET + PAGE_SIZE),
+                (FIRST_TARGET, FIRST_TARGET + PAGE_SIZE),
+                (SECOND_TARGET, SECOND_TARGET + PAGE_SIZE),
+            ],
+            false,
+        )
+        .unwrap();
+
+        // Coverage begins at watch configuration, not at the first firing.
+        // Enter this target at a host resume boundary so it is seen without a
+        // source edge, then start the actual source leg independently.
+        assert_eq!(
+            emu.resume(PRESEEN_TARGET, 1).unwrap().stop_reason,
+            StopReason::ReachedInstructionCap
+        );
+
+        let first_report = emu.resume(SOURCE, 64).unwrap();
+        assert_eq!(
+            first_report.stop_reason,
+            StopReason::IndirectTransferObserved
+        );
+        let first = emu.indirect_transfer_observation().unwrap();
+        assert_eq!(first.target_rip, FIRST_TARGET);
+        assert!(emu
+            .uc
+            .get_data()
+            .indirect_transfer_watch
+            .as_ref()
+            .unwrap()
+            .executed_target_rips
+            .contains(&FIRST_TARGET));
+
+        let mut mismatch = first.clone();
+        mismatch.target_rip = SECOND_TARGET;
+        assert!(matches!(
+            emu.rearm_indirect_transfer_watch_after_refuted(&mismatch),
+            Err(EmuError::IndirectTransferObservationMismatch)
+        ));
+        assert_eq!(emu.indirect_transfer_observation(), Some(first.clone()));
+
+        let captured_rax = first
+            .registers
+            .iter()
+            .find_map(|(register, value)| (*register == RegisterX86::RAX).then_some(*value))
+            .unwrap();
+        emu.write_reg(RegisterX86::RAX, captured_rax ^ 1).unwrap();
+        assert!(matches!(
+            emu.rearm_indirect_transfer_watch_after_refuted(&first),
+            Err(EmuError::IndirectTransferRearmRegisterMismatch {
+                reg: RegisterX86::RAX,
+                ..
+            })
+        ));
+        assert_eq!(emu.indirect_transfer_observation(), Some(first.clone()));
+        emu.write_reg(RegisterX86::RAX, captured_rax).unwrap();
+
+        emu.uc.mem_write(FIRST_TARGET, &[0x90]).unwrap();
+        assert!(matches!(
+            emu.rearm_indirect_transfer_watch_after_refuted(&first),
+            Err(EmuError::IndirectTransferRearmTargetBytesMismatch {
+                target: FIRST_TARGET
+            })
+        ));
+        assert_eq!(emu.indirect_transfer_observation(), Some(first.clone()));
+        emu.uc.mem_write(FIRST_TARGET, &[0xe9]).unwrap();
+
+        emu.write_reg(RegisterX86::RIP, SOURCE).unwrap();
+        assert_eq!(
+            emu.rearm_indirect_transfer_watch_after_refuted(&first)
+                .unwrap_err()
+                .to_string(),
+            EmuError::IndirectTransferRearmRipMismatch {
+                current_rip: SOURCE,
+                target: FIRST_TARGET,
+            }
+            .to_string()
+        );
+        emu.write_reg(RegisterX86::RIP, FIRST_TARGET).unwrap();
+        emu.rearm_indirect_transfer_watch_after_refuted(&first)
+            .unwrap();
+        assert!(emu.indirect_transfer_observation().is_none());
+        let watch = emu.uc.get_data().indirect_transfer_watch.as_ref().unwrap();
+        assert!(watch.executed_target_rips.contains(&PRESEEN_TARGET));
+        assert!(watch.executed_target_rips.contains(&FIRST_TARGET));
+
+        let second_report = emu.resume(FIRST_TARGET, 64).unwrap();
+        assert_eq!(
+            second_report.stop_reason,
+            StopReason::IndirectTransferObserved
+        );
+        let second = emu.indirect_transfer_observation().unwrap();
+        assert_eq!(second.source_rip, THIRD_SOURCE + 10);
+        assert_eq!(second.target_rip, SECOND_TARGET);
+        let watch = emu.uc.get_data().indirect_transfer_watch.as_ref().unwrap();
+        assert!(watch.executed_target_rips.contains(&PRESEEN_TARGET));
+        assert!(watch.executed_target_rips.contains(&FIRST_TARGET));
+        assert!(watch.executed_target_rips.contains(&SECOND_TARGET));
+    }
+
+    #[test]
+    fn indirect_transfer_watch_retains_capture_failure_until_emulator_restart() {
         const SOURCE: u64 = 0x0000_0000_020c_0000;
         const TARGET: u64 = SOURCE + 0x2000;
         let mut emu = Emu::new().unwrap();
@@ -2639,7 +3335,7 @@ mod tests {
         )
         .unwrap();
 
-        retain_indirect_transfer_capture_failure(
+        retain_indirect_transfer_capture_failure_and_stop(
             &mut emu.uc,
             PreviousInstruction {
                 address: SOURCE,
@@ -2658,14 +3354,44 @@ mod tests {
             })
         );
         assert!(emu.indirect_transfer_observation().is_none());
+        assert_eq!(
+            emu.build_run_report(Ok(()), 1).unwrap().stop_reason,
+            StopReason::IndirectTransferCaptureFailed
+        );
 
-        emu.configure_indirect_transfer_watch(
-            &[(SOURCE, SOURCE + PAGE_SIZE)],
-            &[(TARGET, TARGET + PAGE_SIZE)],
-            false,
-        )
-        .unwrap();
-        assert!(emu.indirect_transfer_capture_failure().is_none());
+        let dummy_observation = IndirectTransferObservation {
+            global_instruction_index: 0,
+            source_rip: SOURCE,
+            target_rip: TARGET,
+            kind: IndirectTransferKind::Branch,
+            source_bytes: vec![0xff, 0xe0],
+            target_bytes: vec![0x90],
+            registers: Vec::new(),
+        };
+        assert!(matches!(
+            emu.rearm_indirect_transfer_watch_after_refuted(&dummy_observation),
+            Err(EmuError::IndirectTransferCaptureFailureLatched)
+        ));
+
+        assert!(matches!(
+            emu.configure_indirect_transfer_watch(
+                &[(SOURCE, SOURCE + PAGE_SIZE)],
+                &[(TARGET, TARGET + PAGE_SIZE)],
+                false,
+            ),
+            Err(EmuError::IndirectTransferCaptureFailureLatched)
+        ));
+        assert!(emu.indirect_transfer_capture_failure().is_some());
+
+        let mut restarted = Emu::new().unwrap();
+        restarted
+            .configure_indirect_transfer_watch(
+                &[(SOURCE, SOURCE + PAGE_SIZE)],
+                &[(TARGET, TARGET + PAGE_SIZE)],
+                false,
+            )
+            .unwrap();
+        assert!(restarted.indirect_transfer_capture_failure().is_none());
     }
 
     #[test]

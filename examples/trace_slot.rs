@@ -272,11 +272,33 @@ fn format_stop(stop: &TrapStop) -> String {
         TrapStop::UnhandledApi { name, rva } => {
             format!("unhandled API {name} at export-stub or import rva=0x{rva:08x}")
         }
+        TrapStop::UnhandledSoftwareException { code } => {
+            format!("unhandled software exception 0x{code:08x}")
+        }
+        TrapStop::NoncontinuableContinuationAttempt { code } => {
+            format!("noncontinuable exception continuation attempt 0x{code:08x}")
+        }
+        TrapStop::InvalidVectoredExceptionDisposition { code, disposition } => {
+            format!("invalid VEH disposition 0x{disposition:08x} for exception 0x{code:08x}")
+        }
+        TrapStop::InvalidVectoredExceptionContext { code } => {
+            format!("invalid VEH context for exception 0x{code:08x}")
+        }
+        TrapStop::ExceptionContinuationObserved => {
+            "VEH changed CONTEXT.Rip before host-mediated continuation".to_owned()
+        }
+        TrapStop::IncompleteVectoredExceptionDispatch { thread_id } => {
+            format!("child {thread_id} stopped during vectored exception dispatch")
+        }
         TrapStop::UnexpectedFault { address } => {
             format!("unexpected fetch fault at 0x{address:016x}")
         }
         TrapStop::InstructionCap => "instruction cap reached".to_owned(),
         TrapStop::IndirectTransferObserved => "indirect transfer observed".to_owned(),
+        TrapStop::IndirectTransferCaptureFailed => {
+            "indirect-transfer proof capture failed".to_owned()
+        }
+        TrapStop::IndirectTransferStopFailed => "indirect-transfer hook stop failed".to_owned(),
         TrapStop::NullControlTransfer => "null control transfer".to_owned(),
         TrapStop::Other(value) => value.clone(),
     }

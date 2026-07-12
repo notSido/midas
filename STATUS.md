@@ -55,6 +55,9 @@ implemented" section describe the latest production frontier.
 | The post-`SetCurrentDirectoryW` protected near-return is a missing export result, not an original-code transfer: runtime-derived narrow controls select `GetCurrentProcess` on sample 1 and `GetCurrentThread` on sample 3, while the crossed controls preserve the zero return. | [Slice C finding, controls, and replay](docs/FINDINGS-M3-import-wall.md#slice-c-the-post-directory-null-is-a-missing-name-return-the-oep-criterion-is-armed) | M4 (groundwork) |
 | Observation-driven process/security batch: full-width current-process/thread pseudo handles; a non-debugged current-process query; deterministic no-thread-token failure; a tracked query-only process-token handle; and the observed `TokenGroups` NULL/zero size query under an explicit empty-groups policy. | Focused direct/failure-atomicity/name-resolved tests plus the raised-cap production replay in the Slice C finding | M4 (groundwork) |
 | A fail-closed OEP criterion derives raw-backed original versus loader executable-section provenance from PE layout and preserved code metadata without names, then watches for the first unseen indirect tail transfer from loader code into declared original code and freezes a decodable target instruction plus all 18 registers before target execution; an incomplete proof payload cannot emit a candidate. | `cargo test oep::` and bounded emulator/scheduler integration tests; raised-cap samples arm the criterion and report that it does not fire before the current frontier | M4 (groundwork) |
+| Refuted OEP candidates can be resumed only through an exact, content-addressed adjudication manifest: image/layout identity, execution owner, edge kind/RIPs/bytes, section identities, all 18 registers, and the external disassembly artifact must match before the emulator clears that observation while retaining target coverage; capture and stop failures remain terminal. | [Slice D rearm contract and focused mutation tests](docs/FINDINGS-M3-import-wall.md#candidate-adjudication-and-coverage-preserving-rearm) | M4 (groundwork) |
+| The raised-cap Win64 batch now supplies bounded virtual allocation/free/protection, exact tracked-handle close, bounded SID allocation/logical free, debug/VEH probes, registry/firmware/system-query shapes, a complete kernel32 names snapshot, and a minimized observed msvcrt names treatment; production advances from 36.2M to reproducible 205.5M/208.1M instruction-hook boundaries on samples 1/3. | [Slice D API/catalog evidence and deterministic release replays](docs/FINDINGS-M3-import-wall.md#slice-d-provider-validation-crosses-200-million-instructions-without-an-oep-firing) | M4 (groundwork) |
+| The current late `Sleep(50)` frontier is characterized as two independent blockers: the watched condition has no guest producer, while a downstream missing USER32 lookup is exactly `SendMessageA`; adding only that export repairs the latent slot but does not release the loop. No qualifying OEP edge or candidate was observed. | [Slice D late-loop chronology and one-name A/B](docs/FINDINGS-M3-import-wall.md#the-late-loop-has-no-observed-producer) | M4 (groundwork) |
 
 ## Not yet implemented
 
@@ -71,26 +74,31 @@ API/fault wall, or cap, then restores main. This assumption is verified only
 for the observed release turn and must be re-tested at every later child
 boundary; it is not a general scheduler claim.
 
-The current formal sample-1 production frontier is the observed
-`VirtualAlloc(NULL, 4, MEM_COMMIT, PAGE_READWRITE)` call after the child release,
-the directory calls, and the bounded process/security batch above. Sample 3
-reaches the same named call as engineering corroboration. The child still has a
-separate null after `RtlFreeHeap`; its CPU state is not retained. Samples 2 and
-3 have author-supplied matching Themida version/configuration, but their source
-and pre-protection hashes remain unavailable, so the charter's formal
-two-sample acceptance remains externally blocked. The OEP criterion is armed
-but has not fired on either raised-cap production replay.
+The current formal sample-1 production frontier is a repeated `Sleep(50)` after
+214 handled main-thread calls and 205,498,356 instruction-hook boundaries.
+Incomplete-provenance sample 3 reaches the same named frontier at 208,106,415
+boundaries. The watched late condition is initialized to zero and has no later
+guest writer in the formal replay. The child still has a separate null after
+`RtlFreeHeap`; its CPU state is not retained. Samples 2 and 3 have
+author-supplied matching Themida version/configuration, but their source and
+pre-protection hashes remain unavailable, so the charter's formal two-sample
+acceptance remains externally blocked. The OEP criterion is armed but has not
+fired on either final raised-cap replay; no candidate exists to adjudicate.
 
 The cooperative runner does not preserve a stopped child CPU context or model
 suspend/resume, termination, join/wait/signaling, DLL thread notifications,
-TLS callbacks, TEB `ClientId`, handle close/reuse, an advancing clock, security,
-inheritance, concurrency, or last-error state. `CreateWindowExA` returns only a
+TLS callbacks, TEB `ClientId`, general handle-object lifetime/reuse, an advancing
+clock, security, inheritance, concurrency, or last-error state. `CreateWindowExA` returns only a
 stable opaque HWND without window state, WndProc/message dispatch, or a message
-loop. `RtlFreeHeap` removes live allocation metadata without unmapping or reuse;
+loop. The registered WndProc is not executed in production, but bounded direct
+callback controls did not establish it as the missing late-condition producer.
+`SendMessageA` is present only as a causally required export name; no call shape
+has occurred naturally, so its semantics are not implemented. `RtlFreeHeap`
+removes live allocation metadata without unmapping or reuse;
 `GetCommandLineA` exposes only the fixed process-owned `C:\guest.exe` buffer.
 Thread impersonation, general token/group/security semantics, last-error state,
-handle closure, `RtlReAllocateHeap`, broader filesystem/module semantics, and
-general USER32 behavior remain unmodeled. The full evidence chain and current
+broader handle-closing shapes, `RtlReAllocateHeap`, broader filesystem/module
+semantics, and general USER32 behavior remain unmodeled. The full evidence chain and current
 reproducers are in `docs/FINDINGS-M3-import-wall.md`.
 
 OEP proof is not complete: no candidate has fired, so there is no reproducible

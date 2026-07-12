@@ -3641,7 +3641,11 @@ readable and decodable and all 18 registers must be captured before the watch
 can latch a candidate. An incomplete payload is retained as an explicit
 capture failure and `run_loader` emits no OEP candidate.
 
-Four fail-closed margins bound how a future firing should be interpreted:
+Four fail-closed margins bounded the Slice C checkpoint. The first two still
+govern candidate interpretation and capture failure; Slice D addresses exact
+refuted-candidate continuation. The final two describe derivation behavior at
+that checkpoint and are superseded by the exact alternatives documented in
+Slice D:
 
 - The watch stops at the first edge that satisfies the runtime rule. That edge
   is a first candidate, not proof that it is the OEP: an earlier loader
@@ -3651,11 +3655,13 @@ Four fail-closed margins bound how a future firing should be interpreted:
   completed retains one explicit capture failure and suppresses later
   observations for that run. The failure is reported rather than silently
   skipped, but the watch does not rearm automatically.
-- Layout derivation requires the rawless bridge's `PointerToRawData` to equal
+- At the Slice C checkpoint, layout derivation required the rawless bridge's
+  `PointerToRawData` to equal
   the entry section's earlier raw-data frontier. Because that field carries no
   raw bytes when `SizeOfRawData` is zero, a structurally equivalent variant
   that writes zero there can fail to arm.
-- `SizeOfCode` validation currently requires exact equality with the sum of
+- At the Slice C checkpoint, `SizeOfCode` validation required exact equality
+  with the sum of
   each pre-boundary executable section's `VirtualSize` aligned to
   `FileAlignment`. A producer using another accounting convention can fail to
   arm; this is a false-negative margin, not a path to a candidate.
@@ -3755,3 +3761,260 @@ semantics remain outside this slice. Formal two-sample acceptance also remains
 open: sample 1 has complete provenance, while sample 3 has author-supplied
 matching Themida version/configuration but still lacks source and
 pre-protection hashes. Sample 3 therefore remains engineering corroboration.
+
+## Slice D: provider validation crosses 200 million instructions without an OEP firing
+
+Slice D starts from the armed Slice C criterion and the formal-sample
+`VirtualAlloc(NULL, 4, MEM_COMMIT, PAGE_READWRITE)` wall at 36,156,143
+instruction-hook boundaries. It advances normal release production through the
+allocation, anti-analysis, provider-validation, relocation, and final image
+protection phases. The final production frontier is a repeated `Sleep(50)` at
+205,498,356 boundaries on formal sample 1 and 208,106,415 on sample 3.
+
+The OEP criterion remains armed throughout both runs and does not fire. There
+is no candidate RIP, frozen candidate register state, or candidate disassembly
+to promote or refute. The result is therefore the charter's documented-advance
+alternative, not M4 acceptance and not an OEP claim.
+
+### Criterion layout margins narrowed without weakening provenance
+
+The two structural false-negative margins recorded by Slice C are now handled
+as exact producer conventions:
+
+- A rawless bridge may declare `PointerToRawData` as zero or as the derived
+  earlier raw-data frontier. Other values still fail closed.
+- `SizeOfCode` may equal either the exact sum of pre-boundary executable raw
+  sizes or the exact sum of those sections' independently file-aligned
+  `VirtualSize` values. This is two discrete conventions, not a tolerance.
+
+Raw-backed sections must still have a nonzero pointer and size, begin outside
+the headers, obey `FileAlignment`, and have nonoverflowing file ranges. The
+entry point must be inside its section's declared `VirtualSize`; a raw tail or
+alignment padding does not establish executable-entry provenance. Focused
+tests mutate each relationship independently and retain the name-free layout
+for the deposited samples.
+
+### Candidate adjudication and coverage-preserving rearm
+
+The first-candidate margin is implemented even though production has not yet
+exercised it. When a complete main-thread indirect-transfer observation fires,
+the emulator remains stopped before the target instruction. A child observation
+is frozen and adjudicated synchronously while the child CPU context is live;
+the cooperative scheduler restores the main CPU context before the top-level
+runner returns. `run_loader` prints the runtime target bytes, bounded
+disassembly, edge bytes/kind, execution owner, section identities, global
+instruction index, and all 18 captured registers. That pending event cannot
+authorize its own continuation.
+
+A version-2 adjudication manifest may authorize at most 16 earlier candidates,
+and every entry must match all of the following:
+
+- input length and SHA-256 plus PE image/layout identity;
+- main or exact child-thread execution owner;
+- global instruction index, source/target RIPs, edge kind, and source/target
+  bytes;
+- source and target section identities and all 18 register values; and
+- `adjudication = "refuted"` plus a strict manifest-relative
+  disassembly-evidence path without root or traversal components, whose
+  lowercase SHA-256 matches that file.
+
+Only an exact match invokes `rearm_indirect_transfer_watch_after_refuted`.
+That transition verifies the emulator is still at the frozen target with the
+captured registers and target bytes unchanged, clears only the adjudicated
+observation, resets predecessor continuity, and preserves all prior target-RIP
+coverage. A mismatched or pending entry stops. Capture failures and hook-stop
+failures remain terminal for that emulator and cannot be cleared by
+reconfiguration or a manifest. The scheduler applies the same synchronous
+disposition while a child CPU context is still live.
+
+Mutation tests cover image, owner, instruction index, RIP, edge kind, bytes,
+register, section, evidence path/hash, ordering, duplicates, terminal-state,
+and coverage-preservation failures. No real candidate manifest is committed
+because no sample run produced a candidate.
+
+### Observation-driven Win64 batch
+
+The production batch implements only shapes reached by the raised-cap runs.
+Unsupported shapes remain named `UnhandledApi` boundaries or deterministic
+native-style failures as stated below.
+
+| Area | Bounded behavior added in Slice D |
+|---|---|
+| Virtual memory | `VirtualAlloc(NULL, nonzero, MEM_COMMIT, PAGE_READWRITE)` maps zeroed RW/NX pages from a deterministic 256 MiB arena. `VirtualFree(base, 0, MEM_RELEASE)` unmaps an exact live allocation. `VirtualProtect` page-rounds a complete mapped range, supports the six plain no-access/read/write/execute combinations, writes the first page's prior protection, and rejects an overlapping output before mutation. |
+| Handles and SIDs | `CloseHandle` removes exact tracked kernel handles. `AllocateAndInitializeSid` builds the requested bounded SID in a separate deterministic arena; `FreeSid` logically frees only an exact live base without reuse. The existing empty-group token policy now supports the matching four-byte `TokenGroups` retrieval as well as its size query. |
+| Debug state | `ZwQueryInformationProcess` reports no debug port and no debug object for the current process. `ZwSetInformationThread` accepts the observed current-thread hide-from-debugger request. `GetThreadContext` supports the current-thread pseudo handle with only AMD64 debug-register flags and zeroes the six requested debug registers while preserving the rest of `CONTEXT`. |
+| Vectored exceptions | `RaiseException` constructs bounded guest-visible exception/context records and walks registered handlers. Handler return, removal, invalid disposition/context, noncontinuable continuation, changed-RIP continuation, and incomplete child dispatch have explicit fail-closed stops. XMM and x87 register widths are preserved by the context treatment. |
+| Environment probes | `IsUserAnAdmin` reflects the empty-groups policy. `FindWindowA` accepts exactly one bounded printable class/title selector and reports no external window. `IsBadReadPtr` classifies only the observed four-byte range. `NtQuerySystemInformation(SystemModuleInformation)` exposes zero modeled kernel modules for the observed buffer shapes. |
+| Registry and firmware | `RegOpenKeyA(HKEY_LOCAL_MACHINE, printable-subkey, out)` exposes an empty registry and preserves the output on not-found. The exact `GetSystemFirmwareTable('RSMB', 0, NULL, 0)` query exposes no host firmware and returns zero. |
+
+Every mutating handler preflights the return frame and all required guest
+writes before committing state. Focused tests include arena exhaustion,
+overflow, page gaps, permission splits, overlapping outputs, invalid pointers,
+dirty upper register halves, repeated frees/closes/removals, and named-stub
+dispatch. The additive production-terminal diagnostic now also freezes 13
+qwords from the terminal stack and the ordered VEH registrations, rejects
+registration divergence across its fresh replay, and permits an eight-million-
+instruction bounded suffix for longer names-only controls.
+
+### Names-only provider validation
+
+The short kernel32 seed reached the loader's explicit wrong-provider path.
+`src/kernel32_exports.txt` is the complete 1,664-name snapshot derived from the
+authorized names-only `samples/kernel32.dll` support asset. It is strictly
+sorted and content-addressed in a test:
+
+```text
+SHA-256  1e76115f6f88c0acc5ec0dcb985600d7cba525b5dcf64aa20de262e1728c21a3
+bytes    34,362
+names    1,664
+```
+
+No support-DLL code or data other than export names is mapped or executed. The
+catalog reaches the exact firmware-table query at roughly 135 million
+instructions. The bounded zero result then reaches the loader's decoded
+`Wrong DLL present` error at 202,886,248 boundaries rather than an OEP edge.
+The corresponding release artifact
+`/tmp/midas-slice-d-gsft-zero-s1-run1.txt` has SHA-256
+`107e493c9441c370cc1f7f4ad2fd46aae6f5bde125798a29506cea8649acd02f`.
+
+Memory-access controls show the next provider check walks only the synthetic
+`msvcrt.dll` name count, name-RVA array, and strings before the error; it does
+not read the function RVA or ordinal tables. The first protected lookup operand
+`0x907736ac` reverse-maps to `vfprintf`, but a two-name treatment proves that
+one name is not the complete requirement. Sequential one-name additions reduce
+the accepted treatment to 26 sorted names in `src/msvcrt_exports.txt`, SHA-256
+`f69340427263b932fb80b908063a026e469ce91300485e1ff335238d719f9fc9`.
+The list is a minimized observed treatment, not a complete CRT export claim.
+
+The exact unchanged 26-name list escapes the wrong-provider path on both
+exercised variants. The sample-1 and sample-3 control artifacts have SHA-256
+`cdd63b0da087232d1e9b06f2046e5d637de5f9bd6e8d4e3530ffc8820e3ad126`
+and `03a26c7ed12da0e18637bc421aa679963af47fe707469d6ba8bd948acb8afd5a`.
+Both then reach the same late image-protection and `Sleep` phase.
+
+One later zero slot has a separate, exact provider classification. A protected
+lookup operand `0xf95760cf` produces zero with the four-name USER32 seed. Adding
+only `SendMessageA` changes the same slot to the reverse-mapped USER32 callable
+stub. The baseline and one-name artifacts have SHA-256
+`45d4cc1357cef3d18dcc2b092dc8be94b07dcd2416c27d3fd0af1f095be3bf0a`
+and `a51f91fcacd521f9b844f0c6eaea76eae986b2266718dd7eee0083477b21497d`;
+the protected-key trace has SHA-256
+`29ebab2c0480da0d062301dbad6216635f59e1c8c2c22e473ad6298730c50480`.
+The operand is reported as a dynamic lookup key; no public hash algorithm is
+claimed. `SendMessageA` joins the USER32 names-only seed, but no production call
+shape occurs, so dispatch semantics are not fabricated.
+
+### The late loop has no observed producer
+
+Formal sample 1 reaches the first late `Sleep(50)` after 214 handled main APIs.
+On the final five-name USER32 tree the pending boundary is 204,442,244; after
+the `Sleep` return, 1,985 instructions reach:
+
+```text
+0x000000014005ffeb: cmp byte [r12], dil
+R12 = 0x0000000140078e90
+[R12] = 0
+DIL = 0
+```
+
+One unchanged Sleep-to-Sleep iteration is exactly 3,544 instructions. A watch
+armed before guest entry records the byte's initialization to zero and its
+late reads, with no intervening write. The final-tree diagnostic records:
+
+| Event | Global instruction | Result |
+|---|---:|---|
+| Initial unpack write | 1,368,334 | byte becomes zero |
+| First late compare | 204,440,686 | reads zero |
+| Diagnostic-only changed compare | 204,444,230 | reads one |
+
+The final diagnostic artifact
+`/tmp/midas-slice-d-final-late-probe-s1.log` has SHA-256
+`a4f2ec11002d159ac8d2ef638e64d40d49ce0032c77bd475f147e3923b5e17f4`.
+The unchanged-loop trace has SHA-256
+`31397c76616e76f22f4f8175c977b8544dbe7c579e9cc8fe058ce46d34a732c5`.
+
+This is not the earlier splash-release poll. The sole created child already
+ran once, stored one to that earlier cell after `CreateWindowExA`, and stopped
+at its separately documented post-`RtlFreeHeap` null. It never writes the late
+cell. No second created thread or other guest producer is observed.
+
+The missing `SendMessageA` slot is downstream rather than causal for the wait:
+the unchanged zero-condition loop never reads it. A diagnostic-only one-byte
+change leaves the loop, and 2,528 instructions later reads the slot. With the
+one-name repair the path reaches the protected USER32 stub
+`0x00007fff00101040` with the observed latent arguments
+`SendMessageA(0x0000000f30000020, 2, 0, 0)`. This target is outside every OEP
+target range; the OEP watch does not fire. The corresponding 2,568-instruction
+trace has SHA-256
+`a69aef81192f7796b47dbe503f54fd7ba2a85eff3b5627caf9babee06880bbfe`.
+The changed byte is a sensitivity control only and is not production behavior.
+
+Production registered a WndProc but did not execute it. Disposable direct
+`WM_CREATE`, `WM_NCCREATE`, and `WM_TIMER` callback controls also left the late
+byte zero, but their incomplete window-state/message inputs are insufficient
+to prove or refute WndProc ownership. Window callback/lifecycle remains a
+hypothesis, not a claimed producer and not a basis for a forced write. Their
+artifact SHA-256 values are
+`79e99580a554e991c349e8530c1ca2124f3fce5403bdd863615a532dabe693d0`,
+`c8e0b6fc7e91fdc0a2bb41ade5c7ba7e84055949fb3ad2b802a012b17ead1bf6`,
+and `ba4fca665effb4d1ca561dece4cd4119458c0a8bbc5b5d38d4a7c3555d9a033e`.
+
+### Determinism, performance, and acceptance result
+
+The release runner defaults to a 250,000,000-instruction cap per resume leg and
+512 named calls. Four final fresh invocations are byte-identical within each
+sample:
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---:|---:|
+| Sample SHA-256 | `8e3796d03ddcdc8d66444e9a3f3bc1dfef419ded5418b6cc3a03cca3c91d5eaf` | `6c70e14c40fde8661b0b0121161deb1afd9edffd682f1f30f2b5916895f79585` |
+| Handled main APIs | 512 | 512 |
+| First late pending `Sleep` position | 215 | 215 |
+| Main instructions after first child yield at final bound | 76,986,895 | 74,463,196 |
+| Total instruction-hook boundaries | 205,498,356 | 208,106,415 |
+| OEP observations/capture failures | none / none | none / none |
+| Final output SHA-256 | `24636566b922296c40b98890ae2986d35157db319552b7a3f79dd8e7c8cd1f4e` | `88e5e5dc65d873436ccbbbca611eef1c922193365fc6ef4dbc2949a7a14cd83f` |
+
+On the available host, the four runs each complete in roughly nine to ten
+seconds when run concurrently; the exact elapsed time is not an acceptance
+invariant. The byte-identical outputs and instruction totals are the
+determinism evidence.
+
+Reproduce locally; sample runs remain outside CI:
+
+```text
+cargo build --locked --release --example run_loader \
+  --example trace_child_postmortem
+
+target/release/examples/run_loader \
+  samples/test_target_protected.exe 250000000 512 \
+  > /tmp/midas-slice-d-final-s1-run1.txt
+target/release/examples/run_loader \
+  samples/test_target_protected.exe 250000000 512 \
+  > /tmp/midas-slice-d-final-s1-run2.txt
+target/release/examples/run_loader \
+  samples/test_target3_protected.exe 250000000 512 \
+  > /tmp/midas-slice-d-final-s3-run1.txt
+target/release/examples/run_loader \
+  samples/test_target3_protected.exe 250000000 512 \
+  > /tmp/midas-slice-d-final-s3-run2.txt
+
+cmp /tmp/midas-slice-d-final-s1-run1.txt \
+  /tmp/midas-slice-d-final-s1-run2.txt
+cmp /tmp/midas-slice-d-final-s3-run1.txt \
+  /tmp/midas-slice-d-final-s3-run2.txt
+sha256sum /tmp/midas-slice-d-final-s{1,3}-run{1,2}.txt
+```
+
+No criterion firing occurred, so Slice D cannot perform the requested
+runtime-byte/register/disassembly adjudication on an actual candidate and
+cannot claim M4. Every latched candidate is nevertheless adjudicated: the set
+is empty, and both final runs explicitly report `OEP criterion: did not fire`.
+The late flag's absent producer is the next evidence question. It must be
+derived from guest execution or a bounded general Windows semantic; forcing
+the sample byte would violate the clean-room rule.
+
+Formal two-sample closure also remains externally blocked. Sample 1 has the
+required provenance; sample 3 is useful engineering corroboration but still
+lacks its source and pre-protection hashes. Trace recording, VM detection, IR,
+IAT repair, and a runnable dumped PE remain outside this result.
