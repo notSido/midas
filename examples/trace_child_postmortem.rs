@@ -5,6 +5,10 @@
 //! start address under explicit diagnostic-only stack/TEB conditions, restores
 //! the stopped main CPU context, and gives terminal control transfers no
 //! lifecycle meaning.
+//!
+//! `--production-terminal` is an additive exception to that hand-driven path:
+//! it observes the production cooperative scheduler and retains a bounded
+//! hook-time terminal tail without assigning lifecycle meaning to the stop.
 
 use std::{env, fs, process};
 
@@ -19,7 +23,10 @@ use midas::{
         TEB_STACKLIMIT_OFFSET,
     },
     pe::PeImage,
-    win64::{run_with_import_trap, RunnableUnscheduledThread, TrapRun, TrapStop, Win64Env},
+    win64::{
+        run_with_cooperative_scheduler, run_with_import_trap, CooperativeTrapRun,
+        RunnableUnscheduledThread, TrapRun, TrapStop, Win64Env,
+    },
 };
 
 const DEFAULT_MAIN_PER_LEG_CAP: u64 = 60_000_000;
@@ -37,6 +44,9 @@ const POST_POLL_API_BOUND: usize = 16;
 const POST_POLL_TAIL_LEN: usize = 64;
 const POST_POLL_API_NAME: &str = "GetCommandLineA";
 const POST_CREATE_CHILD_API_NAME: &str = "RtlFreeHeap";
+const PRODUCTION_API_BOUND: usize = 200;
+const PRODUCTION_TERMINAL_SUFFIX_TRACE_CAP: u64 = 1_000_000;
+const PRODUCTION_TERMINAL_TAIL_LEN: usize = 64;
 
 const CHILD_STACK_BASE: u64 = 0x0000_000f_5000_0000;
 const CHILD_STACK_SIZE: u64 = 0x0010_0000;
@@ -117,6 +127,7 @@ struct Config {
     export_name_control: Option<ExportNameControl>,
     frontier_only: bool,
     poll_window_only: bool,
+    production_terminal_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +227,77 @@ struct FormattedWatchHit {
     hit: PersistentWatchHit,
     instruction: String,
     fallthrough: Vec<(u64, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionTerminalTransfer {
+    NearReturn {
+        global_instruction_index: u64,
+        instruction_address: u64,
+        consumed_cell: u64,
+        target_value: u64,
+    },
+    RegisterCall(RegisterCallTerminal),
+    IndirectCall {
+        global_instruction_index: u64,
+        instruction_address: u64,
+        pointer_cell: u64,
+        target_value: u64,
+        pushed_return_cell: u64,
+        pushed_return_address: u64,
+    },
+}
+
+impl ProductionTerminalTransfer {
+    fn instruction_address(self) -> u64 {
+        match self {
+            Self::NearReturn {
+                instruction_address,
+                ..
+            }
+            | Self::IndirectCall {
+                instruction_address,
+                ..
+            } => instruction_address,
+            Self::RegisterCall(call) => call.instruction_address,
+        }
+    }
+
+    fn global_instruction_index(self) -> u64 {
+        match self {
+            Self::NearReturn {
+                global_instruction_index,
+                ..
+            }
+            | Self::IndirectCall {
+                global_instruction_index,
+                ..
+            } => global_instruction_index,
+            Self::RegisterCall(call) => call.global_instruction_index,
+        }
+    }
+
+    fn target_value(self) -> u64 {
+        match self {
+            Self::NearReturn { target_value, .. } | Self::IndirectCall { target_value, .. } => {
+                target_value
+            }
+            Self::RegisterCall(call) => call.target_value,
+        }
+    }
+
+    fn consumed_cell(self) -> Option<u64> {
+        match self {
+            Self::NearReturn { consumed_cell, .. } => Some(consumed_cell),
+            Self::RegisterCall(_) | Self::IndirectCall { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProductionConsumedCellEdge {
+    writer: FormattedWatchHit,
+    consumer: FormattedWatchHit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +478,11 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("failed to read {:?}: {error}", config.path))?;
     let image = PeImage::parse(&bytes)
         .map_err(|error| format!("failed to parse {:?}: {error}", config.path))?;
+
+    if config.production_terminal_only {
+        run_production_terminal(&config, &image, &bytes)?;
+        return Ok(());
+    }
 
     if config.poll_window_only {
         if config.export_name_control.is_some() {
@@ -668,19 +755,8 @@ fn parse_args() -> Result<Config, String> {
         .unwrap_or_else(|| "trace_child_postmortem".to_owned());
     let path = args.next().ok_or_else(|| usage(&program))?;
     let mut positional = args.collect::<Vec<_>>();
-    let mut frontier_only = false;
-    let mut poll_window_only = false;
-    while let Some(argument) = positional.last() {
-        match argument.as_str() {
-            "--frontier-only" => frontier_only = true,
-            "--poll-window" => poll_window_only = true,
-            _ => break,
-        }
-        positional.pop();
-    }
-    if frontier_only && poll_window_only {
-        return Err("--frontier-only and --poll-window are mutually exclusive".to_owned());
-    }
+    let (frontier_only, poll_window_only, production_terminal_only) =
+        parse_trailing_modes(&mut positional)?;
     let main_per_leg_cap = parse_optional(
         positional.first().cloned(),
         DEFAULT_MAIN_PER_LEG_CAP,
@@ -726,19 +802,481 @@ fn parse_args() -> Result<Config, String> {
         export_name_control,
         frontier_only,
         poll_window_only,
+        production_terminal_only,
     })
+}
+
+fn parse_trailing_modes(positional: &mut Vec<String>) -> Result<(bool, bool, bool), String> {
+    let mut frontier_only = false;
+    let mut poll_window_only = false;
+    let mut production_terminal_only = false;
+    let mut mode_count = 0usize;
+    while let Some(argument) = positional.last() {
+        let selected = match argument.as_str() {
+            "--frontier-only" if !frontier_only => {
+                frontier_only = true;
+                true
+            }
+            "--poll-window" if !poll_window_only => {
+                poll_window_only = true;
+                true
+            }
+            "--production-terminal" if !production_terminal_only => {
+                production_terminal_only = true;
+                true
+            }
+            "--frontier-only" | "--poll-window" | "--production-terminal" => {
+                return Err(format!("duplicate diagnostic mode {argument}"));
+            }
+            _ => false,
+        };
+        if !selected {
+            break;
+        }
+        positional.pop();
+        mode_count += 1;
+    }
+    if mode_count > 1 {
+        return Err(
+            "--frontier-only, --poll-window, and --production-terminal are mutually exclusive"
+                .to_owned(),
+        );
+    }
+    Ok((frontier_only, poll_window_only, production_terminal_only))
 }
 
 fn usage(program: &str) -> String {
     format!(
         "usage: {program} <pe> [main-per-leg-cap] [child-per-leg-cap] [watch-hit-cap]\n\
-         [export-control-module export-name-list] [--frontier-only|--poll-window]\n\
+         [export-control-module export-name-list] [--frontier-only|--poll-window|--production-terminal]\n\
          the diagnostic derives the pending Sleep, created thread, and timeGetTime stub at runtime;\n\
          an optional newline-delimited name list changes one synthetic module's names only;\n\
          --frontier-only prints the first child terminal without provenance replays;\n\
          --poll-window rejects an external name control, runs the frozen kernel32 A/B controls,\n\
-         returns a diagnostic nonzero HWND at the confirmed CreateWindowExA boundary, and watches the child/main suffix"
+         returns a diagnostic nonzero HWND at the confirmed CreateWindowExA boundary, and watches the child/main suffix;\n\
+         --production-terminal replays the exact production cooperative scheduler and freezes its terminal 64-instruction tail"
     )
+}
+
+fn run_production_terminal(config: &Config, image: &PeImage, bytes: &[u8]) -> Result<(), String> {
+    let (mut discovery_emu, mut discovery_env) = new_production_runtime(config, image, bytes)?;
+    let discovery = run_with_cooperative_scheduler(
+        &mut discovery_env,
+        &mut discovery_emu,
+        image,
+        image.entry_point_va(),
+        config.main_per_leg_cap,
+        PRODUCTION_API_BOUND,
+    )
+    .map_err(|error| format!("failed to run production terminal discovery: {error}"))?;
+    require_export_control_applied(config, &discovery_env, "production discovery")?;
+    let discovery_total = discovery_emu.total_instructions_executed();
+    if discovery.handled.is_empty() {
+        return Err("production terminal discovery handled no APIs".to_owned());
+    }
+    let synthetic_module_image_ranges = discovery_env
+        .synthetic_module_image_ranges()
+        .map(|(name, start, end)| (name.to_owned(), start, end))
+        .collect::<Vec<_>>();
+    if matches!(&discovery.stop, TrapStop::InstructionCap)
+        || matches!(&discovery.stop, TrapStop::Other(message) if message == "max_calls reached")
+    {
+        let registers = read_cpu_state(&discovery_emu)?;
+        print_production_bounded_frontier_summary(
+            config,
+            image,
+            &discovery,
+            discovery_total,
+            &synthetic_module_image_ranges,
+            &registers,
+        );
+        return Ok(());
+    }
+
+    // A fresh replay stops immediately before the final handled API, then
+    // enables hook-time byte retention only for the bounded suffix. This keeps
+    // the exact production scheduler semantics while avoiding an unbounded
+    // all-run RIP vector merely to retain the final 64 instructions.
+    let prefix_call_bound = discovery.handled.len() - 1;
+    let (mut traced_emu, mut traced_env) = new_production_runtime(config, image, bytes)?;
+    let prefix = run_with_cooperative_scheduler(
+        &mut traced_env,
+        &mut traced_emu,
+        image,
+        image.entry_point_va(),
+        config.main_per_leg_cap,
+        prefix_call_bound,
+    )
+    .map_err(|error| format!("failed to run production terminal prefix replay: {error}"))?;
+    if !matches!(&prefix.stop, TrapStop::Other(message) if message == "max_calls reached")
+        || prefix.handled != discovery.handled[..prefix_call_bound]
+        || prefix.cooperative_yields != discovery.cooperative_yields
+    {
+        return Err(format!(
+            "production terminal prefix replay diverged: handled={:?}, yields={:?}, stop={:?}",
+            prefix.handled, prefix.cooperative_yields, prefix.stop
+        ));
+    }
+    let suffix_begin = traced_emu
+        .read_reg(RegisterX86::RIP)
+        .map_err(|error| format!("failed to read production suffix RIP: {error}"))?;
+    traced_emu
+        .install_code_trace_hook()
+        .map_err(|error| format!("failed to freeze production terminal tail: {error}"))?;
+    let suffix_cap = config
+        .main_per_leg_cap
+        .min(PRODUCTION_TERMINAL_SUFFIX_TRACE_CAP);
+    let suffix = run_with_cooperative_scheduler(
+        &mut traced_env,
+        &mut traced_emu,
+        image,
+        suffix_begin,
+        suffix_cap,
+        PRODUCTION_API_BOUND,
+    )
+    .map_err(|error| format!("failed to run bounded production terminal suffix: {error}"))?;
+    require_export_control_applied(config, &traced_env, "production suffix replay")?;
+    if suffix.handled != discovery.handled[prefix_call_bound..]
+        || !suffix.cooperative_yields.is_empty()
+        || suffix.stop != discovery.stop
+    {
+        return Err(format!(
+            "production terminal suffix replay diverged: handled={:?}, yields={:?}, stop={:?}",
+            suffix.handled, suffix.cooperative_yields, suffix.stop
+        ));
+    }
+    let traced_total = traced_emu.total_instructions_executed();
+    if traced_total != discovery_total {
+        return Err(format!(
+            "production terminal replay instruction count diverged: discovery={discovery_total}, replay={traced_total}"
+        ));
+    }
+    let suffix_rips = traced_emu.executed_addresses();
+    if suffix_rips.len() > usize::try_from(suffix_cap).unwrap_or(usize::MAX) {
+        return Err(format!(
+            "production terminal suffix retained {} RIPs beyond its {suffix_cap}-instruction bound",
+            suffix_rips.len()
+        ));
+    }
+    let frozen_tail = traced_emu.recent_instructions();
+    if frozen_tail.len() != PRODUCTION_TERMINAL_TAIL_LEN
+        || suffix_rips.len() < PRODUCTION_TERMINAL_TAIL_LEN
+    {
+        return Err(format!(
+            "production terminal suffix retained {} frozen and {} executed instructions; exactly {PRODUCTION_TERMINAL_TAIL_LEN} frozen tail entries are required",
+            frozen_tail.len(),
+            suffix_rips.len()
+        ));
+    }
+    let terminal_registers = read_cpu_state(&traced_emu)?;
+    let transfer = classify_production_terminal_transfer(
+        &traced_emu,
+        &discovery.stop,
+        &suffix_rips,
+        &terminal_registers,
+        &frozen_tail,
+    )?;
+    if transfer.global_instruction_index() != discovery_total {
+        return Err(format!(
+            "production terminal global index {} differs from total instruction count {discovery_total}",
+            transfer.global_instruction_index()
+        ));
+    }
+    let tail_instructions = format_tail(&frozen_tail, &suffix_rips, PRODUCTION_TERMINAL_TAIL_LEN)?;
+    let terminal_stub_name = traced_env.callable_stub_name_at(transfer.target_value());
+    let consumed_edge = match transfer.consumed_cell() {
+        Some(consumed_cell) => Some(replay_production_consumed_cell(
+            config,
+            image,
+            bytes,
+            &discovery,
+            discovery_total,
+            &tail_instructions,
+            transfer,
+            consumed_cell,
+        )?),
+        None => None,
+    };
+
+    print_production_terminal_summary(
+        config,
+        image,
+        &discovery,
+        discovery_total,
+        suffix_cap,
+        &synthetic_module_image_ranges,
+        &terminal_registers,
+        &frozen_tail,
+        &tail_instructions,
+        transfer,
+        terminal_stub_name.as_deref(),
+        consumed_edge.as_ref(),
+    );
+    Ok(())
+}
+
+fn new_production_runtime(
+    config: &Config,
+    image: &PeImage,
+    bytes: &[u8],
+) -> Result<(Emu, Win64Env), String> {
+    let mut emu = Emu::new().map_err(|error| format!("failed to create emulator: {error}"))?;
+    emu.map_image(image, bytes, image.image_base)
+        .map_err(|error| format!("failed to map image: {error}"))?;
+    let mut env = Win64Env::new(image.image_base);
+    if let Some(control) = &config.export_name_control {
+        if !env.configure_module_export_name_control(&control.module_name, &control.names) {
+            return Err(format!(
+                "rejected export-name control for {:?}",
+                control.module_name
+            ));
+        }
+    }
+    Ok((emu, env))
+}
+
+fn require_export_control_applied(
+    config: &Config,
+    env: &Win64Env,
+    phase: &str,
+) -> Result<(), String> {
+    if let Some(control) = &config.export_name_control {
+        if !env.module_export_name_control_was_applied(&control.module_name) {
+            return Err(format!(
+                "export-name control for {:?} was not applied during {phase}",
+                control.module_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn classify_production_terminal_transfer(
+    emu: &Emu,
+    stop: &TrapStop,
+    suffix_rips: &[u64],
+    terminal_registers: &[(RegisterX86, u64)],
+    frozen_tail: &[FrozenInstruction],
+) -> Result<ProductionTerminalTransfer, String> {
+    if frozen_tail.len() != PRODUCTION_TERMINAL_TAIL_LEN {
+        return Err(format!(
+            "production terminal classifier requires exactly {PRODUCTION_TERMINAL_TAIL_LEN} frozen instructions, got {}",
+            frozen_tail.len()
+        ));
+    }
+    let last_rip = suffix_rips
+        .last()
+        .copied()
+        .ok_or_else(|| "production terminal suffix is empty".to_owned())?;
+    let frozen = frozen_tail
+        .last()
+        .filter(|entry| entry.address == last_rip)
+        .ok_or_else(|| {
+            "production terminal instruction lacks matching hook-time bytes".to_owned()
+        })?;
+    let mut decoder = Decoder::with_ip(64, &frozen.bytes, last_rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() || instruction.len() != frozen.bytes.len() {
+        return Err(format!(
+            "production terminal bytes at 0x{last_rip:016x} do not decode as one exact instruction"
+        ));
+    }
+    let final_rip = register_value(terminal_registers, RegisterX86::RIP)
+        .ok_or_else(|| "production terminal snapshot is missing RIP".to_owned())?;
+    let final_rsp = register_value(terminal_registers, RegisterX86::RSP)
+        .ok_or_else(|| "production terminal snapshot is missing RSP".to_owned())?;
+
+    let transfer = if matches!(instruction.code(), Code::Retnq | Code::Retnq_imm16) {
+        validate_terminal_ret_instruction(&instruction, &frozen.bytes, last_rip)?;
+        let consumed_cell = terminal_cell(final_rsp)?;
+        let target_value = read_u64(emu, consumed_cell)?;
+        ProductionTerminalTransfer::NearReturn {
+            global_instruction_index: frozen.global_instruction_index,
+            instruction_address: last_rip,
+            consumed_cell,
+            target_value,
+        }
+    } else if instruction.code() == Code::Call_rm64 && instruction.op0_kind() == OpKind::Register {
+        let call = derive_register_call_terminal(
+            emu,
+            suffix_rips,
+            final_rsp,
+            terminal_registers,
+            frozen_tail,
+        )?
+        .ok_or_else(|| "production register-call classifier returned no call".to_owned())?;
+        ProductionTerminalTransfer::RegisterCall(call)
+    } else {
+        let (transfer, pointer_cell) =
+            derive_terminal_transfer(emu, suffix_rips, final_rsp, terminal_registers, frozen_tail)?;
+        let TerminalTransfer::IndirectCall {
+            instruction_address,
+            pointer_cell: derived_pointer_cell,
+            pushed_return_address,
+        } = transfer
+        else {
+            return Err(format!(
+                "unsupported production terminal instruction {}",
+                format_instruction(&instruction)
+            ));
+        };
+        if derived_pointer_cell != pointer_cell {
+            return Err("production indirect-call pointer-cell derivation disagrees".to_owned());
+        }
+        ProductionTerminalTransfer::IndirectCall {
+            global_instruction_index: frozen.global_instruction_index,
+            instruction_address,
+            pointer_cell,
+            target_value: read_u64(emu, pointer_cell)?,
+            pushed_return_cell: final_rsp,
+            pushed_return_address,
+        }
+    };
+    if final_rip != transfer.target_value() {
+        return Err(format!(
+            "production terminal target 0x{:016x} disagrees with final RIP 0x{final_rip:016x}",
+            transfer.target_value()
+        ));
+    }
+    if matches!(stop, TrapStop::NullControlTransfer) != (transfer.target_value() == 0) {
+        return Err(format!(
+            "production terminal stop {stop:?} disagrees with target 0x{:016x}",
+            transfer.target_value()
+        ));
+    }
+    Ok(transfer)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_production_consumed_cell(
+    config: &Config,
+    image: &PeImage,
+    bytes: &[u8],
+    discovery: &CooperativeTrapRun,
+    discovery_total: u64,
+    tail: &[FormattedInstruction],
+    transfer: ProductionTerminalTransfer,
+    consumed_cell: u64,
+) -> Result<ProductionConsumedCellEdge, String> {
+    let watch_end = consumed_cell
+        .checked_add(8)
+        .ok_or_else(|| "production consumed-cell watch range overflows".to_owned())?;
+    let tail_start = tail
+        .first()
+        .map(|entry| entry.global_instruction_index)
+        .ok_or_else(|| "production terminal tail is empty".to_owned())?;
+    let global_end = transfer
+        .global_instruction_index()
+        .checked_add(1)
+        .ok_or_else(|| "production terminal global range overflows".to_owned())?;
+    let (mut emu, mut env) = new_production_runtime(config, image, bytes)?;
+    emu.configure_persistent_watch_in_global_range(
+        &[(consumed_cell, watch_end)],
+        config.watch_hit_cap,
+        (tail_start, global_end),
+    )
+    .map_err(|error| format!("failed to arm production consumed-cell watch: {error}"))?;
+    let replay = run_with_cooperative_scheduler(
+        &mut env,
+        &mut emu,
+        image,
+        image.entry_point_va(),
+        config.main_per_leg_cap,
+        PRODUCTION_API_BOUND,
+    )
+    .map_err(|error| format!("failed to run production consumed-cell replay: {error}"))?;
+    require_export_control_applied(config, &env, "production consumed-cell replay")?;
+    if replay != *discovery || emu.total_instructions_executed() != discovery_total {
+        return Err(format!(
+            "production consumed-cell replay diverged: total={}, stop={:?}",
+            emu.total_instructions_executed(),
+            replay.stop
+        ));
+    }
+    let raw_hits = emu.persistent_watch_hits();
+    if raw_hits.len() >= config.watch_hit_cap {
+        return Err(format!(
+            "production consumed-cell watch reached its {}-hit cap",
+            config.watch_hit_cap
+        ));
+    }
+    let hits = format_watch_hits(raw_hits)?;
+    classify_production_consumed_cell_edge(&hits, transfer, tail_start)
+}
+
+fn classify_production_consumed_cell_edge(
+    hits: &[FormattedWatchHit],
+    transfer: ProductionTerminalTransfer,
+    tail_start: u64,
+) -> Result<ProductionConsumedCellEdge, String> {
+    let ProductionTerminalTransfer::NearReturn {
+        global_instruction_index,
+        instruction_address,
+        consumed_cell,
+        target_value,
+    } = transfer
+    else {
+        return Err("production consumed-cell edge requires a near return".to_owned());
+    };
+    let consumers = hits
+        .iter()
+        .filter(|entry| {
+            !entry.hit.is_write
+                && entry.hit.global_instruction_index == global_instruction_index
+                && entry.hit.rip == instruction_address
+                && entry.hit.address == consumed_cell
+                && entry.hit.size == 8
+                && entry.hit.value == Some(target_value)
+        })
+        .collect::<Vec<_>>();
+    let [consumer] = consumers.as_slice() else {
+        return Err(format!(
+            "production consumed-cell replay retained {} matching terminal reads, expected one",
+            consumers.len()
+        ));
+    };
+    let writer = hits
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.hit.is_write
+                && entry.hit.global_instruction_index >= tail_start
+                && entry.hit.global_instruction_index < consumer.hit.global_instruction_index
+                && entry.hit.address == consumed_cell
+                && entry.hit.size == 8
+                && entry.hit.value == Some(target_value)
+        })
+        .ok_or_else(|| {
+            "production consumed-cell replay has no exact qword writer feeding the terminal read"
+                .to_owned()
+        })?;
+    if consumer
+        .hit
+        .global_instruction_index
+        .saturating_sub(writer.hit.global_instruction_index)
+        >= PRODUCTION_TERMINAL_TAIL_LEN as u64
+    {
+        return Err("production consumed-cell writer lies outside the frozen tail".to_owned());
+    }
+    let writer_instruction = decode_watch_instruction(&writer.hit)
+        .ok_or_else(|| "production consumed-cell writer has no exact instruction".to_owned())?;
+    if writer_instruction.op0_kind() != OpKind::Memory {
+        return Err("production consumed-cell writer does not write a memory operand".to_owned());
+    }
+    if writer_instruction.op1_kind() == OpKind::Register {
+        let source_register = writer_instruction.op1_register().full_register();
+        let source_value = iced_register_value(source_register, &writer.hit.registers)
+            .ok_or_else(|| format!("unsupported consumed-cell source {source_register:?}"))?;
+        if source_value != target_value {
+            return Err(format!(
+                "production consumed-cell writer source {source_register:?}=0x{source_value:016x} disagrees with written value 0x{target_value:016x}"
+            ));
+        }
+    }
+    Ok(ProductionConsumedCellEdge {
+        writer: (*writer).clone(),
+        consumer: (*consumer).clone(),
+    })
 }
 
 fn parse_export_name_control(contents: &str) -> Result<Vec<String>, String> {
@@ -3944,6 +4482,242 @@ fn print_poll_window_summary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn print_production_bounded_frontier_summary(
+    config: &Config,
+    image: &PeImage,
+    discovery: &CooperativeTrapRun,
+    total_instructions: u64,
+    synthetic_module_image_ranges: &[(String, u64, u64)],
+    registers: &[(RegisterX86, u64)],
+) {
+    let rip = register_value(registers, RegisterX86::RIP).unwrap_or(0);
+    println!("image:                 {:?}", config.path);
+    println!("image_base:            0x{:016x}", image.image_base);
+    println!("entry_va:              0x{:016x}", image.entry_point_va());
+    println!("production_terminal:   not reached before bound");
+    println!("main_per_leg_cap:      {}", config.main_per_leg_cap);
+    println!("production_api_bound:  {PRODUCTION_API_BOUND}");
+    print_export_name_control(config);
+    println!("handled_apis:          {:?}", discovery.handled);
+    println!("cooperative_yields:    {:?}", discovery.cooperative_yields);
+    println!(
+        "main_after_yield:      {}",
+        discovery.main_instructions_after_first_yield
+    );
+    println!("stop:                  {:?}", discovery.stop);
+    println!("total_instructions:    {total_instructions}");
+    println!("frontier_rip:          0x{rip:016x}");
+    println!(
+        "frontier_provenance:   {}",
+        format_runtime_address_provenance(image, synthetic_module_image_ranges, rip)
+    );
+    println!("frontier_registers:    {}", format_registers(registers));
+    println!(
+        "frontier_fs_gs:        fs_base=0x{:016x} gs_base=0x{:016x}",
+        register_value(registers, RegisterX86::FS_BASE).unwrap_or(0),
+        register_value(registers, RegisterX86::GS_BASE).unwrap_or(0),
+    );
+    println!("terminal_tail:         unavailable because discovery stopped at a bound");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_production_terminal_summary(
+    config: &Config,
+    image: &PeImage,
+    discovery: &CooperativeTrapRun,
+    total_instructions: u64,
+    suffix_cap: u64,
+    synthetic_module_image_ranges: &[(String, u64, u64)],
+    terminal_registers: &[(RegisterX86, u64)],
+    frozen_tail: &[FrozenInstruction],
+    tail: &[FormattedInstruction],
+    transfer: ProductionTerminalTransfer,
+    terminal_stub_name: Option<&str>,
+    consumed_edge: Option<&ProductionConsumedCellEdge>,
+) {
+    let terminal_frozen = frozen_tail
+        .last()
+        .expect("production terminal tail was validated before printing");
+    let tail_rips = tail.iter().map(|entry| entry.address).collect::<Vec<_>>();
+    println!("image:                 {:?}", config.path);
+    println!("image_base:            0x{:016x}", image.image_base);
+    println!("entry_va:              0x{:016x}", image.entry_point_va());
+    println!("production_terminal:   true");
+    println!("main_per_leg_cap:      {}", config.main_per_leg_cap);
+    println!("suffix_trace_cap:      {suffix_cap}");
+    println!("production_api_bound:  {PRODUCTION_API_BOUND}");
+    print_export_name_control(config);
+    println!("handled_apis:          {:?}", discovery.handled);
+    println!("cooperative_yields:    {:?}", discovery.cooperative_yields);
+    println!(
+        "main_after_yield:      {}",
+        discovery.main_instructions_after_first_yield
+    );
+    println!("stop:                  {:?}", discovery.stop);
+    println!("total_instructions:    {total_instructions}");
+    println!("terminal_tail_rips:    {}", tail.len());
+    println!("terminal_tail_digest:  0x{:016x}", trace_digest(&tail_rips));
+    println!(
+        "terminal_source:       global {} 0x{:016x}: {}",
+        transfer.global_instruction_index(),
+        transfer.instruction_address(),
+        tail.last()
+            .map(|entry| entry.instruction.as_str())
+            .unwrap_or("<missing>")
+    );
+    println!(
+        "terminal_source_bytes: {}",
+        format_hex_bytes(&terminal_frozen.bytes)
+    );
+    println!(
+        "source_provenance:     {}",
+        format_runtime_address_provenance(
+            image,
+            synthetic_module_image_ranges,
+            transfer.instruction_address(),
+        )
+    );
+    match transfer {
+        ProductionTerminalTransfer::NearReturn {
+            consumed_cell,
+            target_value,
+            ..
+        } => {
+            println!("terminal_transfer:     qword near return");
+            println!("consumed_cell:         0x{consumed_cell:016x}");
+            println!("consumed_value:        0x{target_value:016x}");
+        }
+        ProductionTerminalTransfer::RegisterCall(call) => {
+            println!(
+                "terminal_transfer:     call {:?} -> 0x{:016x}",
+                call.target_register, call.target_value
+            );
+            println!(
+                "pushed_return:         cell=0x{:016x} value=0x{:016x}",
+                call.pushed_return_cell, call.pushed_return_address
+            );
+        }
+        ProductionTerminalTransfer::IndirectCall {
+            pointer_cell,
+            target_value,
+            pushed_return_cell,
+            pushed_return_address,
+            ..
+        } => {
+            println!("terminal_transfer:     indirect qword call");
+            println!("pointer_cell:          0x{pointer_cell:016x}");
+            println!("pointer_value:         0x{target_value:016x}");
+            println!(
+                "pushed_return:         cell=0x{pushed_return_cell:016x} value=0x{pushed_return_address:016x}"
+            );
+        }
+    }
+    match terminal_stub_name {
+        Some(name) => println!(
+            "target_provenance:     synthetic callable stub name={name:?} address=0x{:016x}",
+            transfer.target_value()
+        ),
+        None => println!(
+            "target_provenance:     {}",
+            format_runtime_address_provenance(
+                image,
+                synthetic_module_image_ranges,
+                transfer.target_value(),
+            )
+        ),
+    }
+    println!(
+        "terminal_registers:    {}",
+        format_registers(terminal_registers)
+    );
+    println!(
+        "terminal_fs_gs:        fs_base=0x{:016x} gs_base=0x{:016x}",
+        register_value(terminal_registers, RegisterX86::FS_BASE).unwrap_or(0),
+        register_value(terminal_registers, RegisterX86::GS_BASE).unwrap_or(0),
+    );
+    match consumed_edge {
+        Some(edge) => {
+            println!(
+                "consumed_writer:       global {} 0x{:016x}: {} value={}",
+                edge.writer.hit.global_instruction_index,
+                edge.writer.hit.rip,
+                edge.writer.instruction,
+                format_optional_value(edge.writer.hit.value),
+            );
+            println!(
+                "writer_provenance:     {}",
+                format_runtime_address_provenance(
+                    image,
+                    synthetic_module_image_ranges,
+                    edge.writer.hit.rip,
+                )
+            );
+            println!(
+                "writer_registers:      {}",
+                format_registers(&edge.writer.hit.registers)
+            );
+            println!(
+                "consumed_reader:       global {} 0x{:016x}: {} value={}",
+                edge.consumer.hit.global_instruction_index,
+                edge.consumer.hit.rip,
+                edge.consumer.instruction,
+                format_optional_value(edge.consumer.hit.value),
+            );
+            println!(
+                "writer_to_reader:      {} instructions",
+                edge.consumer
+                    .hit
+                    .global_instruction_index
+                    .saturating_sub(edge.writer.hit.global_instruction_index)
+            );
+        }
+        None => println!("consumed_writer:       <transfer has no consumed return cell>"),
+    }
+    println!("terminal tail:");
+    for entry in tail {
+        println!(
+            "  global {} 0x{:016x}: {}",
+            entry.global_instruction_index, entry.address, entry.instruction
+        );
+    }
+}
+
+fn format_runtime_address_provenance(
+    image: &PeImage,
+    synthetic_module_image_ranges: &[(String, u64, u64)],
+    address: u64,
+) -> String {
+    if let Some(rva) = address.checked_sub(image.image_base) {
+        if rva < u64::from(image.size_of_image) {
+            if let Ok(rva32) = u32::try_from(rva) {
+                if let Some(section) = image.section_containing_rva(rva32) {
+                    return format!(
+                        "image section={:?} rva=0x{rva32:08x} characteristics=0x{:08x}",
+                        section.name, section.characteristics
+                    );
+                }
+            }
+            return format!("image headers/gap rva=0x{rva:08x}");
+        }
+    }
+    if let Some((name, start, _end)) = synthetic_module_image_ranges
+        .iter()
+        .find(|(_name, start, end)| *start <= address && address < *end)
+    {
+        return format!("synthetic module={name:?} offset=0x{:x}", address - start);
+    }
+    "outside image and synthetic modules".to_owned()
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn print_frontier_only_summary(config: &Config, image: &PeImage, first: &PassEvidence) {
     println!("image:                 {:?}", config.path);
     println!("image_base:            0x{:016x}", image.image_base);
@@ -4404,6 +5178,127 @@ mod tests {
     }
 
     #[test]
+    fn trailing_mode_parser_accepts_only_one_production_terminal_mode() {
+        let mut production = vec!["60000000".to_owned(), "--production-terminal".to_owned()];
+        assert_eq!(
+            parse_trailing_modes(&mut production).unwrap(),
+            (false, false, true)
+        );
+        assert_eq!(production, ["60000000"]);
+
+        let mut combined = vec![
+            "--poll-window".to_owned(),
+            "--production-terminal".to_owned(),
+        ];
+        assert!(parse_trailing_modes(&mut combined).is_err());
+
+        let mut duplicate = vec![
+            "--production-terminal".to_owned(),
+            "--production-terminal".to_owned(),
+        ];
+        assert!(parse_trailing_modes(&mut duplicate).is_err());
+    }
+
+    #[test]
+    fn production_terminal_classifier_requires_frozen_zero_near_return() {
+        const CODE_BASE: u64 = 0x0000_0000_0110_0000;
+        let initial_rsp = STACK_BASE + 0x8000;
+        let mut code = vec![0x90; PRODUCTION_TERMINAL_TAIL_LEN - 1];
+        code.extend_from_slice(&[0xc2, 0x00, 0x00]);
+        let image = PeImage {
+            image_base: CODE_BASE,
+            entry_point_rva: 0,
+            base_of_code: 0,
+            size_of_code: 0,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
+            size_of_headers: 0,
+            size_of_image: 0x1000,
+            subsystem: 3,
+            sections: Vec::new(),
+        };
+        let mut emu = Emu::new().unwrap();
+        emu.map_code(CODE_BASE, &code).unwrap();
+        emu.write_mem(initial_rsp, &0u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RSP, initial_rsp).unwrap();
+        emu.install_code_trace_hook().unwrap();
+        let mut env = Win64Env::new(CODE_BASE);
+        let result = run_with_import_trap(&mut env, &mut emu, &image, CODE_BASE, 128, 1).unwrap();
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
+        let rips = emu.executed_addresses();
+        let registers = read_cpu_state(&emu).unwrap();
+        let frozen = emu.recent_instructions();
+        assert_eq!(rips.len(), PRODUCTION_TERMINAL_TAIL_LEN);
+        assert_eq!(frozen.len(), PRODUCTION_TERMINAL_TAIL_LEN);
+        assert_eq!(
+            classify_production_terminal_transfer(&emu, &result.stop, &rips, &registers, &frozen,)
+                .unwrap(),
+            ProductionTerminalTransfer::NearReturn {
+                global_instruction_index: PRODUCTION_TERMINAL_TAIL_LEN as u64,
+                instruction_address: CODE_BASE + (PRODUCTION_TERMINAL_TAIL_LEN - 1) as u64,
+                consumed_cell: initial_rsp,
+                target_value: 0,
+            }
+        );
+
+        assert!(classify_production_terminal_transfer(
+            &emu,
+            &TrapStop::InstructionCap,
+            &rips,
+            &registers,
+            &frozen[..frozen.len() - 1],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn production_consumed_edge_requires_exact_writer_and_reader() {
+        let cell = STACK_BASE + 0x9000;
+        let writer_index = 70;
+        let reader_index = 101;
+        let transfer = ProductionTerminalTransfer::NearReturn {
+            global_instruction_index: reader_index,
+            instruction_address: 0x2000,
+            consumed_cell: cell,
+            target_value: 0,
+        };
+        let raw_hits = vec![
+            PersistentWatchHit {
+                global_instruction_index: writer_index,
+                is_write: true,
+                address: cell,
+                size: 8,
+                rip: 0x1000,
+                value: Some(0),
+                registers: vec![(RegisterX86::RSI, cell), (RegisterX86::R13, 0)],
+                code_window: vec![0x4c, 0x89, 0x2e], // mov [rsi],r13
+            },
+            PersistentWatchHit {
+                global_instruction_index: reader_index,
+                is_write: false,
+                address: cell,
+                size: 8,
+                rip: 0x2000,
+                value: Some(0),
+                registers: vec![(RegisterX86::RSP, cell)],
+                code_window: vec![0xc2, 0x00, 0x00], // ret 0
+            },
+        ];
+        let hits = format_watch_hits(raw_hits).unwrap();
+        let edge = classify_production_consumed_cell_edge(&hits, transfer, 64).unwrap();
+        assert_eq!(edge.writer.hit.global_instruction_index, writer_index);
+        assert_eq!(edge.consumer.hit.global_instruction_index, reader_index);
+
+        let mut wrong_source = hits.clone();
+        wrong_source[0].hit.registers[1].1 = 1;
+        assert!(classify_production_consumed_cell_edge(&wrong_source, transfer, 64).is_err());
+
+        let mut wrong_reader = hits;
+        wrong_reader[1].hit.value = Some(1);
+        assert!(classify_production_consumed_cell_edge(&wrong_reader, transfer, 64).is_err());
+    }
+
+    #[test]
     fn terminal_cell_requires_space_for_a_consumed_qword() {
         assert_eq!(terminal_cell(0x1008).unwrap(), 0x1000);
         assert!(terminal_cell(7).is_err());
@@ -4670,6 +5565,10 @@ mod tests {
         let image = PeImage {
             image_base: RET_BASE,
             entry_point_rva: 0,
+            base_of_code: 0,
+            size_of_code: 0,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
             size_of_headers: 0,
             size_of_image: 0x1000,
             subsystem: 3,
@@ -4781,6 +5680,10 @@ mod tests {
         let image = PeImage {
             image_base: CALL_BASE,
             entry_point_rva: 0,
+            base_of_code: 0,
+            size_of_code: 0,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
             size_of_headers: 0,
             size_of_image: 0x1000,
             subsystem: 3,
@@ -4890,6 +5793,10 @@ mod tests {
         let image = PeImage {
             image_base: CALL_BASE,
             entry_point_rva: 0,
+            base_of_code: 0,
+            size_of_code: 0,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
             size_of_headers: 0,
             size_of_image: 0x1000,
             subsystem: 3,

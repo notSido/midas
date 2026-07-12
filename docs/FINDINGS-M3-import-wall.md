@@ -3491,3 +3491,267 @@ table. Fresh paired A/B artifacts retain SHA-256
 for formal sample 1 and
 `f160fea080e8e8871ee819e637af88dd2a3da0088a00d4929fe33534cc6300c6`
 for incomplete-provenance sample 3.
+
+## Slice C: the post-directory null is a missing-name return; the OEP criterion is armed
+
+Slice C starts from the normal cooperative production path above and separates
+two questions that must not be conflated:
+
+1. what produces the zero control target after the two
+   `SetCurrentDirectoryW` calls; and
+2. what runtime event would qualify as an OEP candidate if execution later
+   reaches original executable code.
+
+The first question is now classified as option **(b), another missing
+API/return**. The second has a falsifiable implementation and a production
+watch, but the criterion did not fire in this slice. No OEP address or
+original-code claim follows from the null classification.
+
+### Additive production-terminal diagnostic
+
+`trace_child_postmortem --production-terminal` runs the same cooperative
+scheduler as `run_loader`. A discovery pass establishes the production result;
+a fresh replay stops immediately before the last handled API and enables
+hook-time byte retention only for a bounded suffix of at most 1,000,000
+instructions and the final 64 instructions. For a consumed return qword, a
+third exact production replay watches only the runtime-derived cell and only
+over the global instruction indices represented by that frozen tail. The
+diagnostic rejects replay divergence, a saturated watch, a missing exact
+qword writer/reader pair, or a source-register value that disagrees with the
+watched write.
+
+The initial post-directory observations are distinct sample addresses but the
+same runtime-derived shape:
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---:|---:|
+| Protected return | `0x000000014005cb7c: ret 0` | `0x000000014009a5ae: ret 0` |
+| Consumed qword | `0x0000000fffffef90` = zero | `0x0000000fffffefc0` = zero |
+| Last exact writer | `0x000000014005cb1a: mov [rsi],r13`, `R13=0` | `0x000000014009a54d: mov [rax],r15`, `R15=0` |
+| Writer-to-reader distance | 31 instructions | 31 instructions |
+| Frozen 64-RIP tail digest | `0x96d53dcd14507048` | `0x7daf35286d74de1a` |
+
+Both source instructions are in an image executable section reported as
+`.themida`; zero is outside the image and every synthetic module. Section names
+are printed as evidence only and do not participate in classification.
+
+### Narrow correct/wrong export controls
+
+Two 22-name controls are committed. Each is the frozen 21-name kernel32 list
+from the prior slice plus exactly one sorted candidate:
+
+| Control | Added name | SHA-256 |
+|---|---|---|
+| `docs/controls/kernel32-with-getcurrentprocess.txt` | `GetCurrentProcess` | `5159afeab422902ffaa4979d4e5cfb81ba7eed95793d05c5d9db449f445869df` |
+| `docs/controls/kernel32-with-getcurrentthread.txt` | `GetCurrentThread` | `e0a1d6b8e6f64961e313cf4891d82f80abf4a0c505ac4b05fe6616f005ba0b34` |
+
+The correct control is `GetCurrentProcess` for sample 1 and
+`GetCurrentThread` for sample 3; the other file is the crossed wrong-name
+control. On the final tree, the correct control advances through the named
+call while the crossed control does not. Because each deliberately restricted
+module omits the following required name, both paths eventually return through
+the same protected tail with another zero value:
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---:|---:|
+| Correct control advance | handles call 43 `GetCurrentProcess` | handles call 43 `GetCurrentThread`, then call 44 `OpenThreadToken` |
+| Wrong crossed control | 42 handled APIs, no candidate call | 42 handled APIs, no candidate call |
+| Correct / wrong tail | same `0x96d53dcd14507048` | same `0x7daf35286d74de1a` |
+| Correct / wrong total instructions | 35,743,849 / 35,701,441 | 37,594,734 / 37,585,713 |
+| Correct / wrong main after yield | 81,646 / 77,964 | 203,264 / 155,619 |
+| Correct output SHA-256 | `7069b800b7cf4370c44a21764b97c932aebc77c054b703f8c793f5138a9f8d40` | `5b69a86708ca30d6fd9212dfc667d108f9c07338015a567d73c1a4e189be665c` |
+| Wrong output SHA-256 | `a063380c9e3639e1ac1ecf0ef606971eb2470c2dc6ce27da46c17cad9c3d472d` | `fcc1367d08306ac6e8066e987463316b9c860e7aaed7f50b1880a9a14de60ba8` |
+
+Thus export-name availability changes whether the protected resolver returns a
+callable API and advances, while the return site, consumed-cell mechanism, and
+frozen protected tail remain fixed within each sample. The post-directory null
+is not a transfer into an original executable section and is classified as
+option (b), not an OEP candidate. No sample address, section name, or sample
+index enters production behavior.
+
+Reproduce the final-tree controlled checks locally:
+
+```text
+cargo build --locked --release --example trace_child_postmortem
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 250000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-with-getcurrentprocess.txt \
+  --production-terminal > /tmp/midas-slice-c-final-ab-s1-correct.txt
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 250000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-with-getcurrentthread.txt \
+  --production-terminal > /tmp/midas-slice-c-final-ab-s1-wrong.txt
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target3_protected.exe 250000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-with-getcurrentthread.txt \
+  --production-terminal > /tmp/midas-slice-c-final-ab-s3-correct.txt
+target/release/examples/trace_child_postmortem \
+  samples/test_target3_protected.exe 250000000 100000 4096 \
+  kernel32.dll docs/controls/kernel32-with-getcurrentprocess.txt \
+  --production-terminal > /tmp/midas-slice-c-final-ab-s3-wrong.txt
+
+sha256sum /tmp/midas-slice-c-final-ab-s{1,3}-{correct,wrong}.txt
+```
+
+### Falsifiable OEP-candidate criterion
+
+`src/oep.rs` derives a supported image partition from PE metadata at runtime
+and fails closed when the relationships are absent or ambiguous. It does not
+consult section names or preferred/sample addresses. The supported layout
+requires:
+
+- an executable, raw-backed entry-point code section;
+- its mapped-adjacent immediate predecessor to be rawless, writable,
+  executable code sharing the entry section's earlier raw-data frontier; and
+- pre-boundary executable code to have raw backing and agree exactly with
+  `BaseOfCode` and `SizeOfCode` accounting.
+
+Declared section virtual sizes, rather than alignment padding, define accepted
+targets. The actual mapped base is explicit. For both observed samples the
+derived production layout reports protector boundary RVA `0x0004f000`, loader
+section indices `[20, 21]`, and original executable section index `[0]`; these
+values are output evidence, not constants in the criterion.
+
+The runtime rule is:
+
+> Accept the first indirect branch or return from a derived loader executable
+> region to an exact, previously unexecuted RIP inside a derived original
+> executable section.
+
+Indirect calls are excluded because a loader callback/helper is ambiguous;
+direct transfers, repeated target RIPs, image padding, data sections,
+synthetic modules, and out-of-image targets do not satisfy the rule.
+
+`Emu` tracks target-RIP coverage from the first guest instruction across resume
+legs and CPU-context restores. Predecessor continuity resets at host-driven
+resume boundaries, preventing a resume directly at a target from being
+misreported as a transfer. When a matching source-to-target edge is observed,
+the emulator decodes the exact source instruction bytes, freezes a bounded
+runtime byte window at the target before it executes, captures the general
+register/RIP/flags snapshot, latches the first observation, and stops. The
+production runner then re-evaluates that observation with `OepCriterion` and,
+if accepted, emits the candidate RIP, source and target section indices,
+transfer kind, source bytes, target bytes with bounded disassembly, global
+instruction index, and captured registers.
+
+The proof payload also fails closed: the exact target instruction must be
+readable and decodable and all 18 registers must be captured before the watch
+can latch a candidate. An incomplete payload is retained as an explicit
+capture failure and `run_loader` emits no OEP candidate.
+
+Four fail-closed margins bound how a future firing should be interpreted:
+
+- The watch stops at the first edge that satisfies the runtime rule. That edge
+  is a first candidate, not proof that it is the OEP: an earlier loader
+  transfer into original code could precede the true entry, so every firing
+  still requires repeatability and disassembly adjudication.
+- The first potential source/target edge whose proof payload cannot be
+  completed retains one explicit capture failure and suppresses later
+  observations for that run. The failure is reported rather than silently
+  skipped, but the watch does not rearm automatically.
+- Layout derivation requires the rawless bridge's `PointerToRawData` to equal
+  the entry section's earlier raw-data frontier. Because that field carries no
+  raw bytes when `SizeOfRawData` is zero, a structurally equivalent variant
+  that writes zero there can fail to arm.
+- `SizeOfCode` validation currently requires exact equality with the sum of
+  each pre-boundary executable section's `VirtualSize` aligned to
+  `FileAlignment`. A producer using another accounting convention can fail to
+  arm; this is a false-negative margin, not a path to a candidate.
+
+This is criterion readiness, not M4 acceptance. Neither raised-cap production
+run below produced a qualifying observation, so both print `OEP criterion: did
+not fire`. There is no reproducible candidate RIP and therefore no candidate
+disassembly artifact to corroborate in this slice.
+
+### Observation-driven API batch after the classified null
+
+The narrow controls exposed different first names on the two variants, and
+subsequent bounded runs exposed a short security/token suffix. The final Win64
+batch models only the observed shapes:
+
+| API | Supported bounded effect |
+|---|---|
+| `GetCurrentProcess` | returns the full-width pseudo-handle `-1` |
+| `GetCurrentThread` | returns the full-width pseudo-handle `-2` |
+| `CheckRemoteDebuggerPresent` | for the current-process pseudo-handle, writes a four-byte false result and returns true |
+| `OpenThreadToken` | for current-thread, `TOKEN_QUERY`, `OpenAsSelf=true`, reports no impersonation token, leaves the output untouched, and returns false |
+| `OpenProcessToken` | for current-process plus exact `TOKEN_QUERY`, allocates a tracked non-inheritable process-token handle, writes it, and returns true |
+| `GetTokenInformation` | for that tracked query handle, `TokenGroups`, `NULL`, length zero: writes required size 4 for an empty `TOKEN_GROUPS` and returns false |
+
+Other process/thread pseudo-handles, access masks, token information classes,
+non-query buffers, impersonation state, token groups, security policy, and
+last-error behavior remain unmodeled. Unsupported shapes stop as unhandled;
+memory/return-frame failures preserve the bounded state established by the
+tests.
+
+The resulting observed main suffix is:
+
+- sample 1: `GetCurrentProcess`, `CheckRemoteDebuggerPresent`,
+  `GetCurrentThread`, `OpenThreadToken`, `GetCurrentProcess`,
+  `OpenProcessToken`, `GetTokenInformation`;
+- sample 3: `GetCurrentThread`, `OpenThreadToken`, `GetCurrentProcess`,
+  `OpenProcessToken`, `GetTokenInformation`.
+
+### Raised-cap production frontier: `VirtualAlloc`
+
+Normal release production runs with a 250,000,000 per-leg cap and 512-call
+bound now reach the same named frontier on both variants:
+
+| Observation | Formal sample 1 | Incomplete-provenance sample 3 |
+|---|---:|---:|
+| Handled main APIs before stop | 49 | 47 |
+| Main instructions after first yield | 224,235 | 190,472 |
+| Total guest instructions in terminal diagnostic | 36,156,143 | 37,899,761 |
+| `VirtualAlloc` arguments | `RCX=0`, `RDX=4`, `R8=0x1000`, `R9=4` | same |
+| OEP criterion | did not fire | did not fire |
+| Production output SHA-256 | `7327e7879fdb0580b256d3253eb2c44db0342ccf2f22c8ee03a3d1ba06533967` | `1e5212114f353c0b644ff05c88fe0382cebd79e77025b567e53209d3d7096582` |
+| Terminal diagnostic SHA-256 | `c0ed8c01d28ad6acafb32f5bfc45a2e05be435ec7ef7383b657453206e78215a` | `e9114c79a610a37afb679a2ee5af7fe38e1fb736eeb68a36c181ae247feaa683` |
+
+Each production output is byte-identical across two fresh invocations. The
+diagnostic reverse-maps target `0x00007fff00001140` to the synthetic
+`VirtualAlloc` stub and freezes the full register state above; the address is
+runtime evidence and is not production behavior. `VirtualAlloc` semantics are
+not added in this slice.
+
+Reproduce the raised-cap frontier locally:
+
+```text
+cargo build --locked --release --example run_loader \
+  --example trace_child_postmortem
+
+target/release/examples/run_loader \
+  samples/test_target_protected.exe 250000000 512 \
+  > /tmp/midas-slice-c-final-production-s1-run1.txt
+target/release/examples/run_loader \
+  samples/test_target_protected.exe 250000000 512 \
+  > /tmp/midas-slice-c-final-production-s1-run2.txt
+target/release/examples/run_loader \
+  samples/test_target3_protected.exe 250000000 512 \
+  > /tmp/midas-slice-c-final-production-s3-run1.txt
+target/release/examples/run_loader \
+  samples/test_target3_protected.exe 250000000 512 \
+  > /tmp/midas-slice-c-final-production-s3-run2.txt
+
+cmp /tmp/midas-slice-c-final-production-s1-run1.txt \
+  /tmp/midas-slice-c-final-production-s1-run2.txt
+cmp /tmp/midas-slice-c-final-production-s3-run1.txt \
+  /tmp/midas-slice-c-final-production-s3-run2.txt
+sha256sum /tmp/midas-slice-c-final-production-s{1,3}-run2.txt
+
+target/release/examples/trace_child_postmortem \
+  samples/test_target_protected.exe 250000000 100000 4096 \
+  --production-terminal > /tmp/midas-slice-c-final-frontier-s1.txt
+target/release/examples/trace_child_postmortem \
+  samples/test_target3_protected.exe 250000000 100000 4096 \
+  --production-terminal > /tmp/midas-slice-c-final-frontier-s3.txt
+sha256sum /tmp/midas-slice-c-final-frontier-s{1,3}.txt
+```
+
+This is an honest Slice C frontier, not OEP proof. Trace recording, VM
+detection, IR lifting, a general scheduler, and full token/thread/process memory
+semantics remain outside this slice. Formal two-sample acceptance also remains
+open: sample 1 has complete provenance, while sample 3 has author-supplied
+matching Themida version/configuration but still lacks source and
+pre-protection hashes. Sample 3 therefore remains engineering corroboration.

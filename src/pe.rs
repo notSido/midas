@@ -15,6 +15,8 @@ pub enum PeError {
     NotPe64,
     #[error("PE optional header is missing")]
     MissingOptionalHeader,
+    #[error("PE optional-header field {field} does not fit in 32 bits: {value:#x}")]
+    OptionalHeaderFieldOutOfRange { field: &'static str, value: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +41,10 @@ impl Section {
 pub struct PeImage {
     pub image_base: u64,
     pub entry_point_rva: u32,
+    pub base_of_code: u32,
+    pub size_of_code: u32,
+    pub section_alignment: u32,
+    pub file_alignment: u32,
     pub size_of_headers: u32,
     pub size_of_image: u32,
     pub subsystem: u16,
@@ -59,7 +65,20 @@ impl PeImage {
             .header
             .optional_header
             .ok_or(PeError::MissingOptionalHeader)?;
+        let standard_fields = optional_header.standard_fields;
         let windows_fields = optional_header.windows_fields;
+        let base_of_code = u32::try_from(standard_fields.base_of_code).map_err(|_| {
+            PeError::OptionalHeaderFieldOutOfRange {
+                field: "BaseOfCode",
+                value: standard_fields.base_of_code,
+            }
+        })?;
+        let size_of_code = u32::try_from(standard_fields.size_of_code).map_err(|_| {
+            PeError::OptionalHeaderFieldOutOfRange {
+                field: "SizeOfCode",
+                value: standard_fields.size_of_code,
+            }
+        })?;
 
         let sections = pe
             .sections
@@ -79,6 +98,10 @@ impl PeImage {
         Ok(PeImage {
             image_base: windows_fields.image_base,
             entry_point_rva: pe.entry,
+            base_of_code,
+            size_of_code,
+            section_alignment: windows_fields.section_alignment,
+            file_alignment: windows_fields.file_alignment,
             size_of_headers: windows_fields.size_of_headers,
             size_of_image: windows_fields.size_of_image,
             subsystem: windows_fields.subsystem,
@@ -223,6 +246,10 @@ mod tests {
         assert_eq!(image.image_base, 0x140000000);
         assert_eq!(image.entry_point_rva, 0x1000);
         assert_eq!(image.entry_point_va(), 0x140001000);
+        assert_eq!(image.base_of_code, 0x1000);
+        assert_eq!(image.size_of_code, 0x200);
+        assert_eq!(image.section_alignment, 0x1000);
+        assert_eq!(image.file_alignment, 0x200);
         assert_eq!(image.size_of_headers, 0x400);
         assert_eq!(image.size_of_image, 0x4000);
         assert_eq!(image.subsystem, 3);
@@ -268,6 +295,10 @@ mod tests {
         let image = PeImage {
             image_base: 0x140000000,
             entry_point_rva: 0x1000,
+            base_of_code: 0x1000,
+            size_of_code: 0x2000,
+            section_alignment: 0x1000,
+            file_alignment: 0x200,
             size_of_headers: 0x400,
             size_of_image: 0x10000,
             subsystem: 3,

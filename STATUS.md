@@ -52,6 +52,9 @@ implemented" section describe the latest production frontier.
 | Runtime-derived poll-release diagnostic: a persistent whole-run watch identifies the release producer as a child-thread byte-one store after a bounded nonzero return at the causally confirmed `CreateWindowExA` boundary; restored formal-sample main execution advances 64,695 instructions past the poll. Production scheduling/window semantics were absent at this diagnostic checkpoint, and no OEP proof was made. | [Formal finding and reproducer](docs/FINDINGS-M3-import-wall.md#poll-release-producer-is-a-post-createwindowexa-child-store) | M3 (groundwork) |
 | Runtime-derived post-release null classification: the restored main's zero-target register call is the failed kernel32 export-walk result for `GetCommandLineA` (option b), so this evidence does not require fine-grained child/main interleaving. | [Formal finding and reproducer](docs/FINDINGS-M3-import-wall.md#post-release-null-is-missing-getcommandlinea-resolution) | M3 (groundwork) |
 | A normal production `run_loader` uses a bounded CPU-context switch at main-thread `Sleep` to run one created child through `CreateWindowExA`/`RtlFreeHeap`, preserve its release store, and resume main; samples 1 and 3 next reach `GetCommandLineA`, while sample 2 has already handled it before the yield. No sample address or index enters `src`. | [Three-sample production replay and paired post-release classifier](docs/FINDINGS-M3-import-wall.md#production-cooperative-sleep-yield-releases-the-poll) | M3 |
+| The post-`SetCurrentDirectoryW` protected near-return is a missing export result, not an original-code transfer: runtime-derived narrow controls select `GetCurrentProcess` on sample 1 and `GetCurrentThread` on sample 3, while the crossed controls preserve the zero return. | [Slice C finding, controls, and replay](docs/FINDINGS-M3-import-wall.md#slice-c-the-post-directory-null-is-a-missing-name-return-the-oep-criterion-is-armed) | M4 (groundwork) |
+| Observation-driven process/security batch: full-width current-process/thread pseudo handles; a non-debugged current-process query; deterministic no-thread-token failure; a tracked query-only process-token handle; and the observed `TokenGroups` NULL/zero size query under an explicit empty-groups policy. | Focused direct/failure-atomicity/name-resolved tests plus the raised-cap production replay in the Slice C finding | M4 (groundwork) |
+| A fail-closed OEP criterion derives raw-backed original versus loader executable-section provenance from PE layout and preserved code metadata without names, then watches for the first unseen indirect tail transfer from loader code into declared original code and freezes a decodable target instruction plus all 18 registers before target execution; an incomplete proof payload cannot emit a candidate. | `cargo test oep::` and bounded emulator/scheduler integration tests; raised-cap samples arm the criterion and report that it does not fire before the current frontier | M4 (groundwork) |
 
 ## Not yet implemented
 
@@ -60,24 +63,23 @@ its VM-slot diagnosis, and the bounded in-image-stub experiment remain historica
 evidence in `docs/FINDINGS-M3-import-wall.md`; that experiment did not advance the
 observable frontier and did not prove candidate 1 causally false.
 
-The production runner now applies one coarse assumption: a supported finite
+The production runner applies one coarse assumption: a supported finite
 main-thread `Sleep` is a cooperative yield when a created thread remains
 unclaimed. It saves the returned main CPU context, runs the lowest-ID child on a
 fresh bounded stack and minimal TEB/GS until its NX return guard, child `Sleep`,
 API/fault wall, or cap, then restores main. This assumption is verified only
-through the observed `GetCommandLineA` boundary and must be re-tested at every
-later child boundary; it is not a general scheduler claim.
+for the observed release turn and must be re-tested at every later child
+boundary; it is not a general scheduler claim.
 
-The current formal sample-1 production frontier is a new child null after
-`RtlFreeHeap`, followed by restored-main `GetCommandLineA`, two bounded
-`SetCurrentDirectoryW` calls, and a later null control transfer. Sample 3
-repeats that release shape as engineering corroboration. Sample 2 also leaves
-the `Sleep` loop after the same child suffix, but has already handled
-`GetCommandLineA` before creating the child. Samples 2 and 3 now have
-author-supplied matching Themida version/configuration, but their source and
-pre-protection hashes remain unavailable, so the charter's formal two-sample
-acceptance remains externally blocked. None of the later nulls is classified
-as OEP.
+The current formal sample-1 production frontier is the observed
+`VirtualAlloc(NULL, 4, MEM_COMMIT, PAGE_READWRITE)` call after the child release,
+the directory calls, and the bounded process/security batch above. Sample 3
+reaches the same named call as engineering corroboration. The child still has a
+separate null after `RtlFreeHeap`; its CPU state is not retained. Samples 2 and
+3 have author-supplied matching Themida version/configuration, but their source
+and pre-protection hashes remain unavailable, so the charter's formal
+two-sample acceptance remains externally blocked. The OEP criterion is armed
+but has not fired on either raised-cap production replay.
 
 The cooperative runner does not preserve a stopped child CPU context or model
 suspend/resume, termination, join/wait/signaling, DLL thread notifications,
@@ -86,9 +88,12 @@ inheritance, concurrency, or last-error state. `CreateWindowExA` returns only a
 stable opaque HWND without window state, WndProc/message dispatch, or a message
 loop. `RtlFreeHeap` removes live allocation metadata without unmapping or reuse;
 `GetCommandLineA` exposes only the fixed process-owned `C:\guest.exe` buffer.
-`RtlReAllocateHeap`, broader filesystem/module semantics, and general USER32
-behavior remain unmodeled. The full evidence chain and current reproducers are
-in `docs/FINDINGS-M3-import-wall.md`.
+Thread impersonation, general token/group/security semantics, last-error state,
+handle closure, `RtlReAllocateHeap`, broader filesystem/module semantics, and
+general USER32 behavior remain unmodeled. The full evidence chain and current
+reproducers are in `docs/FINDINGS-M3-import-wall.md`.
 
-Also not implemented (per `docs/CHARTER.md`): OEP detection, trace recording, VM
-detection, and the IR lifter. None has a passing acceptance artifact yet.
+OEP proof is not complete: no candidate has fired, so there is no reproducible
+OEP RIP/register snapshot or corroborating runtime disassembly. Also not
+implemented (per `docs/CHARTER.md`): trace recording, VM detection, and the IR
+lifter. None has a passing acceptance artifact yet.
