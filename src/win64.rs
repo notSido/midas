@@ -1,11 +1,15 @@
 //! Minimal Win64 import-call trap and API stubs.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::LazyLock,
+};
 
 use crate::{
     emu::{
-        Emu, EmuError, FaultKind, RegisterX86, StopReason, PEB_BASE, STACK_BASE, STACK_SIZE,
-        TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_SIZE, TEB_STACKBASE_OFFSET, TEB_STACKLIMIT_OFFSET,
+        Emu, EmuError, FaultKind, IndirectTransferObservation, PageProtection, RegisterX86,
+        StopReason, PEB_BASE, STACK_BASE, STACK_SIZE, TEB_PEB_OFFSET, TEB_SELF_OFFSET, TEB_SIZE,
+        TEB_STACKBASE_OFFSET, TEB_STACKLIMIT_OFFSET,
     },
     pe,
 };
@@ -14,6 +18,7 @@ const IMPORT_NAME_CAP: usize = 256;
 const SET_CURRENT_DIRECTORY_W_UNIT_CAP: usize = 260;
 const WIDE_CHAR_TO_MULTI_BYTE_UNIT_CAP: usize = 260;
 const WINDOW_CLASS_NAME_BYTE_CAP: usize = 256;
+const REGISTRY_SUBKEY_BYTE_CAP: usize = 256;
 const DIAGNOSTIC_EXPORT_NAME_CAP: usize = 4_096;
 const WNDCLASSEXA_SIZE: usize = 80;
 const FAKE_MODULE_BASE_START: u64 = 0x0000_7fff_0000_0000;
@@ -27,9 +32,144 @@ const HEAP_ARENA_SIZE: u64 = 0x1000_0000;
 const HEAP_ALIGNMENT: u64 = 16;
 const HEAP_NO_SERIALIZE: u32 = 0x1;
 const HEAP_ZERO_MEMORY: u32 = 0x8;
+const VIRTUAL_ALLOCATION_GRANULARITY: u64 = 0x1_0000;
+const VIRTUAL_ALLOCATION_ARENA_BASE: u64 = STACK_BASE + STACK_SIZE;
+const VIRTUAL_ALLOCATION_ARENA_SIZE: u64 = 0x1000_0000;
+const VIRTUAL_ALLOCATION_ARENA_END: u64 =
+    VIRTUAL_ALLOCATION_ARENA_BASE + VIRTUAL_ALLOCATION_ARENA_SIZE;
+const SID_ALLOCATION_ARENA_BASE: u64 = VIRTUAL_ALLOCATION_ARENA_END;
+const SID_ALLOCATION_ARENA_SIZE: u64 = 0x0100_0000;
+const SID_ALLOCATION_ARENA_END: u64 = SID_ALLOCATION_ARENA_BASE + SID_ALLOCATION_ARENA_SIZE;
+const EXCEPTION_DISPATCH_ARENA_BASE: u64 = SID_ALLOCATION_ARENA_END;
+const EXCEPTION_DISPATCH_ARENA_SIZE: u64 = 0x0100_0000;
+const EXCEPTION_DISPATCH_ARENA_END: u64 =
+    EXCEPTION_DISPATCH_ARENA_BASE + EXCEPTION_DISPATCH_ARENA_SIZE;
+const EXCEPTION_POINTERS_OFFSET: usize = 0;
+const EXCEPTION_RECORD_OFFSET: usize = 0x20;
+const EXCEPTION_RECORD_SIZE: usize = 0x98;
+const AMD64_CONTEXT_OFFSET: usize = 0xc0;
+const AMD64_CONTEXT_SIZE: usize = 0x4d0;
+const AMD64_CONTEXT_FLAGS_OFFSET: usize = 0x30;
+const AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS: [usize; 6] = [0x48, 0x50, 0x58, 0x60, 0x68, 0x70];
+const AMD64_CONTEXT_EFLAGS_OFFSET: usize = 0x44;
+const AMD64_CONTEXT_RAX_OFFSET: usize = 0x78;
+const AMD64_CONTEXT_RCX_OFFSET: usize = 0x80;
+const AMD64_CONTEXT_RDX_OFFSET: usize = 0x88;
+const AMD64_CONTEXT_RBX_OFFSET: usize = 0x90;
+const AMD64_CONTEXT_RSP_OFFSET: usize = 0x98;
+const AMD64_CONTEXT_RBP_OFFSET: usize = 0xa0;
+const AMD64_CONTEXT_RSI_OFFSET: usize = 0xa8;
+const AMD64_CONTEXT_RDI_OFFSET: usize = 0xb0;
+const AMD64_CONTEXT_R8_OFFSET: usize = 0xb8;
+const AMD64_CONTEXT_R9_OFFSET: usize = 0xc0;
+const AMD64_CONTEXT_R10_OFFSET: usize = 0xc8;
+const AMD64_CONTEXT_R11_OFFSET: usize = 0xd0;
+const AMD64_CONTEXT_R12_OFFSET: usize = 0xd8;
+const AMD64_CONTEXT_R13_OFFSET: usize = 0xe0;
+const AMD64_CONTEXT_R14_OFFSET: usize = 0xe8;
+const AMD64_CONTEXT_R15_OFFSET: usize = 0xf0;
+const AMD64_CONTEXT_RIP_OFFSET: usize = 0xf8;
+const CONTEXT_AMD64_DEBUG_REGISTERS: u32 = 0x0010_0010;
+const CONTEXT_AMD64_CONTROL_INTEGER: u32 = 0x0010_0003;
+const EXCEPTION_MAXIMUM_PARAMETERS: usize = 15;
+const EXCEPTION_NONCONTINUABLE: u32 = 1;
+const EXCEPTION_CONTINUE_EXECUTION: u32 = u32::MAX;
+const EXCEPTION_CALLBACK_STACK_HEADROOM: u64 = 0x100;
+const _: () = assert!(EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE <= AMD64_CONTEXT_OFFSET);
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RELEASE: u32 = 0x8000;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const FIRMWARE_PROVIDER_RSMB: u32 = 0x5253_4d42;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const SID_REVISION: u8 = 1;
+const SID_IDENTIFIER_AUTHORITY_SIZE: usize = 6;
+const SID_MAX_SUB_AUTHORITIES: u8 = 8;
 const TOKEN_QUERY: u32 = 0x8;
 const TOKEN_INFORMATION_CLASS_GROUPS: u32 = 2;
 const EMPTY_TOKEN_GROUPS_SIZE: u32 = 4;
+const PROCESS_INFORMATION_CLASS_DEBUG_PORT: u32 = 7;
+const PROCESS_INFORMATION_CLASS_DEBUG_OBJECT_HANDLE: u32 = 30;
+const SYSTEM_INFORMATION_CLASS_MODULE_INFORMATION: u32 = 11;
+const SYSTEM_MODULE_INFORMATION_COUNT_SIZE: u32 = 4;
+const THREAD_INFORMATION_CLASS_HIDE_FROM_DEBUGGER: u32 = 17;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xc000_0004;
+const STATUS_PORT_NOT_SET: u32 = 0xc000_0353;
+
+const EXCEPTION_DISPATCH_REGISTER_ORDER: [RegisterX86; 29] = [
+    RegisterX86::RAX,
+    RegisterX86::RBX,
+    RegisterX86::RCX,
+    RegisterX86::RDX,
+    RegisterX86::RSI,
+    RegisterX86::RDI,
+    RegisterX86::RBP,
+    RegisterX86::RSP,
+    RegisterX86::R8,
+    RegisterX86::R9,
+    RegisterX86::R10,
+    RegisterX86::R11,
+    RegisterX86::R12,
+    RegisterX86::R13,
+    RegisterX86::R14,
+    RegisterX86::R15,
+    RegisterX86::RIP,
+    RegisterX86::EFLAGS,
+    RegisterX86::FS_BASE,
+    RegisterX86::GS_BASE,
+    RegisterX86::MXCSR,
+    RegisterX86::FPCW,
+    RegisterX86::FPSW,
+    RegisterX86::FPTAG,
+    RegisterX86::FIP,
+    RegisterX86::FCS,
+    RegisterX86::FDP,
+    RegisterX86::FDS,
+    RegisterX86::FOP,
+];
+const EXCEPTION_DISPATCH_XMM_REGISTERS: [RegisterX86; 16] = [
+    RegisterX86::XMM0,
+    RegisterX86::XMM1,
+    RegisterX86::XMM2,
+    RegisterX86::XMM3,
+    RegisterX86::XMM4,
+    RegisterX86::XMM5,
+    RegisterX86::XMM6,
+    RegisterX86::XMM7,
+    RegisterX86::XMM8,
+    RegisterX86::XMM9,
+    RegisterX86::XMM10,
+    RegisterX86::XMM11,
+    RegisterX86::XMM12,
+    RegisterX86::XMM13,
+    RegisterX86::XMM14,
+    RegisterX86::XMM15,
+];
+const EXCEPTION_DISPATCH_X87_REGISTERS: [RegisterX86; 8] = [
+    RegisterX86::ST0,
+    RegisterX86::ST1,
+    RegisterX86::ST2,
+    RegisterX86::ST3,
+    RegisterX86::ST4,
+    RegisterX86::ST5,
+    RegisterX86::ST6,
+    RegisterX86::ST7,
+];
+const EXCEPTION_DISPATCH_FP_CONTROL_REGISTERS: [RegisterX86; 9] = [
+    RegisterX86::MXCSR,
+    RegisterX86::FPCW,
+    RegisterX86::FPSW,
+    RegisterX86::FPTAG,
+    RegisterX86::FIP,
+    RegisterX86::FCS,
+    RegisterX86::FDP,
+    RegisterX86::FDS,
+    RegisterX86::FOP,
+];
 
 /// Total instruction budget for one cooperatively selected child run.
 const COOPERATIVE_CHILD_INSTRUCTION_CAP: u64 = 100_000;
@@ -97,6 +237,9 @@ const VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE: u64 = 0x10;
 const KERNEL_HANDLE_BASE: u64 = 0x0000_000f_3000_1000;
 const KERNEL_HANDLE_STRIDE: u64 = 0x10;
 
+/// Observed zero-extended predefined handle for HKEY_LOCAL_MACHINE.
+const HKEY_LOCAL_MACHINE: u64 = 0x0000_0000_8000_0002;
+
 /// Opaque handle for the sole modeled shared system cursor. It occupies the
 /// unmapped gap after the process-heap handle and before the kernel-handle
 /// namespace.
@@ -123,34 +266,24 @@ pub const SYNTHETIC_EXPORT_DIR_RVA: u32 = 0x200;
 /// Byte spacing between synthetic export call targets.
 pub const SYNTHETIC_STUB_STRIDE: u32 = 16;
 
-/// Seed kernel32 export names expanded by observation, not a completeness claim.
-/// A real kernel32 provider will replace this later.
-pub const KERNEL32_EXPORTS: &[&str] = &[
-    "LoadLibraryA",
-    "LoadLibraryW",
-    "GetProcAddress",
-    "GetProcessHeap",
-    "GetModuleHandleA",
-    "GetModuleHandleW",
-    "VirtualAlloc",
-    "VirtualProtect",
-    "VirtualFree",
-    "ExitProcess",
-    "GetUserDefaultUILanguage",
-    "GetCurrentProcess",
-    "GetCurrentThread",
-    "CheckRemoteDebuggerPresent",
-    "GetCurrentThreadId",
-    "GetCurrentDirectoryW",
-    "GetCommandLineA",
-    "SetCurrentDirectoryW",
-    "GetModuleFileNameW",
-    "OpenThread",
-    "CreateThread",
-    "GetVersion",
-    "Sleep",
-    "WideCharToMultiByte",
-];
+/// Sorted export-name snapshot derived from the authorized names-only
+/// `samples/kernel32.dll` support asset. No bytes or implementation from that
+/// DLL are mapped or executed. The complete catalog is required when the guest
+/// validates the provider while rebuilding its original imports; a short
+/// incremental seed reaches the loader's explicit "Wrong DLL" path.
+pub static KERNEL32_EXPORTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let names = include_str!("kernel32_exports.txt")
+        .lines()
+        .collect::<Vec<_>>();
+    assert!(!names.is_empty() && names.len() <= DIAGNOSTIC_EXPORT_NAME_CAP);
+    assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(names.iter().all(|name| {
+        !name.is_empty()
+            && name.len() <= IMPORT_NAME_CAP
+            && name.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    }));
+    names
+});
 
 /// Seed ntdll export names observed during the bootstrap export walk; this is
 /// not a completeness claim.
@@ -159,14 +292,51 @@ const NTDLL_EXPORTS: &[&str] = &[
     "RtlLeaveCriticalSection",
     "RtlInitializeCriticalSection",
     "RtlAddVectoredExceptionHandler",
+    "RtlRemoveVectoredExceptionHandler",
     "NtQueryObject",
+    "ZwQueryInformationProcess",
+    "ZwSetInformationThread",
     "RtlAllocateHeap",
     "RtlReAllocateHeap",
     "RtlFreeHeap",
 ];
 
-const USER32_EXPORTS: &[&str] = &["CreateWindowExA", "LoadCursorA", "RegisterClassExA"];
-const ADVAPI32_EXPORTS: &[&str] = &["GetTokenInformation", "OpenProcessToken", "OpenThreadToken"];
+const USER32_EXPORTS: &[&str] = &[
+    "CreateWindowExA",
+    "FindWindowA",
+    "LoadCursorA",
+    "RegisterClassExA",
+    // Names-only provider evidence: no natural call has established an ABI
+    // treatment, so dispatch deliberately remains unimplemented.
+    "SendMessageA",
+];
+const ADVAPI32_EXPORTS: &[&str] = &[
+    "AllocateAndInitializeSid",
+    "FreeSid",
+    "GetTokenInformation",
+    "OpenProcessToken",
+    "OpenThreadToken",
+    "RegOpenKeyA",
+];
+/// Sorted, bounded names-only catalog required by the protected loader's
+/// `msvcrt.dll` export-name validation. The guest hashes these names before it
+/// reads any function or ordinal table. A one-name declared-import seed reaches
+/// the loader's explicit wrong-provider path; this same catalog escapes that
+/// path unchanged on both exercised protected samples. No DLL implementation
+/// bytes are mapped or executed.
+static MSVCRT_EXPORTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let names = include_str!("msvcrt_exports.txt")
+        .lines()
+        .collect::<Vec<_>>();
+    assert!(!names.is_empty() && names.len() <= DIAGNOSTIC_EXPORT_NAME_CAP);
+    assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(names.iter().all(|name| {
+        !name.is_empty()
+            && name.len() <= IMPORT_NAME_CAP
+            && name.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    }));
+    names
+});
 
 #[derive(Debug, Clone)]
 pub struct SyntheticModule {
@@ -353,6 +523,47 @@ fn align_up_u32(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
 
+fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    debug_assert!(alignment.is_power_of_two());
+    value
+        .checked_add(alignment.checked_sub(1)?)
+        .map(|with_padding| with_padding & !(alignment - 1))
+}
+
+fn virtual_protect_page_range(address: u64, size: u64) -> Option<(u64, u64)> {
+    if address == 0 || size == 0 {
+        return None;
+    }
+    let page_size = u64::from(PAGE_SIZE);
+    let base = address & !(page_size - 1);
+    let end = align_up_u64(address.checked_add(size)?, page_size)?;
+    let mapped_size = end.checked_sub(base)?;
+    (mapped_size != 0).then_some((base, mapped_size))
+}
+
+fn page_protection_from_win32(value: u32) -> Option<PageProtection> {
+    match value {
+        PAGE_NOACCESS => Some(PageProtection::NoAccess),
+        PAGE_READONLY => Some(PageProtection::ReadOnly),
+        PAGE_READWRITE => Some(PageProtection::ReadWrite),
+        PAGE_EXECUTE => Some(PageProtection::Execute),
+        PAGE_EXECUTE_READ => Some(PageProtection::ExecuteRead),
+        PAGE_EXECUTE_READWRITE => Some(PageProtection::ExecuteReadWrite),
+        _ => None,
+    }
+}
+
+fn page_protection_to_win32(value: PageProtection) -> u32 {
+    match value {
+        PageProtection::NoAccess => PAGE_NOACCESS,
+        PageProtection::ReadOnly => PAGE_READONLY,
+        PageProtection::ReadWrite => PAGE_READWRITE,
+        PageProtection::Execute => PAGE_EXECUTE,
+        PageProtection::ExecuteRead => PAGE_EXECUTE_READ,
+        PageProtection::ExecuteReadWrite => PAGE_EXECUTE_READWRITE,
+    }
+}
+
 fn write_bytes(image: &mut [u8], offset: usize, value: &[u8]) {
     let Some(end) = offset.checked_add(value.len()) else {
         return;
@@ -406,6 +617,21 @@ struct HeapAllocation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtualAllocation {
+    requested_size: u64,
+    mapped_size: u64,
+    allocation_type: u32,
+    protection: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidAllocation {
+    sid_size: u64,
+    mapped_size: u64,
+    sub_authority_count: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelObject {
     Thread { thread_id: u32 },
     ProcessToken,
@@ -435,7 +661,58 @@ pub struct RunnableUnscheduledThread {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VectoredExceptionHandlerRegistration {
     token: u64,
+    first: u32,
     handler: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingVectoredException {
+    code: u32,
+    flags: u32,
+    handlers: Vec<u64>,
+    next_handler_index: usize,
+    current_handler: u64,
+    exception_pointers: u64,
+    exception_record: u64,
+    context_record: u64,
+    return_guard: u64,
+    callback_rsp: u64,
+    dispatcher_registers: [u64; EXCEPTION_DISPATCH_REGISTER_ORDER.len()],
+    dispatcher_xmm_registers: [[u8; 16]; EXCEPTION_DISPATCH_XMM_REGISTERS.len()],
+    dispatcher_x87_registers: [[u8; 10]; EXCEPTION_DISPATCH_X87_REGISTERS.len()],
+    initial_context: Vec<u8>,
+    thread_id: u32,
+}
+
+/// Frozen evidence for a VEH-mediated `CONTEXT.Rip` change.
+///
+/// This is not classified as a guest indirect transfer: the host context
+/// restore has no guest predecessor instruction. The trap runner stops before
+/// executing `continuation_rip`, preventing the OEP watch from silently
+/// marking that target as already executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionContinuationObservation {
+    pub thread_id: u32,
+    pub exception_code: u32,
+    /// Handler that returned `EXCEPTION_CONTINUE_EXECUTION`. An earlier
+    /// continue-search handler may have authored the context mutation.
+    pub continuing_handler: u64,
+    pub original_rip: u64,
+    pub continuation_rip: u64,
+    pub context_record: u64,
+    pub registers: Vec<(RegisterX86, u64)>,
+    pub target_bytes: Vec<u8>,
+    pub context_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectoredExceptionReturn {
+    Resume,
+    ChangedContinuation,
+    HandlersExhausted { code: u32 },
+    Noncontinuable { code: u32 },
+    InvalidDisposition { code: u32, disposition: u32 },
+    InvalidContext { code: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,6 +796,9 @@ pub struct Win64Env {
     executable_path: [u16; 12],
     next_vectored_exception_handler_token: u64,
     vectored_exception_handlers: Vec<VectoredExceptionHandlerRegistration>,
+    next_exception_dispatch_base: u64,
+    pending_vectored_exceptions: BTreeMap<u32, PendingVectoredException>,
+    changed_exception_continuation: Option<ExceptionContinuationObservation>,
     next_kernel_handle: u64,
     kernel_handles: BTreeMap<u64, KernelHandle>,
     next_thread_id: u64,
@@ -527,6 +807,10 @@ pub struct Win64Env {
     next_cooperative_runtime_base: u64,
     heap_cursor: u64,
     heap_allocations: BTreeMap<u64, HeapAllocation>,
+    virtual_allocation_cursor: u64,
+    virtual_allocations: BTreeMap<u64, VirtualAllocation>,
+    sid_allocation_cursor: u64,
+    sid_allocations: BTreeMap<u64, SidAllocation>,
     command_line_a_mapped: bool,
     modules: BTreeMap<String, u64>,
     next_base: u64,
@@ -550,6 +834,9 @@ impl Win64Env {
             executable_path: EMULATED_EXECUTABLE_PATH,
             next_vectored_exception_handler_token: VECTORED_EXCEPTION_HANDLER_TOKEN_BASE,
             vectored_exception_handlers: Vec::new(),
+            next_exception_dispatch_base: EXCEPTION_DISPATCH_ARENA_BASE,
+            pending_vectored_exceptions: BTreeMap::new(),
+            changed_exception_continuation: None,
             next_kernel_handle: KERNEL_HANDLE_BASE,
             kernel_handles: BTreeMap::new(),
             next_thread_id: CREATED_THREAD_ID_BASE,
@@ -558,6 +845,10 @@ impl Win64Env {
             next_cooperative_runtime_base: COOPERATIVE_THREAD_RUNTIME_BASE,
             heap_cursor: HEAP_ARENA_BASE,
             heap_allocations: BTreeMap::new(),
+            virtual_allocation_cursor: VIRTUAL_ALLOCATION_ARENA_BASE,
+            virtual_allocations: BTreeMap::new(),
+            sid_allocation_cursor: SID_ALLOCATION_ARENA_BASE,
+            sid_allocations: BTreeMap::new(),
             command_line_a_mapped: false,
             modules: BTreeMap::new(),
             next_base: FAKE_MODULE_BASE_START,
@@ -604,6 +895,33 @@ impl Win64Env {
         self.window_classes_by_atom
             .iter()
             .map(|(&atom, class)| (atom, class.window_procedure))
+    }
+
+    /// Iterate over registered vectored exception handlers in current dispatch
+    /// order as `(order, token, first, handler)` tuples.
+    ///
+    /// This is a read-only diagnostic projection. It does not invoke handlers
+    /// or assign removal, dispatch, exception, or lifecycle semantics.
+    pub fn vectored_exception_handler_registrations(
+        &self,
+    ) -> impl Iterator<Item = (usize, u64, u32, u64)> + '_ {
+        self.vectored_exception_handlers
+            .iter()
+            .enumerate()
+            .map(|(order, registration)| {
+                (
+                    order,
+                    registration.token,
+                    registration.first,
+                    registration.handler,
+                )
+            })
+    }
+
+    /// Return the first frozen host-mediated exception continuation whose RIP
+    /// differs from the logical RaiseException return point.
+    pub fn changed_exception_continuation(&self) -> Option<&ExceptionContinuationObservation> {
+        self.changed_exception_continuation.as_ref()
     }
 
     /// Iterate over mapped synthetic module image ranges in normalized-name
@@ -659,9 +977,10 @@ impl Win64Env {
     }
 
     fn add_vectored_exception_handler(&mut self, first: u32, handler: u64) -> u64 {
-        // Bounded policy: registration only records the opaque callback value
-        // and insertion order. It does not inspect callback memory or model
-        // dispatch, removal, lifetime, or synchronization semantics.
+        // Registration records an opaque callback and Windows-compatible
+        // insertion order. A RaiseException dispatch snapshots this ordered
+        // list; concurrent mutation of an active dispatch remains outside the
+        // model.
         let token = self.next_vectored_exception_handler_token;
         let Some(next_token) = token.checked_add(VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE) else {
             return 0;
@@ -677,7 +996,11 @@ impl Win64Env {
             return 0;
         }
 
-        let registration = VectoredExceptionHandlerRegistration { token, handler };
+        let registration = VectoredExceptionHandlerRegistration {
+            token,
+            first,
+            handler,
+        };
         if first == 0 {
             self.vectored_exception_handlers.push(registration);
         } else {
@@ -685,6 +1008,308 @@ impl Win64Env {
         }
         self.next_vectored_exception_handler_token = next_token;
         token
+    }
+
+    fn has_pending_vectored_exception(&self) -> bool {
+        self.pending_vectored_exceptions
+            .contains_key(&self.current_thread_id)
+    }
+
+    fn begin_vectored_exception_dispatch(
+        &mut self,
+        emu: &mut Emu,
+        code: u32,
+        flags: u32,
+        argument_count: u32,
+        arguments: u64,
+    ) -> Result<bool, EmuError> {
+        let thread_id = self.current_thread_id;
+        if self.pending_vectored_exceptions.contains_key(&thread_id) {
+            // Nested software exceptions need a bounded per-thread stack. Do
+            // not overwrite the active dispatch until that behavior is
+            // observed and modeled.
+            return Ok(false);
+        }
+
+        let effective_count = if argument_count == 0 || arguments == 0 {
+            0
+        } else {
+            usize::try_from(argument_count)
+                .unwrap_or(usize::MAX)
+                .min(EXCEPTION_MAXIMUM_PARAMETERS)
+        };
+        let information = if effective_count == 0 {
+            Vec::new()
+        } else {
+            let byte_len = effective_count
+                .checked_mul(std::mem::size_of::<u64>())
+                .ok_or(EmuError::AddressRangeOverflow {
+                    base: arguments,
+                    size: u64::MAX,
+                })?;
+            emu.read_mem(arguments, byte_len)?
+        };
+
+        let (continuation_rip, continuation_rsp) = preflight_api_return(emu)?;
+        let api_rsp = emu.read_reg(RegisterX86::RSP)?;
+        let callback_rsp = api_rsp
+            .checked_sub(EXCEPTION_CALLBACK_STACK_HEADROOM)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: api_rsp,
+                size: EXCEPTION_CALLBACK_STACK_HEADROOM,
+            })?;
+        if callback_rsp & 0xf != 8 {
+            return Ok(false);
+        }
+        // The callback receives a normal Win64 entry frame: one return cell
+        // plus the caller-owned 32-byte home area.
+        emu.preflight_write_mem(callback_rsp, 0x28)?;
+
+        let dispatch_base = self.next_exception_dispatch_base;
+        let Some(next_dispatch_base) = dispatch_base.checked_add(u64::from(PAGE_SIZE)) else {
+            return Ok(false);
+        };
+        if !(EXCEPTION_DISPATCH_ARENA_BASE..EXCEPTION_DISPATCH_ARENA_END).contains(&dispatch_base)
+            || !dispatch_base.is_multiple_of(u64::from(PAGE_SIZE))
+            || next_dispatch_base > EXCEPTION_DISPATCH_ARENA_END
+            || self
+                .pending_vectored_exceptions
+                .values()
+                .any(|pending| pending.return_guard == dispatch_base)
+        {
+            return Ok(false);
+        }
+
+        let mut dispatcher_registers = [0u64; EXCEPTION_DISPATCH_REGISTER_ORDER.len()];
+        for (slot, register) in dispatcher_registers
+            .iter_mut()
+            .zip(EXCEPTION_DISPATCH_REGISTER_ORDER)
+        {
+            *slot = emu.read_reg(register)?;
+        }
+        let mut dispatcher_xmm_registers = [[0u8; 16]; EXCEPTION_DISPATCH_XMM_REGISTERS.len()];
+        for (slot, register) in dispatcher_xmm_registers
+            .iter_mut()
+            .zip(EXCEPTION_DISPATCH_XMM_REGISTERS)
+        {
+            *slot = emu.read_reg_128(register)?;
+        }
+        let mut dispatcher_x87_registers = [[0u8; 10]; EXCEPTION_DISPATCH_X87_REGISTERS.len()];
+        for (slot, register) in dispatcher_x87_registers
+            .iter_mut()
+            .zip(EXCEPTION_DISPATCH_X87_REGISTERS)
+        {
+            *slot = emu.read_reg_80(register)?;
+        }
+
+        let exception_pointers = dispatch_base
+            .checked_add(EXCEPTION_POINTERS_OFFSET as u64)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: dispatch_base,
+                size: EXCEPTION_POINTERS_OFFSET as u64,
+            })?;
+        let exception_record = dispatch_base
+            .checked_add(EXCEPTION_RECORD_OFFSET as u64)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: dispatch_base,
+                size: EXCEPTION_RECORD_OFFSET as u64,
+            })?;
+        let context_record = dispatch_base
+            .checked_add(AMD64_CONTEXT_OFFSET as u64)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: dispatch_base,
+                size: AMD64_CONTEXT_OFFSET as u64,
+            })?;
+
+        let mut page = vec![0u8; PAGE_SIZE as usize];
+        debug_assert!(AMD64_CONTEXT_OFFSET + AMD64_CONTEXT_SIZE <= page.len());
+        write_u64(&mut page, EXCEPTION_POINTERS_OFFSET, exception_record);
+        write_u64(
+            &mut page,
+            EXCEPTION_POINTERS_OFFSET + std::mem::size_of::<u64>(),
+            context_record,
+        );
+        write_u32(&mut page, EXCEPTION_RECORD_OFFSET, code);
+        // This bounded provider collapses kernel32!RaiseException and the
+        // ntdll raise path into one host transition. The observed first VEH
+        // ignores the structures, so expose only the integer/control fields
+        // Midas can restore exactly. Native AMD64 providers capture additional
+        // segment and FP state; the callback's live XMM/x87/control state is
+        // nevertheless snapshotted separately below and restored on return.
+        write_u32(
+            &mut page,
+            EXCEPTION_RECORD_OFFSET + 4,
+            flags & EXCEPTION_NONCONTINUABLE,
+        );
+        write_u64(&mut page, EXCEPTION_RECORD_OFFSET + 0x10, continuation_rip);
+        write_u32(
+            &mut page,
+            EXCEPTION_RECORD_OFFSET + 0x18,
+            effective_count as u32,
+        );
+        write_bytes(&mut page, EXCEPTION_RECORD_OFFSET + 0x20, &information);
+
+        write_u32(
+            &mut page,
+            AMD64_CONTEXT_OFFSET + AMD64_CONTEXT_FLAGS_OFFSET,
+            CONTEXT_AMD64_CONTROL_INTEGER,
+        );
+        write_u32(
+            &mut page,
+            AMD64_CONTEXT_OFFSET + AMD64_CONTEXT_EFLAGS_OFFSET,
+            snapshot_register_value(&dispatcher_registers, RegisterX86::EFLAGS) as u32,
+        );
+        for (register, offset) in amd64_context_integer_layout() {
+            let value = match register {
+                RegisterX86::RSP => continuation_rsp,
+                RegisterX86::RIP => continuation_rip,
+                _ => snapshot_register_value(&dispatcher_registers, register),
+            };
+            write_u64(&mut page, AMD64_CONTEXT_OFFSET + offset, value);
+        }
+        let initial_context =
+            page[AMD64_CONTEXT_OFFSET..AMD64_CONTEXT_OFFSET + AMD64_CONTEXT_SIZE].to_vec();
+
+        // All fallible reads and caller-stack validation are complete before
+        // allocating or mutating environment-owned exception state.
+        emu.map_zeroed_rw(dispatch_base, u64::from(PAGE_SIZE))?;
+        if let Err(error) = emu.write_mem(dispatch_base, &page) {
+            emu.unmap(dispatch_base, u64::from(PAGE_SIZE))?;
+            return Err(error);
+        }
+
+        let handlers = self
+            .vectored_exception_handlers
+            .iter()
+            .map(|registration| registration.handler)
+            .collect::<Vec<_>>();
+        let current_handler = handlers.first().copied().unwrap_or(0);
+        let pending = PendingVectoredException {
+            code,
+            flags: flags & EXCEPTION_NONCONTINUABLE,
+            next_handler_index: usize::from(!handlers.is_empty()),
+            handlers,
+            current_handler,
+            exception_pointers,
+            exception_record,
+            context_record,
+            return_guard: dispatch_base,
+            callback_rsp,
+            dispatcher_registers,
+            dispatcher_xmm_registers,
+            dispatcher_x87_registers,
+            initial_context,
+            thread_id,
+        };
+        let setup_result = if pending.handlers.is_empty() {
+            install_empty_vectored_exception_guard(emu, &pending)
+        } else {
+            install_vectored_exception_callback(emu, &pending)
+        };
+        if let Err(error) = setup_result {
+            // The dispatch page is not yet reachable through environment
+            // state, so remove it before returning a late setup failure.
+            emu.unmap(dispatch_base, u64::from(PAGE_SIZE))?;
+            return Err(error);
+        }
+        self.next_exception_dispatch_base = next_dispatch_base;
+        self.pending_vectored_exceptions.insert(thread_id, pending);
+        Ok(true)
+    }
+
+    fn advance_vectored_exception_dispatch_on_guard(
+        &mut self,
+        emu: &mut Emu,
+        address: u64,
+    ) -> Result<Option<VectoredExceptionReturn>, EmuError> {
+        let thread_id = self.current_thread_id;
+        let Some(mut pending) = self.pending_vectored_exceptions.get(&thread_id).cloned() else {
+            return Ok(None);
+        };
+        if pending.thread_id != thread_id
+            || pending.return_guard != address
+            || emu.read_reg(RegisterX86::RIP)? != address
+            || pending.callback_rsp.checked_add(8) != Some(emu.read_reg(RegisterX86::RSP)?)
+        {
+            return Ok(None);
+        }
+        if pending.handlers.is_empty() {
+            return Ok(Some(VectoredExceptionReturn::HandlersExhausted {
+                code: pending.code,
+            }));
+        }
+
+        let disposition = emu.read_reg(RegisterX86::RAX)? as u32;
+        match disposition {
+            0 => {
+                let Some(&next_handler) = pending.handlers.get(pending.next_handler_index) else {
+                    return Ok(Some(VectoredExceptionReturn::HandlersExhausted {
+                        code: pending.code,
+                    }));
+                };
+                pending.next_handler_index += 1;
+                pending.current_handler = next_handler;
+                install_vectored_exception_callback(emu, &pending)?;
+                self.pending_vectored_exceptions.insert(thread_id, pending);
+                Ok(Some(VectoredExceptionReturn::Resume))
+            }
+            EXCEPTION_CONTINUE_EXECUTION => {
+                if pending.flags & EXCEPTION_NONCONTINUABLE != 0 {
+                    return Ok(Some(VectoredExceptionReturn::Noncontinuable {
+                        code: pending.code,
+                    }));
+                }
+                let pointers = emu.read_mem(pending.exception_pointers, 16)?;
+                if u64_from_bytes(&pointers, 0) != pending.exception_record
+                    || u64_from_bytes(&pointers, 8) != pending.context_record
+                {
+                    return Ok(Some(VectoredExceptionReturn::InvalidContext {
+                        code: pending.code,
+                    }));
+                }
+                let context = emu.read_mem(pending.context_record, AMD64_CONTEXT_SIZE)?;
+                if !valid_mutated_amd64_context(&pending.initial_context, &context) {
+                    return Ok(Some(VectoredExceptionReturn::InvalidContext {
+                        code: pending.code,
+                    }));
+                }
+                let original_rip =
+                    u64_from_bytes(&pending.initial_context, AMD64_CONTEXT_RIP_OFFSET);
+                let continuation_rip = u64_from_bytes(&context, AMD64_CONTEXT_RIP_OFFSET);
+                let changed_observation = if continuation_rip != original_rip {
+                    if self.changed_exception_continuation.is_some() {
+                        return Ok(Some(VectoredExceptionReturn::InvalidContext {
+                            code: pending.code,
+                        }));
+                    }
+                    Some(ExceptionContinuationObservation {
+                        thread_id,
+                        exception_code: pending.code,
+                        continuing_handler: pending.current_handler,
+                        original_rip,
+                        continuation_rip,
+                        context_record: pending.context_record,
+                        registers: amd64_context_register_snapshot(&context),
+                        target_bytes: freeze_exception_continuation_target(emu, continuation_rip)?,
+                        context_bytes: context.clone(),
+                    })
+                } else {
+                    None
+                };
+                restore_amd64_context(emu, &pending, &context)?;
+                self.pending_vectored_exceptions.remove(&thread_id);
+                if let Some(observation) = changed_observation {
+                    self.changed_exception_continuation = Some(observation);
+                    Ok(Some(VectoredExceptionReturn::ChangedContinuation))
+                } else {
+                    Ok(Some(VectoredExceptionReturn::Resume))
+                }
+            }
+            _ => Ok(Some(VectoredExceptionReturn::InvalidDisposition {
+                code: pending.code,
+                disposition,
+            })),
+        }
     }
 
     fn kernel_handle_candidate(&self) -> Option<(u64, u64)> {
@@ -887,6 +1512,90 @@ impl Win64Env {
         Ok(allocation_base)
     }
 
+    fn virtual_allocation_candidate(
+        &self,
+        requested_size: u64,
+    ) -> Option<(u64, u64, VirtualAllocation)> {
+        if requested_size == 0 {
+            return None;
+        }
+
+        let mapped_size = align_up_u64(requested_size, u64::from(PAGE_SIZE))?;
+        let allocation_base = self.virtual_allocation_cursor;
+        let mapped_end = allocation_base.checked_add(mapped_size)?;
+        let next_cursor = align_up_u64(mapped_end, VIRTUAL_ALLOCATION_GRANULARITY)?;
+        if !(VIRTUAL_ALLOCATION_ARENA_BASE..VIRTUAL_ALLOCATION_ARENA_END).contains(&allocation_base)
+            || !allocation_base.is_multiple_of(VIRTUAL_ALLOCATION_GRANULARITY)
+            || mapped_end > VIRTUAL_ALLOCATION_ARENA_END
+            || next_cursor > VIRTUAL_ALLOCATION_ARENA_END
+            || self.virtual_allocations.contains_key(&allocation_base)
+        {
+            return None;
+        }
+
+        Some((
+            allocation_base,
+            next_cursor,
+            VirtualAllocation {
+                requested_size,
+                mapped_size,
+                allocation_type: MEM_COMMIT,
+                protection: PAGE_READWRITE,
+            },
+        ))
+    }
+
+    fn commit_virtual_allocation(
+        &mut self,
+        allocation_base: u64,
+        next_cursor: u64,
+        allocation: VirtualAllocation,
+    ) {
+        let previous = self.virtual_allocations.insert(allocation_base, allocation);
+        debug_assert!(previous.is_none());
+        self.virtual_allocation_cursor = next_cursor;
+    }
+
+    fn sid_allocation_candidate(
+        &self,
+        sub_authority_count: u8,
+    ) -> Option<(u64, u64, SidAllocation)> {
+        if !(1..=SID_MAX_SUB_AUTHORITIES).contains(&sub_authority_count) {
+            return None;
+        }
+        let sid_size = 8u64.checked_add(u64::from(sub_authority_count).checked_mul(4)?)?;
+        let mapped_size = u64::from(PAGE_SIZE);
+        let allocation_base = self.sid_allocation_cursor;
+        let next_cursor = allocation_base.checked_add(mapped_size)?;
+        if !(SID_ALLOCATION_ARENA_BASE..SID_ALLOCATION_ARENA_END).contains(&allocation_base)
+            || !allocation_base.is_multiple_of(mapped_size)
+            || next_cursor > SID_ALLOCATION_ARENA_END
+            || self.sid_allocations.contains_key(&allocation_base)
+        {
+            return None;
+        }
+        Some((
+            allocation_base,
+            next_cursor,
+            SidAllocation {
+                sid_size,
+                mapped_size,
+                sub_authority_count,
+            },
+        ))
+    }
+
+    fn commit_sid_allocation(
+        &mut self,
+        allocation_base: u64,
+        next_cursor: u64,
+        allocation: SidAllocation,
+    ) {
+        let previous = self.sid_allocations.insert(allocation_base, allocation);
+        debug_assert!(previous.is_none());
+        self.sid_allocation_cursor = next_cursor;
+    }
+
     fn can_free_heap(&self, heap_handle: u64, flags: u32, allocation_base: u64) -> bool {
         heap_handle == self.process_heap
             && flags & !HEAP_NO_SERIALIZE == 0
@@ -998,13 +1707,15 @@ impl Win64Env {
             .next()
             .unwrap_or(normalized.as_str());
         let exports: &[&str] = if module_name.eq_ignore_ascii_case("kernel32.dll") {
-            KERNEL32_EXPORTS
+            KERNEL32_EXPORTS.as_slice()
         } else if module_name.eq_ignore_ascii_case("ntdll.dll") {
             NTDLL_EXPORTS
         } else if module_name.eq_ignore_ascii_case("user32.dll") {
             USER32_EXPORTS
         } else if module_name.eq_ignore_ascii_case("advapi32.dll") {
             ADVAPI32_EXPORTS
+        } else if module_name.eq_ignore_ascii_case("msvcrt.dll") {
+            MSVCRT_EXPORTS.as_slice()
         } else {
             &[]
         };
@@ -1205,8 +1916,223 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "VirtualAlloc" => {
+            let requested_address = emu.read_reg(RegisterX86::RCX)?;
+            let requested_size = emu.read_reg(RegisterX86::RDX)?;
+            // Allocation type and protection are DWORD values on Win64, so
+            // their dirty upper register halves do not participate.
+            let allocation_type = emu.read_reg(RegisterX86::R8)? as u32;
+            let protection = emu.read_reg(RegisterX86::R9)? as u32;
+
+            // Bounded policy: the observed NULL-address, commit-only,
+            // read/write allocation is supported for any nonzero size that
+            // fits the finite arena. Address-selected allocations, reservation
+            // state, modifiers, and other protections remain unmodeled.
+            if requested_address != 0
+                || allocation_type != MEM_COMMIT
+                || protection != PAGE_READWRITE
+            {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // Validate the return frame before mapping pages or consuming an
+            // allocator cursor. A zero, overflowing, or exhausted request is a
+            // handled allocation failure and returns NULL without state change.
+            let return_state = preflight_api_return(emu)?;
+            let ret = if let Some((allocation_base, next_cursor, allocation)) =
+                env.virtual_allocation_candidate(requested_size)
+            {
+                emu.map_zeroed_rw(allocation_base, allocation.mapped_size)?;
+                env.commit_virtual_allocation(allocation_base, next_cursor, allocation);
+                allocation_base
+            } else {
+                0
+            };
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "VirtualFree" => {
+            let allocation_base = emu.read_reg(RegisterX86::RCX)?;
+            let size = emu.read_reg(RegisterX86::RDX)?;
+            let free_type = emu.read_reg(RegisterX86::R8)? as u32;
+            if size != 0 || free_type != MEM_RELEASE {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let allocation = env.virtual_allocations.get(&allocation_base).copied();
+            let return_state = preflight_api_return(emu)?;
+            if let Some(allocation) = allocation {
+                emu.unmap(allocation_base, allocation.mapped_size)?;
+            }
+            let ret = u64::from(allocation.is_some());
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            if allocation.is_some() {
+                let removed = env.virtual_allocations.remove(&allocation_base);
+                debug_assert!(removed.is_some());
+            }
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "VirtualProtect" => {
+            let address = emu.read_reg(RegisterX86::RCX)?;
+            let size = emu.read_reg(RegisterX86::RDX)?;
+            let new_protection = emu.read_reg(RegisterX86::R8)? as u32;
+            let old_protection = emu.read_reg(RegisterX86::R9)?;
+            let Some(new_protection) = page_protection_from_win32(new_protection) else {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            };
+            if old_protection == 0 {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let page_range = virtual_protect_page_range(address, size);
+            if page_range.is_some_and(|(page_base, mapped_size)| {
+                ranges_overlap(
+                    page_base,
+                    mapped_size,
+                    old_protection,
+                    std::mem::size_of::<u32>() as u64,
+                )
+            }) {
+                // Supporting an output inside the range requires rollback when
+                // the new protection removes write access. Keep this bounded
+                // model failure-atomic until that shape is observed.
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // Validate control before any page or output change. NULL, empty,
+            // overflowing, and incompletely mapped ranges are deterministic
+            // failures and do not access lpflOldProtect.
+            let return_state = preflight_api_return(emu)?;
+            let Some((page_base, mapped_size)) = page_range else {
+                commit_api_return(emu, return_state)?;
+                emu.write_reg(RegisterX86::RAX, 0)?;
+                return Ok(ApiOutcome::Handled {
+                    name: name.to_owned(),
+                    ret: 0,
+                });
+            };
+            let Some(previous) = emu.page_range_protection(page_base, mapped_size)? else {
+                commit_api_return(emu, return_state)?;
+                emu.write_reg(RegisterX86::RAX, 0)?;
+                return Ok(ApiOutcome::Handled {
+                    name: name.to_owned(),
+                    ret: 0,
+                });
+            };
+
+            // Both fallible guest writes are preflighted before changing page
+            // permissions. The old-protection DWORD describes the first page,
+            // as required when the range spans adjacent regions.
+            emu.preflight_write_mem(old_protection, std::mem::size_of::<u32>())?;
+            let Some(changed_from) = emu.protect_pages(page_base, mapped_size, new_protection)?
+            else {
+                commit_api_return(emu, return_state)?;
+                emu.write_reg(RegisterX86::RAX, 0)?;
+                return Ok(ApiOutcome::Handled {
+                    name: name.to_owned(),
+                    ret: 0,
+                });
+            };
+            debug_assert_eq!(changed_from, previous);
+            emu.write_mem(
+                old_protection,
+                &page_protection_to_win32(previous).to_le_bytes(),
+            )?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, 1)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: 1,
+            })
+        }
+        "CloseHandle" => {
+            let handle = emu.read_reg(RegisterX86::RCX)?;
+            let tracked = env.kernel_handles.contains_key(&handle);
+            let ret = u64::from(tracked);
+
+            // Closing only removes a real registry-backed handle. Pseudo,
+            // unknown, and already-closed values return FALSE without adding
+            // last-error, reuse, signaling, or object-lifecycle semantics.
+            // Validate and commit control/result before removing the record so
+            // a bad return frame cannot consume a live handle.
+            let return_state = preflight_api_return(emu)?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            if tracked {
+                let removed = env.kernel_handles.remove(&handle);
+                debug_assert!(removed.is_some());
+            }
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
         "GetCurrentProcess" => handled_scalar_api_return(emu, name, CURRENT_PROCESS_PSEUDO_HANDLE),
         "GetCurrentThread" => handled_scalar_api_return(emu, name, CURRENT_THREAD_PSEUDO_HANDLE),
+        "GetThreadContext" => {
+            let thread = emu.read_reg(RegisterX86::RCX)?;
+            if thread != CURRENT_THREAD_PSEUDO_HANDLE {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let context = emu.read_reg(RegisterX86::RDX)?;
+            let flags_address = checked_context_field_address(
+                context,
+                AMD64_CONTEXT_FLAGS_OFFSET,
+                std::mem::size_of::<u32>(),
+            )?;
+            let context_flags = read_u32_at(emu, flags_address)?;
+            if context_flags != CONTEXT_AMD64_DEBUG_REGISTERS {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // The observed call asks for only the AMD64 debug-register group
+            // on the current-thread pseudo handle. Windows documents the
+            // current-thread form as successful but not a valid snapshot; the
+            // bounded environment therefore returns deterministic no-debug
+            // state. Preserve ContextFlags and every unrequested CONTEXT byte.
+            let return_state = preflight_api_return(emu)?;
+            let mut debug_register_addresses = [0u64; 6];
+            for (address, offset) in debug_register_addresses
+                .iter_mut()
+                .zip(AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS)
+            {
+                *address =
+                    checked_context_field_address(context, offset, std::mem::size_of::<u64>())?;
+                emu.preflight_write_mem(*address, std::mem::size_of::<u64>())?;
+            }
+            for address in debug_register_addresses {
+                emu.write_mem(address, &0u64.to_le_bytes())?;
+            }
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, 1)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: 1,
+            })
+        }
         "CheckRemoteDebuggerPresent" => {
             let process = emu.read_reg(RegisterX86::RCX)?;
             if process != CURRENT_PROCESS_PSEUDO_HANDLE {
@@ -1226,6 +2152,30 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret: 1,
             })
         }
+        "IsBadReadPtr" => {
+            let pointer = emu.read_reg(RegisterX86::RCX)?;
+            let size = emu.read_reg(RegisterX86::RDX)?;
+            if size != std::mem::size_of::<u32>() as u64 {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // UINT_PTR is full-width on Win64. For the exact observed
+            // four-byte probe, classify only the current bounded mapping:
+            // readable is FALSE; an overflowing or Unicorn-unreadable range
+            // is TRUE. This does not promise that a later guest access is safe.
+            let ret = if pointer.checked_add(size - 1).is_none() {
+                1
+            } else {
+                match emu.read_mem(pointer, size as usize) {
+                    Ok(_) => 0,
+                    Err(EmuError::ReadMem { .. }) => 1,
+                    Err(error) => return Err(error),
+                }
+            };
+            handled_scalar_api_return(emu, name, ret)
+        }
         "GetCurrentThreadId" => {
             let ret = u64::from(env.current_thread_id);
             emu.write_reg(RegisterX86::RAX, ret)?;
@@ -1244,6 +2194,26 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 name: name.to_owned(),
                 ret,
             })
+        }
+        "GetSystemFirmwareTable" => {
+            let provider = emu.read_reg(RegisterX86::RCX)? as u32;
+            let table_id = emu.read_reg(RegisterX86::RDX)? as u32;
+            let buffer = emu.read_reg(RegisterX86::R8)?;
+            let buffer_size = emu.read_reg(RegisterX86::R9)? as u32;
+            if provider != FIRMWARE_PROVIDER_RSMB
+                || table_id != 0
+                || buffer != 0
+                || buffer_size != 0
+            {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // The bounded environment publishes no host firmware identity.
+            // This exact size query therefore fails with zero and performs no
+            // guest-memory access; last-error state remains outside the model.
+            handled_scalar_api_return(emu, name, 0)
         }
         "GetCommandLineA" => {
             // Validate the return frame before the first lazy mapping. The
@@ -1268,6 +2238,11 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 name: name.to_owned(),
                 ret,
             })
+        }
+        "IsUserAnAdmin" => {
+            // The bounded environment exposes an empty supplementary-groups
+            // token policy, so the emulated caller is not an administrator.
+            handled_scalar_api_return(emu, name, 0)
         }
         "WideCharToMultiByte" => {
             // DWORD/UINT/int arguments consume only their low 32 bits. The
@@ -1377,6 +2352,39 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 name: name.to_owned(),
                 ret: EMULATED_HAND_CURSOR_HANDLE,
             })
+        }
+        "FindWindowA" => {
+            let class_name = emu.read_reg(RegisterX86::RCX)?;
+            let window_name = emu.read_reg(RegisterX86::RDX)?;
+
+            // The observed calls select by either class or title, never both.
+            // Other Win32 shapes remain unmodeled and are rejected before
+            // pointer or return-frame access.
+            if (class_name == 0) == (window_name == 0) {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+            let selector = if class_name != 0 {
+                class_name
+            } else {
+                window_name
+            };
+            match read_raw_ansi_class_name(emu, selector, WINDOW_CLASS_NAME_BYTE_CAP)? {
+                RawAnsiClassNameRead::Terminated(bytes) if !bytes.is_empty() => {}
+                RawAnsiClassNameRead::Terminated(_)
+                | RawAnsiClassNameRead::CapExhausted
+                | RawAnsiClassNameRead::NonPrintable => {
+                    return Ok(ApiOutcome::Unhandled {
+                        name: name.to_owned(),
+                    });
+                }
+            }
+
+            // Midas owns no searchable external top-level-window state. A
+            // bounded, valid lookup therefore has the native no-match result:
+            // HWND NULL. No window/class registry state is mutated.
+            handled_scalar_api_return(emu, name, 0)
         }
         "RegisterClassExA" => {
             let class_description = emu.read_reg(RegisterX86::RCX)?;
@@ -1653,6 +2661,103 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                 ret,
             })
         }
+        "AllocateAndInitializeSid" => {
+            let authority_address = emu.read_reg(RegisterX86::RCX)?;
+            // BYTE consumes only the low eight bits on Win64.
+            let sub_authority_count = emu.read_reg(RegisterX86::RDX)? as u8;
+            if !(1..=SID_MAX_SUB_AUTHORITIES).contains(&sub_authority_count) {
+                return handled_scalar_api_return(emu, name, 0);
+            }
+            let Some((allocation_base, next_cursor, allocation)) =
+                env.sid_allocation_candidate(sub_authority_count)
+            else {
+                return handled_scalar_api_return(emu, name, 0);
+            };
+
+            let authority = emu.read_mem(authority_address, SID_IDENTIFIER_AUTHORITY_SIZE)?;
+            let mut sub_authorities = Vec::with_capacity(usize::from(sub_authority_count));
+            sub_authorities.push(emu.read_reg(RegisterX86::R8)? as u32);
+            if sub_authority_count >= 2 {
+                sub_authorities.push(emu.read_reg(RegisterX86::R9)? as u32);
+            }
+            let rsp = emu.read_reg(RegisterX86::RSP)?;
+            for index in 2..usize::from(sub_authority_count) {
+                let offset = 0x28 + (index as u64 - 2) * 8;
+                let address = checked_stack_argument_address(rsp, offset, 4)?;
+                sub_authorities.push(read_u32_at(emu, address)?);
+            }
+            let output_slot = checked_stack_argument_address(rsp, 0x58, 8)?;
+            let output = read_u64_at(emu, output_slot)?;
+
+            let return_state = preflight_api_return(emu)?;
+            emu.preflight_write_mem(output, std::mem::size_of::<u64>())?;
+
+            let mut sid = Vec::with_capacity(allocation.sid_size as usize);
+            sid.push(SID_REVISION);
+            sid.push(sub_authority_count);
+            sid.extend_from_slice(&authority);
+            for sub_authority in sub_authorities {
+                sid.extend_from_slice(&sub_authority.to_le_bytes());
+            }
+            debug_assert_eq!(sid.len(), allocation.sid_size as usize);
+
+            emu.map_zeroed_rw(allocation_base, allocation.mapped_size)?;
+            emu.write_mem(allocation_base, &sid)?;
+            emu.write_mem(output, &allocation_base.to_le_bytes())?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, 1)?;
+            env.commit_sid_allocation(allocation_base, next_cursor, allocation);
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: 1,
+            })
+        }
+        "FreeSid" => {
+            let sid = emu.read_reg(RegisterX86::RCX)?;
+            let live = env.sid_allocations.contains_key(&sid);
+            let ret = if live { 0 } else { sid };
+
+            // The bounded arena never unmaps or reuses pages. Only an exact
+            // live allocation base is logically freed; interior, unknown, and
+            // duplicate values are returned unchanged. Commit control/result
+            // before removing metadata so a bad return cannot consume a SID.
+            let return_state = preflight_api_return(emu)?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            if live {
+                let removed = env.sid_allocations.remove(&sid);
+                debug_assert!(removed.is_some());
+            }
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "RegOpenKeyA" => {
+            let root = emu.read_reg(RegisterX86::RCX)?;
+            let subkey = emu.read_reg(RegisterX86::RDX)?;
+            let output = emu.read_reg(RegisterX86::R8)?;
+            if root != HKEY_LOCAL_MACHINE || subkey == 0 || output == 0 {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+            match read_raw_ansi_class_name(emu, subkey, REGISTRY_SUBKEY_BYTE_CAP)? {
+                RawAnsiClassNameRead::Terminated(bytes) if !bytes.is_empty() => {}
+                RawAnsiClassNameRead::Terminated(_)
+                | RawAnsiClassNameRead::CapExhausted
+                | RawAnsiClassNameRead::NonPrintable => {
+                    return Ok(ApiOutcome::Unhandled {
+                        name: name.to_owned(),
+                    });
+                }
+            }
+
+            // The bounded environment owns no registry keys. Return the
+            // deterministic native not-found status without reading or
+            // changing phkResult; callers retain every output byte.
+            handled_scalar_api_return(emu, name, u64::from(ERROR_FILE_NOT_FOUND))
+        }
         "OpenProcessToken" => {
             let process = emu.read_reg(RegisterX86::RCX)?;
             let desired_access = emu.read_reg(RegisterX86::RDX)? as u32;
@@ -1697,28 +2802,55 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
                     ..
                 })
             );
-            if !valid_token
-                || information_class != TOKEN_INFORMATION_CLASS_GROUPS
-                || information != 0
-                || information_length != 0
+            if !valid_token || information_class != TOKEN_INFORMATION_CLASS_GROUPS {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+            let is_size_query = information == 0 && information_length == 0;
+            let is_empty_groups_read =
+                information != 0 && information_length == EMPTY_TOKEN_GROUPS_SIZE;
+            if !is_size_query && !is_empty_groups_read {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let rsp = emu.read_reg(RegisterX86::RSP)?;
+            let return_length_slot = checked_stack_argument_address(rsp, 0x28, 8)?;
+            let return_length = read_u64_at(emu, return_length_slot)?;
+            if is_empty_groups_read
+                && equal_sized_ranges_overlap(
+                    information,
+                    return_length,
+                    u64::from(EMPTY_TOKEN_GROUPS_SIZE),
+                )
             {
                 return Ok(ApiOutcome::Unhandled {
                     name: name.to_owned(),
                 });
             }
-            let rsp = emu.read_reg(RegisterX86::RSP)?;
-            let return_length_slot = checked_stack_argument_address(rsp, 0x28, 8)?;
-            let return_length = read_u64_at(emu, return_length_slot)?;
+
             let return_state = preflight_api_return(emu)?;
+            if is_empty_groups_read {
+                emu.preflight_write_mem(information, EMPTY_TOKEN_GROUPS_SIZE as usize)?;
+            }
+            emu.preflight_write_mem(return_length, EMPTY_TOKEN_GROUPS_SIZE as usize)?;
+
             // The bounded environment exposes no supplementary token groups.
-            // This first observed call is the documented NULL/zero size query:
-            // return FALSE and publish the four-byte GroupCount requirement.
+            // A NULL/zero size query returns FALSE and publishes the required
+            // four bytes. The matching retrieval writes GroupCount=0 and the
+            // same required length, then returns TRUE.
+            if is_empty_groups_read {
+                emu.write_mem(information, &0u32.to_le_bytes())?;
+            }
             emu.write_mem(return_length, &EMPTY_TOKEN_GROUPS_SIZE.to_le_bytes())?;
             commit_api_return(emu, return_state)?;
-            emu.write_reg(RegisterX86::RAX, 0)?;
+            let ret = u64::from(is_empty_groups_read);
+            emu.write_reg(RegisterX86::RAX, ret)?;
             Ok(ApiOutcome::Handled {
                 name: name.to_owned(),
-                ret: 0,
+                ret,
             })
         }
         "OpenThreadToken" => {
@@ -1740,14 +2872,152 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
             // not modeled by the current environment.
             handled_scalar_api_return(emu, name, 0)
         }
+        "NtQuerySystemInformation" => {
+            let information_class = emu.read_reg(RegisterX86::RCX)? as u32;
+            let information = emu.read_reg(RegisterX86::RDX)?;
+            let information_length = emu.read_reg(RegisterX86::R8)? as u32;
+            let return_length = emu.read_reg(RegisterX86::R9)?;
+            if information_class != SYSTEM_INFORMATION_CLASS_MODULE_INFORMATION
+                || return_length != 0
+            {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            // A short buffer cannot hold even NumberOfModules. Report the
+            // native length-mismatch status without probing or changing the
+            // caller's buffer. ReturnLength remains unsupported until an
+            // observed non-NULL form establishes its contract here.
+            if information_length < SYSTEM_MODULE_INFORMATION_COUNT_SIZE {
+                return handled_scalar_api_return(
+                    emu,
+                    name,
+                    u64::from(STATUS_INFO_LENGTH_MISMATCH),
+                );
+            }
+
+            // The bounded environment exposes no modeled kernel modules.
+            // Validate both control flow and the exact DWORD output before
+            // writing NumberOfModules=0; every suffix byte remains guest-owned.
+            let return_state = preflight_api_return(emu)?;
+            emu.preflight_write_mem(information, SYSTEM_MODULE_INFORMATION_COUNT_SIZE as usize)?;
+            emu.write_mem(information, &0u32.to_le_bytes())?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, 0)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret: 0,
+            })
+        }
+        "ZwQueryInformationProcess" => {
+            let process = emu.read_reg(RegisterX86::RCX)?;
+            let information_class = emu.read_reg(RegisterX86::RDX)? as u32;
+            let information = emu.read_reg(RegisterX86::R8)?;
+            let information_length = emu.read_reg(RegisterX86::R9)? as u32;
+            let status = match information_class {
+                PROCESS_INFORMATION_CLASS_DEBUG_PORT => 0,
+                PROCESS_INFORMATION_CLASS_DEBUG_OBJECT_HANDLE => STATUS_PORT_NOT_SET,
+                _ => {
+                    return Ok(ApiOutcome::Unhandled {
+                        name: name.to_owned(),
+                    });
+                }
+            };
+            if process != CURRENT_PROCESS_PSEUDO_HANDLE
+                || information_length != std::mem::size_of::<u64>() as u32
+            {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let rsp = emu.read_reg(RegisterX86::RSP)?;
+            let return_length_slot = checked_stack_argument_address(rsp, 0x28, 8)?;
+            let return_length = read_u64_at(emu, return_length_slot)?;
+            if return_length != 0 {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+
+            let return_state = preflight_api_return(emu)?;
+            emu.preflight_write_mem(information, std::mem::size_of::<u64>())?;
+            emu.write_mem(information, &0u64.to_le_bytes())?;
+            commit_api_return(emu, return_state)?;
+            let ret = u64::from(status);
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "ZwSetInformationThread" => {
+            let thread = emu.read_reg(RegisterX86::RCX)?;
+            let information_class = emu.read_reg(RegisterX86::RDX)? as u32;
+            let information = emu.read_reg(RegisterX86::R8)?;
+            let information_length = emu.read_reg(RegisterX86::R9)? as u32;
+            if thread != CURRENT_THREAD_PSEUDO_HANDLE
+                || information_class != THREAD_INFORMATION_CLASS_HIDE_FROM_DEBUGGER
+                || information != 0
+                || information_length != 0
+            {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+            handled_scalar_api_return(emu, name, 0)
+        }
+        "RaiseException" => {
+            // DWORD arguments consume the low halves; the exception argument
+            // array remains a full-width pointer. The dispatcher builds a
+            // guest-visible record/context and leaves RIP at the first VEH.
+            let code = emu.read_reg(RegisterX86::RCX)? as u32;
+            let flags = emu.read_reg(RegisterX86::RDX)? as u32;
+            let argument_count = emu.read_reg(RegisterX86::R8)? as u32;
+            let arguments = emu.read_reg(RegisterX86::R9)?;
+            if !env.begin_vectored_exception_dispatch(
+                emu,
+                code,
+                flags,
+                argument_count,
+                arguments,
+            )? {
+                return Ok(ApiOutcome::Unhandled {
+                    name: name.to_owned(),
+                });
+            }
+            Ok(ApiOutcome::HandledVoid {
+                name: name.to_owned(),
+            })
+        }
         "RtlAddVectoredExceptionHandler" => {
             // First is ULONG and consumes only ECX. Handler is a pointer and
             // retains the full RDX value, including NULL or an unmapped value.
             let first = emu.read_reg(RegisterX86::RCX)? as u32;
             let handler = emu.read_reg(RegisterX86::RDX)?;
+            let return_state = preflight_api_return(emu)?;
             let ret = env.add_vectored_exception_handler(first, handler);
+            commit_api_return(emu, return_state)?;
             emu.write_reg(RegisterX86::RAX, ret)?;
-            api_return(emu)?;
+            Ok(ApiOutcome::Handled {
+                name: name.to_owned(),
+                ret,
+            })
+        }
+        "RtlRemoveVectoredExceptionHandler" => {
+            let token = emu.read_reg(RegisterX86::RCX)?;
+            let registration_index = env
+                .vectored_exception_handlers
+                .iter()
+                .position(|registration| registration.token == token);
+            let ret = u64::from(registration_index.is_some());
+            let return_state = preflight_api_return(emu)?;
+            commit_api_return(emu, return_state)?;
+            emu.write_reg(RegisterX86::RAX, ret)?;
+            if let Some(index) = registration_index {
+                env.vectored_exception_handlers.remove(index);
+            }
             Ok(ApiOutcome::Handled {
                 name: name.to_owned(),
                 ret,
@@ -1816,12 +3086,295 @@ pub fn dispatch(env: &mut Win64Env, emu: &mut Emu, name: &str) -> Result<ApiOutc
     }
 }
 
+fn amd64_context_integer_layout() -> [(RegisterX86, usize); 17] {
+    [
+        (RegisterX86::RAX, AMD64_CONTEXT_RAX_OFFSET),
+        (RegisterX86::RCX, AMD64_CONTEXT_RCX_OFFSET),
+        (RegisterX86::RDX, AMD64_CONTEXT_RDX_OFFSET),
+        (RegisterX86::RBX, AMD64_CONTEXT_RBX_OFFSET),
+        (RegisterX86::RSP, AMD64_CONTEXT_RSP_OFFSET),
+        (RegisterX86::RBP, AMD64_CONTEXT_RBP_OFFSET),
+        (RegisterX86::RSI, AMD64_CONTEXT_RSI_OFFSET),
+        (RegisterX86::RDI, AMD64_CONTEXT_RDI_OFFSET),
+        (RegisterX86::R8, AMD64_CONTEXT_R8_OFFSET),
+        (RegisterX86::R9, AMD64_CONTEXT_R9_OFFSET),
+        (RegisterX86::R10, AMD64_CONTEXT_R10_OFFSET),
+        (RegisterX86::R11, AMD64_CONTEXT_R11_OFFSET),
+        (RegisterX86::R12, AMD64_CONTEXT_R12_OFFSET),
+        (RegisterX86::R13, AMD64_CONTEXT_R13_OFFSET),
+        (RegisterX86::R14, AMD64_CONTEXT_R14_OFFSET),
+        (RegisterX86::R15, AMD64_CONTEXT_R15_OFFSET),
+        (RegisterX86::RIP, AMD64_CONTEXT_RIP_OFFSET),
+    ]
+}
+
+fn snapshot_register_value(
+    snapshot: &[u64; EXCEPTION_DISPATCH_REGISTER_ORDER.len()],
+    register: RegisterX86,
+) -> u64 {
+    EXCEPTION_DISPATCH_REGISTER_ORDER
+        .iter()
+        .position(|candidate| *candidate == register)
+        .map_or(0, |index| snapshot[index])
+}
+
+fn restore_exception_dispatcher_registers(
+    emu: &mut Emu,
+    pending: &PendingVectoredException,
+) -> Result<(), EmuError> {
+    let rollback = emu.capture_cpu_context()?;
+    for (register, value) in EXCEPTION_DISPATCH_REGISTER_ORDER
+        .into_iter()
+        .zip(pending.dispatcher_registers)
+    {
+        if let Err(error) = emu.write_reg(register, value) {
+            emu.restore_cpu_context(&rollback)?;
+            return Err(error);
+        }
+    }
+    for (register, value) in EXCEPTION_DISPATCH_XMM_REGISTERS
+        .into_iter()
+        .zip(&pending.dispatcher_xmm_registers)
+    {
+        if let Err(error) = emu.write_reg_128(register, value) {
+            emu.restore_cpu_context(&rollback)?;
+            return Err(error);
+        }
+    }
+    for (register, value) in EXCEPTION_DISPATCH_X87_REGISTERS
+        .into_iter()
+        .zip(&pending.dispatcher_x87_registers)
+    {
+        if let Err(error) = emu.write_reg_80(register, value) {
+            emu.restore_cpu_context(&rollback)?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn install_empty_vectored_exception_guard(
+    emu: &mut Emu,
+    pending: &PendingVectoredException,
+) -> Result<(), EmuError> {
+    let rollback = emu.capture_cpu_context()?;
+    if let Err(error) = (|| {
+        restore_exception_dispatcher_registers(emu, pending)?;
+        let consumed_rsp =
+            pending
+                .callback_rsp
+                .checked_add(8)
+                .ok_or(EmuError::AddressRangeOverflow {
+                    base: pending.callback_rsp,
+                    size: 8,
+                })?;
+        emu.write_reg(RegisterX86::RSP, consumed_rsp)?;
+        emu.write_reg(RegisterX86::RIP, pending.return_guard)
+    })() {
+        emu.restore_cpu_context(&rollback)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn install_vectored_exception_callback(
+    emu: &mut Emu,
+    pending: &PendingVectoredException,
+) -> Result<(), EmuError> {
+    emu.preflight_write_mem(pending.callback_rsp, 0x28)?;
+    let return_cell_before = emu.read_mem(pending.callback_rsp, std::mem::size_of::<u64>())?;
+    let rollback = emu.capture_cpu_context()?;
+    if let Err(error) = (|| {
+        write_guest_u64(emu, pending.callback_rsp, pending.return_guard)?;
+        restore_exception_dispatcher_registers(emu, pending)?;
+        emu.write_reg(RegisterX86::RCX, pending.exception_pointers)?;
+        // Wine's x64 call wrapper passes the callback as its second argument,
+        // so RDX still contains the handler value at guest callback entry.
+        emu.write_reg(RegisterX86::RDX, pending.current_handler)?;
+        emu.write_reg(RegisterX86::RSP, pending.callback_rsp)?;
+        emu.write_reg(RegisterX86::RIP, pending.current_handler)
+    })() {
+        emu.restore_cpu_context(&rollback)?;
+        emu.write_mem(pending.callback_rsp, &return_cell_before)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn amd64_context_register_snapshot(context: &[u8]) -> Vec<(RegisterX86, u64)> {
+    let ordered = [
+        (RegisterX86::RAX, AMD64_CONTEXT_RAX_OFFSET),
+        (RegisterX86::RBX, AMD64_CONTEXT_RBX_OFFSET),
+        (RegisterX86::RCX, AMD64_CONTEXT_RCX_OFFSET),
+        (RegisterX86::RDX, AMD64_CONTEXT_RDX_OFFSET),
+        (RegisterX86::RSI, AMD64_CONTEXT_RSI_OFFSET),
+        (RegisterX86::RDI, AMD64_CONTEXT_RDI_OFFSET),
+        (RegisterX86::RBP, AMD64_CONTEXT_RBP_OFFSET),
+        (RegisterX86::RSP, AMD64_CONTEXT_RSP_OFFSET),
+        (RegisterX86::R8, AMD64_CONTEXT_R8_OFFSET),
+        (RegisterX86::R9, AMD64_CONTEXT_R9_OFFSET),
+        (RegisterX86::R10, AMD64_CONTEXT_R10_OFFSET),
+        (RegisterX86::R11, AMD64_CONTEXT_R11_OFFSET),
+        (RegisterX86::R12, AMD64_CONTEXT_R12_OFFSET),
+        (RegisterX86::R13, AMD64_CONTEXT_R13_OFFSET),
+        (RegisterX86::R14, AMD64_CONTEXT_R14_OFFSET),
+        (RegisterX86::R15, AMD64_CONTEXT_R15_OFFSET),
+        (RegisterX86::RIP, AMD64_CONTEXT_RIP_OFFSET),
+    ];
+    let mut registers = ordered
+        .into_iter()
+        .map(|(register, offset)| (register, u64_from_bytes(context, offset)))
+        .collect::<Vec<_>>();
+    registers.push((
+        RegisterX86::EFLAGS,
+        u64::from(u32_from_bytes(context, AMD64_CONTEXT_EFLAGS_OFFSET)),
+    ));
+    registers
+}
+
+fn freeze_exception_continuation_target(emu: &Emu, target: u64) -> Result<Vec<u8>, EmuError> {
+    let mut bytes = Vec::with_capacity(64);
+    for offset in 0..64u64 {
+        let address = target
+            .checked_add(offset)
+            .ok_or(EmuError::AddressRangeOverflow {
+                base: target,
+                size: offset,
+            })?;
+        match emu.read_mem(address, 1) {
+            Ok(byte) => bytes.push(byte[0]),
+            Err(error) if bytes.is_empty() => return Err(error),
+            Err(_) => break,
+        }
+    }
+    Ok(bytes)
+}
+
+fn is_mutable_amd64_context_byte(index: usize) -> bool {
+    let in_range = |offset: usize, size: usize| (offset..offset + size).contains(&index);
+    in_range(AMD64_CONTEXT_EFLAGS_OFFSET, 4)
+        || amd64_context_integer_layout()
+            .into_iter()
+            .any(|(_register, offset)| in_range(offset, 8))
+}
+
+fn valid_mutated_amd64_context(initial: &[u8], current: &[u8]) -> bool {
+    if initial.len() != AMD64_CONTEXT_SIZE
+        || current.len() != AMD64_CONTEXT_SIZE
+        || u32_from_bytes(current, AMD64_CONTEXT_FLAGS_OFFSET) != CONTEXT_AMD64_CONTROL_INTEGER
+    {
+        return false;
+    }
+    initial
+        .iter()
+        .zip(current)
+        .enumerate()
+        .all(|(index, (before, after))| is_mutable_amd64_context_byte(index) || before == after)
+}
+
+fn restore_amd64_context(
+    emu: &mut Emu,
+    pending: &PendingVectoredException,
+    context: &[u8],
+) -> Result<(), EmuError> {
+    let mut registers = amd64_context_integer_layout()
+        .into_iter()
+        .map(|(register, offset)| (register, u64_from_bytes(context, offset)))
+        .collect::<Vec<_>>();
+    registers.push((
+        RegisterX86::EFLAGS,
+        u64::from(u32_from_bytes(context, AMD64_CONTEXT_EFLAGS_OFFSET)),
+    ));
+    registers.push((
+        RegisterX86::FS_BASE,
+        snapshot_register_value(&pending.dispatcher_registers, RegisterX86::FS_BASE),
+    ));
+    registers.push((
+        RegisterX86::GS_BASE,
+        snapshot_register_value(&pending.dispatcher_registers, RegisterX86::GS_BASE),
+    ));
+
+    let rollback = emu.capture_cpu_context()?;
+    for (register, value) in registers {
+        if let Err(error) = emu.write_reg(register, value) {
+            emu.restore_cpu_context(&rollback)?;
+            return Err(error);
+        }
+    }
+    for register in EXCEPTION_DISPATCH_FP_CONTROL_REGISTERS {
+        let value = snapshot_register_value(&pending.dispatcher_registers, register);
+        if let Err(error) = emu.write_reg(register, value) {
+            emu.restore_cpu_context(&rollback)?;
+            return Err(error);
+        }
+    }
+    for (register, value) in EXCEPTION_DISPATCH_XMM_REGISTERS
+        .into_iter()
+        .zip(&pending.dispatcher_xmm_registers)
+    {
+        if let Err(error) = emu.write_reg_128(register, value) {
+            emu.restore_cpu_context(&rollback)?;
+            return Err(error);
+        }
+    }
+    for (register, value) in EXCEPTION_DISPATCH_X87_REGISTERS
+        .into_iter()
+        .zip(&pending.dispatcher_x87_registers)
+    {
+        if let Err(error) = emu.write_reg_80(register, value) {
+            emu.restore_cpu_context(&rollback)?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn equal_sized_ranges_overlap(first: u64, second: u64, size: u64) -> bool {
+    size != 0 && first.abs_diff(second) < size
+}
+
+fn ranges_overlap(first: u64, first_size: u64, second: u64, second_size: u64) -> bool {
+    if first_size == 0 || second_size == 0 {
+        return false;
+    }
+    let Some(first_end) = first.checked_add(first_size) else {
+        return true;
+    };
+    let Some(second_end) = second.checked_add(second_size) else {
+        return true;
+    };
+    first < second_end && second < first_end
+}
+
 fn checked_stack_argument_address(rsp: u64, offset: u64, size: u64) -> Result<u64, EmuError> {
     debug_assert!(size > 0);
     let address = rsp
         .checked_add(offset)
         .ok_or(EmuError::AddressRangeOverflow {
             base: rsp,
+            size: offset,
+        })?;
+    address
+        .checked_add(size - 1)
+        .ok_or(EmuError::AddressRangeOverflow {
+            base: address,
+            size,
+        })?;
+    Ok(address)
+}
+
+fn checked_context_field_address(
+    context: u64,
+    offset: usize,
+    size: usize,
+) -> Result<u64, EmuError> {
+    debug_assert!(size > 0);
+    let offset = u64::try_from(offset).map_err(|_| EmuError::CodeTooLarge)?;
+    let size = u64::try_from(size).map_err(|_| EmuError::CodeTooLarge)?;
+    let address = context
+        .checked_add(offset)
+        .ok_or(EmuError::AddressRangeOverflow {
+            base: context,
             size: offset,
         })?;
     address
@@ -2018,11 +3571,41 @@ fn api_return(emu: &mut Emu) -> Result<(), EmuError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrapStop {
     UnhandledApi { name: String, rva: u32 },
+    UnhandledSoftwareException { code: u32 },
+    NoncontinuableContinuationAttempt { code: u32 },
+    InvalidVectoredExceptionDisposition { code: u32, disposition: u32 },
+    InvalidVectoredExceptionContext { code: u32 },
+    ExceptionContinuationObserved,
+    IncompleteVectoredExceptionDispatch { thread_id: u32 },
     UnexpectedFault { address: u64 },
     InstructionCap,
     IndirectTransferObserved,
+    IndirectTransferCaptureFailed,
+    IndirectTransferStopFailed,
     NullControlTransfer,
     Other(String),
+}
+
+/// CPU owner at a watched indirect-transfer boundary.
+///
+/// The observing scheduler reports this while the named CPU context is still
+/// live. In particular, a child observation is delivered before the bounded
+/// cooperative switch restores the main context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectTransferExecutionContext {
+    Main,
+    Child { thread_id: u32 },
+}
+
+/// Explicit caller disposition for one complete watched transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectTransferDisposition {
+    /// Preserve the observation and return it as the current run boundary.
+    Stop,
+    /// The caller has independently adjudicated this exact payload as a false
+    /// OEP candidate. Preserve coverage, clear only this observation, and
+    /// continue at its still-unexecuted target.
+    ResumeAdjudicatedRefutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2183,14 +3766,44 @@ fn configure_cooperative_runtime(
     })
 }
 
-fn run_cooperative_child(
+fn disposition_allows_resume<F>(
+    emu: &mut Emu,
+    context: IndirectTransferExecutionContext,
+    on_transfer: &mut F,
+) -> Result<bool, EmuError>
+where
+    F: FnMut(
+        IndirectTransferExecutionContext,
+        &IndirectTransferObservation,
+    ) -> IndirectTransferDisposition,
+{
+    let observation = emu
+        .indirect_transfer_observation()
+        .ok_or(EmuError::IndirectTransferWatchNotLatched)?;
+    match on_transfer(context, &observation) {
+        IndirectTransferDisposition::Stop => Ok(false),
+        IndirectTransferDisposition::ResumeAdjudicatedRefutation => {
+            emu.rearm_indirect_transfer_watch_after_refuted(&observation)?;
+            Ok(true)
+        }
+    }
+}
+
+fn run_cooperative_child<F>(
     env: &mut Win64Env,
     emu: &mut Emu,
     image: &pe::PeImage,
+    thread_id: u32,
     begin: u64,
-    return_guard: u64,
-    entry_rsp: u64,
-) -> Result<(Vec<String>, CooperativeThreadStop, u64), EmuError> {
+    runtime: CooperativeRuntime,
+    on_transfer: &mut F,
+) -> Result<(Vec<String>, CooperativeThreadStop, u64), EmuError>
+where
+    F: FnMut(
+        IndirectTransferExecutionContext,
+        &IndirectTransferObservation,
+    ) -> IndirectTransferDisposition,
+{
     let start_count = emu.total_instructions_executed();
     let mut handled = Vec::new();
     let mut next = begin;
@@ -2219,15 +3832,25 @@ fn run_cooperative_child(
         let leg = run_with_import_trap(env, emu, image, next, remaining, 0)?;
         debug_assert!(leg.handled.is_empty());
         if !is_call_bound_stop(&leg.stop) {
+            if leg.stop == TrapStop::IndirectTransferObserved
+                && disposition_allows_resume(
+                    emu,
+                    IndirectTransferExecutionContext::Child { thread_id },
+                    on_transfer,
+                )?
+            {
+                next = emu.read_reg(RegisterX86::RIP)?;
+                continue;
+            }
             let final_rip = emu.read_reg(RegisterX86::RIP)?;
             let final_rsp = emu.read_reg(RegisterX86::RSP)?;
             let stop = if matches!(
                 leg.stop,
                 TrapStop::UnexpectedFault {
                     address
-                } if address == return_guard
-            ) && final_rip == return_guard
-                && entry_rsp.checked_add(8) == Some(final_rsp)
+                } if address == runtime.return_guard
+            ) && final_rip == runtime.return_guard
+                && runtime.entry_rsp.checked_add(8) == Some(final_rsp)
             {
                 CooperativeThreadStop::ReachedReturnGuard
             } else {
@@ -2261,7 +3884,7 @@ fn run_cooperative_child(
 
         match dispatch(env, emu, &name)? {
             ApiOutcome::Handled { name, .. } | ApiOutcome::HandledVoid { name } => {
-                let blocked = name == "Sleep";
+                let blocked = name == "Sleep" && !env.has_pending_vectored_exception();
                 handled.push(name);
                 if blocked {
                     return Ok((
@@ -2285,11 +3908,18 @@ fn run_cooperative_child(
     }
 }
 
-fn yield_to_next_runnable_thread(
+fn yield_to_next_runnable_thread<F>(
     env: &mut Win64Env,
     emu: &mut Emu,
     image: &pe::PeImage,
-) -> Result<Option<CooperativeYield>, EmuError> {
+    on_transfer: &mut F,
+) -> Result<Option<CooperativeYield>, EmuError>
+where
+    F: FnMut(
+        IndirectTransferExecutionContext,
+        &IndirectTransferObservation,
+    ) -> IndirectTransferDisposition,
+{
     let next_thread = env
         .runnable_unscheduled_threads()
         .next()
@@ -2309,9 +3939,10 @@ fn yield_to_next_runnable_thread(
             env,
             emu,
             image,
+            thread_id,
             thread.start_address,
-            runtime.return_guard,
-            runtime.entry_rsp,
+            runtime,
+            on_transfer,
         )?;
         Ok(CooperativeYield {
             thread_id,
@@ -2346,6 +3977,43 @@ pub fn run_with_cooperative_scheduler(
     per_run_cap: u64,
     max_calls: usize,
 ) -> Result<CooperativeTrapRun, EmuError> {
+    run_with_cooperative_scheduler_observing(
+        env,
+        emu,
+        image,
+        begin,
+        per_run_cap,
+        max_calls,
+        |_: IndirectTransferExecutionContext, _: &IndirectTransferObservation| {
+            IndirectTransferDisposition::Stop
+        },
+    )
+}
+
+/// Run the bounded cooperative scheduler while allowing a caller to dispose
+/// each complete watched indirect transfer synchronously.
+///
+/// The callback runs before any child CPU context is discarded. Returning
+/// [`IndirectTransferDisposition::ResumeAdjudicatedRefutation`] invokes the
+/// coverage-preserving exact-observation rearm transition and resumes at the
+/// frozen, not-yet-executed target. Capture failures and emulator stop failures
+/// never reach the callback and remain fail-closed run boundaries.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_cooperative_scheduler_observing<F>(
+    env: &mut Win64Env,
+    emu: &mut Emu,
+    image: &pe::PeImage,
+    begin: u64,
+    per_run_cap: u64,
+    max_calls: usize,
+    mut on_transfer: F,
+) -> Result<CooperativeTrapRun, EmuError>
+where
+    F: FnMut(
+        IndirectTransferExecutionContext,
+        &IndirectTransferObservation,
+    ) -> IndirectTransferDisposition,
+{
     let mut handled = Vec::new();
     let mut cooperative_yields = Vec::new();
     let mut main_instructions_after_first_yield = 0u64;
@@ -2362,6 +4030,16 @@ pub fn run_with_cooperative_scheduler(
         }
         debug_assert!(leg.handled.is_empty());
         if !is_call_bound_stop(&leg.stop) {
+            if leg.stop == TrapStop::IndirectTransferObserved
+                && disposition_allows_resume(
+                    emu,
+                    IndirectTransferExecutionContext::Main,
+                    &mut on_transfer,
+                )?
+            {
+                next = emu.read_reg(RegisterX86::RIP)?;
+                continue;
+            }
             return Ok(CooperativeTrapRun {
                 handled,
                 cooperative_yields,
@@ -2390,25 +4068,45 @@ pub fn run_with_cooperative_scheduler(
 
         match dispatch(env, emu, &name)? {
             ApiOutcome::Handled { name, .. } | ApiOutcome::HandledVoid { name } => {
-                let should_yield =
-                    name == "Sleep" && env.runnable_unscheduled_threads().next().is_some();
+                let should_yield = name == "Sleep"
+                    && !env.has_pending_vectored_exception()
+                    && env.runnable_unscheduled_threads().next().is_some();
                 handled.push(name);
                 next = emu.read_reg(RegisterX86::RIP)?;
                 if should_yield {
-                    if let Some(yielded) = yield_to_next_runnable_thread(env, emu, image)? {
-                        let indirect_transfer_observed = matches!(
-                            yielded.stop,
-                            CooperativeThreadStop::Trap(TrapStop::IndirectTransferObserved)
-                        );
+                    if let Some(yielded) =
+                        yield_to_next_runnable_thread(env, emu, image, &mut on_transfer)?
+                    {
+                        let propagated_watch_stop = match &yielded.stop {
+                            CooperativeThreadStop::Trap(
+                                stop @ (TrapStop::IndirectTransferObserved
+                                | TrapStop::IndirectTransferCaptureFailed
+                                | TrapStop::IndirectTransferStopFailed
+                                | TrapStop::ExceptionContinuationObserved
+                                | TrapStop::UnhandledSoftwareException { .. }
+                                | TrapStop::NoncontinuableContinuationAttempt { .. }
+                                | TrapStop::InvalidVectoredExceptionDisposition { .. }
+                                | TrapStop::InvalidVectoredExceptionContext { .. }),
+                            ) => Some(stop.clone()),
+                            _ if env
+                                .pending_vectored_exceptions
+                                .contains_key(&yielded.thread_id) =>
+                            {
+                                Some(TrapStop::IncompleteVectoredExceptionDispatch {
+                                    thread_id: yielded.thread_id,
+                                })
+                            }
+                            _ => None,
+                        };
                         cooperative_yields.push(yielded);
                         has_yielded = true;
                         next = emu.read_reg(RegisterX86::RIP)?;
-                        if indirect_transfer_observed {
+                        if let Some(stop) = propagated_watch_stop {
                             return Ok(CooperativeTrapRun {
                                 handled,
                                 cooperative_yields,
                                 main_instructions_after_first_yield,
-                                stop: TrapStop::IndirectTransferObserved,
+                                stop,
                             });
                         }
                     }
@@ -2435,6 +4133,12 @@ pub fn run_with_import_trap(
     max_calls: usize,
 ) -> Result<TrapRun, EmuError> {
     let mut handled = Vec::new();
+    if env.changed_exception_continuation.is_some() {
+        return Ok(TrapRun {
+            handled,
+            stop: TrapStop::ExceptionContinuationObserved,
+        });
+    }
     let mut rip = begin;
 
     loop {
@@ -2443,6 +4147,50 @@ pub fn run_with_import_trap(
             StopReason::MemoryFault(fault)
                 if matches!(fault.kind, FaultKind::FetchUnmapped | FaultKind::FetchProt) =>
             {
+                if let Some(transition) =
+                    env.advance_vectored_exception_dispatch_on_guard(emu, fault.address)?
+                {
+                    match transition {
+                        VectoredExceptionReturn::Resume => {
+                            rip = emu.read_reg(RegisterX86::RIP)?;
+                            continue;
+                        }
+                        VectoredExceptionReturn::ChangedContinuation => {
+                            return Ok(TrapRun {
+                                handled,
+                                stop: TrapStop::ExceptionContinuationObserved,
+                            });
+                        }
+                        VectoredExceptionReturn::HandlersExhausted { code } => {
+                            return Ok(TrapRun {
+                                handled,
+                                stop: TrapStop::UnhandledSoftwareException { code },
+                            });
+                        }
+                        VectoredExceptionReturn::Noncontinuable { code } => {
+                            return Ok(TrapRun {
+                                handled,
+                                stop: TrapStop::NoncontinuableContinuationAttempt { code },
+                            });
+                        }
+                        VectoredExceptionReturn::InvalidDisposition { code, disposition } => {
+                            return Ok(TrapRun {
+                                handled,
+                                stop: TrapStop::InvalidVectoredExceptionDisposition {
+                                    code,
+                                    disposition,
+                                },
+                            });
+                        }
+                        VectoredExceptionReturn::InvalidContext { code } => {
+                            return Ok(TrapRun {
+                                handled,
+                                stop: TrapStop::InvalidVectoredExceptionContext { code },
+                            });
+                        }
+                    }
+                }
+
                 if let Some((name, rva)) = env
                     .stub_export_at(fault.address)
                     .or_else(|| env.proc_stub_at(fault.address))
@@ -2544,6 +4292,18 @@ pub fn run_with_import_trap(
                     stop: TrapStop::IndirectTransferObserved,
                 });
             }
+            StopReason::IndirectTransferCaptureFailed => {
+                return Ok(TrapRun {
+                    handled,
+                    stop: TrapStop::IndirectTransferCaptureFailed,
+                });
+            }
+            StopReason::IndirectTransferStopFailed => {
+                return Ok(TrapRun {
+                    handled,
+                    stop: TrapStop::IndirectTransferStopFailed,
+                });
+            }
             StopReason::ReachedUntil if report.final_rip == 0 => {
                 return Ok(TrapRun {
                     handled,
@@ -2564,6 +4324,7 @@ pub fn run_with_import_trap(
 mod tests {
     use super::*;
     use crate::pe::{PeImage, Section};
+    use sha2::{Digest, Sha256};
 
     const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
     const CODE_RVA: u32 = 0x1000;
@@ -2711,6 +4472,14 @@ mod tests {
             .iter()
             .map(|register| (*register, emu.read_reg(*register).unwrap()))
             .collect()
+    }
+
+    fn observed_register(observation: &IndirectTransferObservation, register: RegisterX86) -> u64 {
+        observation
+            .registers
+            .iter()
+            .find_map(|(observed, value)| (*observed == register).then_some(*value))
+            .unwrap_or_else(|| panic!("missing {register:?} from indirect-transfer snapshot"))
     }
 
     fn assert_sleep_return_state(emu: &Emu, before: &[(RegisterX86, u64)], return_address: u64) {
@@ -2959,6 +4728,105 @@ mod tests {
         assert_ne!(ret, 0);
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct VirtualAllocArgs {
+        requested_address: u64,
+        requested_size: u64,
+        allocation_type: u64,
+        protection: u64,
+    }
+
+    impl VirtualAllocArgs {
+        fn observed(requested_size: u64) -> Self {
+            Self {
+                requested_address: 0,
+                requested_size,
+                allocation_type: u64::from(MEM_COMMIT),
+                protection: u64::from(PAGE_READWRITE),
+            }
+        }
+    }
+
+    fn prepare_virtual_alloc_call(
+        emu: &mut Emu,
+        args: VirtualAllocArgs,
+        rsp: u64,
+        return_address: Option<u64>,
+    ) {
+        if let Some(return_address) = return_address {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        }
+        seed_sleep_machine_state(emu, args.requested_address, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, args.requested_size)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, args.allocation_type)
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, args.protection).unwrap();
+    }
+
+    fn call_virtual_alloc(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        args: VirtualAllocArgs,
+        rsp: u64,
+        return_address: u64,
+    ) -> u64 {
+        prepare_virtual_alloc_call(emu, args, rsp, Some(return_address));
+        let outcome = dispatch(env, emu, "VirtualAlloc").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected VirtualAlloc to be handled");
+        };
+        assert_eq!(name, "VirtualAlloc");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn prepare_virtual_free_call(
+        emu: &mut Emu,
+        allocation_base: u64,
+        size: u64,
+        free_type: u64,
+        rsp: u64,
+        return_address: Option<u64>,
+    ) {
+        if let Some(return_address) = return_address {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        }
+        emu.write_reg(RegisterX86::RCX, allocation_base).unwrap();
+        emu.write_reg(RegisterX86::RDX, size).unwrap();
+        emu.write_reg(RegisterX86::R8, free_type).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+    }
+
+    fn call_virtual_free(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        allocation_base: u64,
+        free_type: u64,
+    ) -> u64 {
+        let rsp = STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        prepare_virtual_free_call(
+            emu,
+            allocation_base,
+            0,
+            free_type,
+            rsp,
+            Some(return_address),
+        );
+        let outcome = dispatch(env, emu, "VirtualFree").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected VirtualFree to be handled");
+        };
+        assert_eq!(name, "VirtualFree");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
     fn call_rtl_allocate_heap(
         env: &mut Win64Env,
         emu: &mut Emu,
@@ -3038,6 +4906,30 @@ mod tests {
         ret
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestRaiseExceptionArgs {
+        code: u64,
+        flags: u64,
+        argument_count: u64,
+        arguments: u64,
+        rsp: u64,
+        return_address: u64,
+    }
+
+    fn begin_test_raise_exception(
+        env: &mut Win64Env,
+        emu: &mut Emu,
+        args: TestRaiseExceptionArgs,
+    ) -> ApiOutcome {
+        emu.write_mem(args.rsp, &args.return_address.to_le_bytes())
+            .unwrap();
+        seed_sleep_machine_state(emu, args.code, args.rsp, 0x0000_7fff_1234_5000);
+        emu.write_reg(RegisterX86::RDX, args.flags).unwrap();
+        emu.write_reg(RegisterX86::R8, args.argument_count).unwrap();
+        emu.write_reg(RegisterX86::R9, args.arguments).unwrap();
+        dispatch(env, emu, "RaiseException").unwrap()
+    }
+
     fn call_open_thread(
         env: &mut Win64Env,
         emu: &mut Emu,
@@ -3058,6 +4950,65 @@ mod tests {
             panic!("expected OpenThread to be handled");
         };
         assert_eq!(name, "OpenThread");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn call_close_handle(env: &mut Win64Env, emu: &mut Emu, handle: u64) -> u64 {
+        let rsp = STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, handle).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let outcome = dispatch(env, emu, "CloseHandle").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected CloseHandle to be handled");
+        };
+        assert_eq!(name, "CloseHandle");
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        ret
+    }
+
+    fn prepare_allocate_sid_call(
+        emu: &mut Emu,
+        authority: u64,
+        count: u64,
+        sub_authorities: [u64; 8],
+        output: u64,
+        rsp: u64,
+        return_address: Option<u64>,
+    ) {
+        if let Some(return_address) = return_address {
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        }
+        for (index, value) in sub_authorities[2..].iter().enumerate() {
+            emu.write_mem(rsp + 0x28 + index as u64 * 8, &value.to_le_bytes())
+                .unwrap();
+        }
+        emu.write_mem(rsp + 0x58, &output.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, authority).unwrap();
+        emu.write_reg(RegisterX86::RDX, count).unwrap();
+        emu.write_reg(RegisterX86::R8, sub_authorities[0]).unwrap();
+        emu.write_reg(RegisterX86::R9, sub_authorities[1]).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+    }
+
+    fn call_free_sid(env: &mut Win64Env, emu: &mut Emu, sid: u64) -> u64 {
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, sid).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let outcome = dispatch(env, emu, "FreeSid").unwrap();
+        let ApiOutcome::Handled { name, ret } = outcome else {
+            panic!("expected FreeSid to be handled");
+        };
+        assert_eq!(name, "FreeSid");
         assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), ret);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
@@ -3273,8 +5224,11 @@ mod tests {
     #[test]
     fn synthetic_kernel32_is_parseable() {
         let mut emu = Emu::new().unwrap();
-        let module =
-            SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", KERNEL32_EXPORTS);
+        let module = SyntheticModule::build(
+            FAKE_MODULE_BASE_START,
+            "kernel32.dll",
+            KERNEL32_EXPORTS.as_slice(),
+        );
         module.map_into(&mut emu).unwrap();
 
         assert_eq!(emu.read_mem(module.base, 2).unwrap(), b"MZ");
@@ -3316,6 +5270,21 @@ mod tests {
             .collect::<Vec<_>>();
         expected.sort();
         assert_eq!(walked, expected);
+    }
+
+    #[test]
+    fn kernel32_export_name_snapshot_is_content_addressed() {
+        let bytes = include_bytes!("kernel32_exports.txt");
+        let digest = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(KERNEL32_EXPORTS.len(), 1_664);
+        assert_eq!(bytes.len(), 34_362);
+        assert_eq!(
+            digest,
+            "1e76115f6f88c0acc5ec0dcb985600d7cba525b5dcf64aa20de262e1728c21a3"
+        );
     }
 
     #[test]
@@ -3514,17 +5483,43 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let expected = vec![
-            "NtQueryObject",
-            "RtlAddVectoredExceptionHandler",
-            "RtlAllocateHeap",
-            "RtlEnterCriticalSection",
-            "RtlFreeHeap",
-            "RtlInitializeCriticalSection",
-            "RtlLeaveCriticalSection",
-            "RtlReAllocateHeap",
-        ];
+        let mut expected = NTDLL_EXPORTS.to_vec();
+        expected.sort_unstable();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn msvcrt_catalog_exposes_declared_bootstrap_handler() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let base = env.ensure_loaded_module(&mut emu, "msvcrt.dll").unwrap();
+        let module = env.synthetic_modules.get("msvcrt.dll").unwrap();
+
+        assert_eq!(module.base, base);
+        assert_eq!(module.exports.len(), 26);
+        let handler = module.export_stub("__C_specific_handler").unwrap();
+        assert_eq!(
+            env.callable_stub_name_at(handler).as_deref(),
+            Some("__C_specific_handler")
+        );
+        assert!(emu
+            .read_mem(handler, SYNTHETIC_STUB_STRIDE as usize)
+            .is_ok());
+    }
+
+    #[test]
+    fn msvcrt_export_name_snapshot_is_content_addressed() {
+        let bytes = include_bytes!("msvcrt_exports.txt");
+        let digest = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(MSVCRT_EXPORTS.len(), 26);
+        assert_eq!(bytes.len(), 244);
+        assert_eq!(
+            digest,
+            "f69340427263b932fb80b908063a026e469ce91300485e1ff335238d719f9fc9"
+        );
     }
 
     #[test]
@@ -3552,7 +5547,7 @@ mod tests {
         let export_dir = first_base + u64::from(SYNTHETIC_EXPORT_DIR_RVA);
         let names_rva = read_u32_emu(&emu, export_dir + 32);
         let count = read_u32_emu(&emu, export_dir + 24);
-        assert_eq!(count, 8);
+        assert_eq!(count as usize, NTDLL_EXPORTS.len());
         let names = (0..count)
             .map(|i| {
                 read_ascii_z_emu(
@@ -3565,19 +5560,9 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "NtQueryObject",
-                "RtlAddVectoredExceptionHandler",
-                "RtlAllocateHeap",
-                "RtlEnterCriticalSection",
-                "RtlFreeHeap",
-                "RtlInitializeCriticalSection",
-                "RtlLeaveCriticalSection",
-                "RtlReAllocateHeap",
-            ]
-        );
+        let mut expected = NTDLL_EXPORTS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
         emu.write_mem(name_addr, b"NTDLL\0").unwrap();
         emu.write_reg(RegisterX86::RSP, rsp).unwrap();
         let second = dispatch(&mut env, &mut emu, "LoadLibraryA").unwrap();
@@ -3743,6 +5728,217 @@ mod tests {
     }
 
     #[test]
+    fn get_thread_context_zeroes_only_requested_debug_registers() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let context = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        let mut expected = vec![0xa5; AMD64_CONTEXT_SIZE];
+        expected[AMD64_CONTEXT_FLAGS_OFFSET..AMD64_CONTEXT_FLAGS_OFFSET + 4]
+            .copy_from_slice(&CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes());
+        for &offset in &AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS {
+            expected[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        }
+
+        emu.map_zeroed_rw(context, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(context, &vec![0xa5; AMD64_CONTEXT_SIZE])
+            .unwrap();
+        emu.write_mem(
+            context + AMD64_CONTEXT_FLAGS_OFFSET as u64,
+            &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+        )
+        .unwrap();
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, CURRENT_THREAD_PSEUDO_HANDLE)
+            .unwrap();
+        emu.write_reg(RegisterX86::RDX, context).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "GetThreadContext").unwrap(),
+            ApiOutcome::Handled {
+                name: "GetThreadContext".to_owned(),
+                ret: 1,
+            }
+        );
+        assert_eq!(emu.read_mem(context, AMD64_CONTEXT_SIZE).unwrap(), expected);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), u64::MAX - 1);
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), context);
+    }
+
+    #[test]
+    fn get_thread_context_rejects_unobserved_inputs_before_mutation() {
+        let mut bad_handle_emu = Emu::new().unwrap();
+        let mut bad_handle_env = Win64Env::new(IMAGE_BASE);
+        bad_handle_emu.write_reg(RegisterX86::RCX, 7).unwrap();
+        bad_handle_emu
+            .write_reg(RegisterX86::RDX, 0x0000_0000_dead_1000)
+            .unwrap();
+        bad_handle_emu
+            .write_reg(RegisterX86::RSP, 0x0000_0000_dead_2000)
+            .unwrap();
+        assert_eq!(
+            dispatch(&mut bad_handle_env, &mut bad_handle_emu, "GetThreadContext").unwrap(),
+            ApiOutcome::Unhandled {
+                name: "GetThreadContext".to_owned(),
+            }
+        );
+
+        let mut bad_flags_emu = Emu::new().unwrap();
+        let mut bad_flags_env = Win64Env::new(IMAGE_BASE);
+        let context = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let before = vec![0xa5; AMD64_CONTEXT_SIZE];
+        bad_flags_emu
+            .map_zeroed_rw(context, u64::from(PAGE_SIZE))
+            .unwrap();
+        bad_flags_emu.write_mem(context, &before).unwrap();
+        bad_flags_emu
+            .write_mem(
+                context + AMD64_CONTEXT_FLAGS_OFFSET as u64,
+                &CONTEXT_AMD64_CONTROL_INTEGER.to_le_bytes(),
+            )
+            .unwrap();
+        bad_flags_emu
+            .write_reg(RegisterX86::RAX, 0xaaaa_bbbb_cccc_dddd)
+            .unwrap();
+        bad_flags_emu
+            .write_reg(RegisterX86::RIP, 0x1111_2222_3333_4444)
+            .unwrap();
+        bad_flags_emu
+            .write_reg(RegisterX86::RCX, CURRENT_THREAD_PSEUDO_HANDLE)
+            .unwrap();
+        bad_flags_emu.write_reg(RegisterX86::RDX, context).unwrap();
+        bad_flags_emu
+            .write_reg(RegisterX86::RSP, 0x0000_0000_dead_2000)
+            .unwrap();
+        assert_eq!(
+            dispatch(&mut bad_flags_env, &mut bad_flags_emu, "GetThreadContext").unwrap(),
+            ApiOutcome::Unhandled {
+                name: "GetThreadContext".to_owned(),
+            }
+        );
+        let mut expected = before;
+        expected[AMD64_CONTEXT_FLAGS_OFFSET..AMD64_CONTEXT_FLAGS_OFFSET + 4]
+            .copy_from_slice(&CONTEXT_AMD64_CONTROL_INTEGER.to_le_bytes());
+        assert_eq!(
+            bad_flags_emu.read_mem(context, AMD64_CONTEXT_SIZE).unwrap(),
+            expected
+        );
+        assert_eq!(
+            bad_flags_emu.read_reg(RegisterX86::RAX).unwrap(),
+            0xaaaa_bbbb_cccc_dddd
+        );
+        assert_eq!(
+            bad_flags_emu.read_reg(RegisterX86::RIP).unwrap(),
+            0x1111_2222_3333_4444
+        );
+        assert_eq!(
+            bad_flags_emu.read_reg(RegisterX86::RSP).unwrap(),
+            0x0000_0000_dead_2000
+        );
+    }
+
+    #[test]
+    fn get_thread_context_preflights_all_outputs_and_return() {
+        let context_page = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let context = context_page + u64::from(PAGE_SIZE) - 0x70;
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        let debug_sentinel = 0xfeed_face_cafe_beef_u64;
+
+        let mut protected_emu = Emu::new().unwrap();
+        let mut protected_env = Win64Env::new(IMAGE_BASE);
+        protected_emu
+            .map_zeroed_rw(context_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        protected_emu
+            .map_code(
+                context_page + u64::from(PAGE_SIZE),
+                &debug_sentinel.to_le_bytes(),
+            )
+            .unwrap();
+        protected_emu
+            .write_mem(
+                context + AMD64_CONTEXT_FLAGS_OFFSET as u64,
+                &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+            )
+            .unwrap();
+        for &offset in &AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS[..5] {
+            protected_emu
+                .write_mem(context + offset as u64, &debug_sentinel.to_le_bytes())
+                .unwrap();
+        }
+        protected_emu
+            .write_mem(rsp, &return_address.to_le_bytes())
+            .unwrap();
+        protected_emu
+            .write_reg(RegisterX86::RAX, 0xaaaa_bbbb_cccc_dddd)
+            .unwrap();
+        protected_emu
+            .write_reg(RegisterX86::RIP, 0x1111_2222_3333_4444)
+            .unwrap();
+        protected_emu
+            .write_reg(RegisterX86::RCX, CURRENT_THREAD_PSEUDO_HANDLE)
+            .unwrap();
+        protected_emu.write_reg(RegisterX86::RDX, context).unwrap();
+        protected_emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert!(dispatch(&mut protected_env, &mut protected_emu, "GetThreadContext").is_err());
+        for &offset in &AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS {
+            assert_eq!(
+                read_u64_at(&protected_emu, context + offset as u64).unwrap(),
+                debug_sentinel
+            );
+        }
+        assert_eq!(
+            protected_emu.read_reg(RegisterX86::RAX).unwrap(),
+            0xaaaa_bbbb_cccc_dddd
+        );
+        assert_eq!(
+            protected_emu.read_reg(RegisterX86::RIP).unwrap(),
+            0x1111_2222_3333_4444
+        );
+        assert_eq!(protected_emu.read_reg(RegisterX86::RSP).unwrap(), rsp);
+
+        let mut bad_return_emu = Emu::new().unwrap();
+        let mut bad_return_env = Win64Env::new(IMAGE_BASE);
+        bad_return_emu
+            .map_zeroed_rw(context_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        bad_return_emu
+            .write_mem(
+                context_page + AMD64_CONTEXT_FLAGS_OFFSET as u64,
+                &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+            )
+            .unwrap();
+        for &offset in &AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS {
+            bad_return_emu
+                .write_mem(context_page + offset as u64, &debug_sentinel.to_le_bytes())
+                .unwrap();
+        }
+        bad_return_emu
+            .write_reg(RegisterX86::RCX, CURRENT_THREAD_PSEUDO_HANDLE)
+            .unwrap();
+        bad_return_emu
+            .write_reg(RegisterX86::RDX, context_page)
+            .unwrap();
+        bad_return_emu
+            .write_reg(RegisterX86::RSP, 0x0000_0000_dead_2000)
+            .unwrap();
+        assert!(dispatch(&mut bad_return_env, &mut bad_return_emu, "GetThreadContext").is_err());
+        for &offset in &AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS {
+            assert_eq!(
+                read_u64_at(&bad_return_emu, context_page + offset as u64).unwrap(),
+                debug_sentinel
+            );
+        }
+    }
+
+    #[test]
     fn check_remote_debugger_present_reports_false_for_current_process() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -3840,6 +6036,513 @@ mod tests {
         .is_err());
         assert_eq!(invalid_output.read_reg(RegisterX86::RAX).unwrap(), rax);
         assert_eq!(invalid_output.read_reg(RegisterX86::RSP).unwrap(), rsp);
+    }
+
+    #[test]
+    fn is_bad_read_ptr_reports_false_for_exact_readable_dword() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let page = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let pointer = page + u64::from(PAGE_SIZE) - 4;
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        emu.map_zeroed_rw(page, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(pointer, &[0xde, 0xad, 0xbe, 0xef]).unwrap();
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        seed_sleep_machine_state(&mut emu, pointer, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, 4).unwrap();
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "IsBadReadPtr").unwrap(),
+            ApiOutcome::Handled {
+                name: "IsBadReadPtr".to_owned(),
+                ret: 0,
+            }
+        );
+        for (register, value) in machine_before {
+            let expected = match register {
+                RegisterX86::RAX => 0,
+                RegisterX86::RIP => return_address,
+                RegisterX86::RSP => value + 8,
+                _ => value,
+            };
+            assert_eq!(emu.read_reg(register).unwrap(), expected);
+        }
+        assert_eq!(
+            emu.read_mem(pointer, 4).unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(sleep_environment_state(&env), environment_before);
+    }
+
+    #[test]
+    fn is_bad_read_ptr_reports_true_for_bounded_unreadable_dword() {
+        for pointer in [0x0000_0001_dead_1000, u64::MAX - 2] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let rsp = STACK_BASE + 0x500;
+            let return_address = 0x1234_5678_9abc_def0_u64;
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(&mut emu, pointer, rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, 4).unwrap();
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "IsBadReadPtr").unwrap(),
+                ApiOutcome::Handled {
+                    name: "IsBadReadPtr".to_owned(),
+                    ret: 1,
+                }
+            );
+            assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+            assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), pointer);
+            assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), 4);
+        }
+
+        let mut crossing_emu = Emu::new().unwrap();
+        let mut crossing_env = Win64Env::new(IMAGE_BASE);
+        let page = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let pointer = page + u64::from(PAGE_SIZE) - 2;
+        let rsp = STACK_BASE + 0x500;
+        crossing_emu
+            .map_zeroed_rw(page, u64::from(PAGE_SIZE))
+            .unwrap();
+        crossing_emu.write_mem(pointer, &[0xa5; 2]).unwrap();
+        crossing_emu
+            .write_mem(rsp, &0x1234_5678_9abc_def0_u64.to_le_bytes())
+            .unwrap();
+        seed_sleep_machine_state(&mut crossing_emu, pointer, rsp, 0x1111_2222_3333_4444);
+        crossing_emu.write_reg(RegisterX86::RDX, 4).unwrap();
+        assert_eq!(
+            dispatch(&mut crossing_env, &mut crossing_emu, "IsBadReadPtr").unwrap(),
+            ApiOutcome::Handled {
+                name: "IsBadReadPtr".to_owned(),
+                ret: 1,
+            }
+        );
+        assert_eq!(crossing_emu.read_mem(pointer, 2).unwrap(), vec![0xa5; 2]);
+    }
+
+    #[test]
+    fn is_bad_read_ptr_rejects_other_full_width_lengths_before_access() {
+        for size in [0, 3, 5, 0xaaaa_bbbb_0000_0004] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            seed_sleep_machine_state(
+                &mut emu,
+                0x0000_0001_dead_1000,
+                0x0000_0002_dead_2000,
+                0x1111_2222_3333_4444,
+            );
+            emu.write_reg(RegisterX86::RDX, size).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "IsBadReadPtr").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "IsBadReadPtr".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+        }
+    }
+
+    #[test]
+    fn is_bad_read_ptr_invalid_return_frame_is_failure_atomic() {
+        for readable in [false, true] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let pointer = if readable {
+                STACK_BASE + 0x900
+            } else {
+                0x0000_0001_dead_1000
+            };
+            if readable {
+                emu.write_mem(pointer, &[0xa5; 4]).unwrap();
+            }
+            seed_sleep_machine_state(
+                &mut emu,
+                pointer,
+                0x0000_0002_dead_2000,
+                0x1111_2222_3333_4444,
+            );
+            emu.write_reg(RegisterX86::RDX, 4).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+
+            assert!(dispatch(&mut env, &mut emu, "IsBadReadPtr").is_err());
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            if readable {
+                assert_eq!(emu.read_mem(pointer, 4).unwrap(), vec![0xa5; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn nt_query_system_information_reports_empty_modules_with_abi_widths() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x500;
+        let information = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        emu.map_zeroed_rw(information, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_mem(information, &[0xa5; 16]).unwrap();
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        seed_sleep_machine_state(&mut emu, 0xaaaa_bbbb_0000_000b, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, information).unwrap();
+        emu.write_reg(RegisterX86::R8, 0xcccc_dddd_0001_0000)
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, 0).unwrap();
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "NtQuerySystemInformation").unwrap(),
+            ApiOutcome::Handled {
+                name: "NtQuerySystemInformation".to_owned(),
+                ret: 0,
+            }
+        );
+        assert_eq!(
+            emu.read_mem(information, 16).unwrap(),
+            vec![
+                0, 0, 0, 0, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5
+            ]
+        );
+        for (register, value) in machine_before {
+            let expected = match register {
+                RegisterX86::RAX => 0,
+                RegisterX86::RIP => return_address,
+                RegisterX86::RSP => value + 8,
+                _ => value,
+            };
+            assert_eq!(emu.read_reg(register).unwrap(), expected);
+        }
+        assert_eq!(sleep_environment_state(&env), environment_before);
+    }
+
+    #[test]
+    fn nt_query_system_information_short_buffer_preserves_output() {
+        for (information_length, information) in [
+            (0u64, 0x0000_0001_dead_1000),
+            (0xaaaa_bbbb_0000_0001, STACK_BASE + 0x900),
+            (0xcccc_dddd_0000_0003, STACK_BASE + 0x900),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let rsp = STACK_BASE + 0x500;
+            let return_address = 0x1234_5678_9abc_def0_u64;
+            if information == STACK_BASE + 0x900 {
+                emu.write_mem(information, &[0xa5; 8]).unwrap();
+            }
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(&mut emu, 0xaaaa_bbbb_0000_000b, rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, information).unwrap();
+            emu.write_reg(RegisterX86::R8, information_length).unwrap();
+            emu.write_reg(RegisterX86::R9, 0).unwrap();
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "NtQuerySystemInformation").unwrap(),
+                ApiOutcome::Handled {
+                    name: "NtQuerySystemInformation".to_owned(),
+                    ret: u64::from(STATUS_INFO_LENGTH_MISMATCH),
+                }
+            );
+            assert_eq!(
+                emu.read_reg(RegisterX86::RAX).unwrap(),
+                u64::from(STATUS_INFO_LENGTH_MISMATCH)
+            );
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+            assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), information);
+            assert_eq!(emu.read_reg(RegisterX86::R8).unwrap(), information_length);
+            if information == STACK_BASE + 0x900 {
+                assert_eq!(emu.read_mem(information, 8).unwrap(), vec![0xa5; 8]);
+            }
+        }
+    }
+
+    #[test]
+    fn nt_query_system_information_rejects_unobserved_shapes_before_access() {
+        for (information_class, return_length) in [
+            (0u64, 0),
+            (u64::from(SYSTEM_INFORMATION_CLASS_MODULE_INFORMATION), 1),
+            (0xaaaa_bbbb_0000_000b, 0x0000_0001_dead_2000),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            seed_sleep_machine_state(
+                &mut emu,
+                information_class,
+                0x0000_0002_dead_3000,
+                0x1111_2222_3333_4444,
+            );
+            emu.write_reg(RegisterX86::RDX, 0x0000_0003_dead_4000)
+                .unwrap();
+            emu.write_reg(RegisterX86::R8, 0x1_0000).unwrap();
+            emu.write_reg(RegisterX86::R9, return_length).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "NtQuerySystemInformation").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "NtQuerySystemInformation".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+        }
+    }
+
+    #[test]
+    fn nt_query_system_information_pointer_failures_are_atomic() {
+        let information_page = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let crossing_information = information_page + u64::from(PAGE_SIZE) - 2;
+        let rsp = STACK_BASE + 0x500;
+        let mut crossing_emu = Emu::new().unwrap();
+        let mut crossing_env = Win64Env::new(IMAGE_BASE);
+        crossing_emu
+            .map_zeroed_rw(information_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        crossing_emu
+            .write_mem(crossing_information, &[0xa5; 2])
+            .unwrap();
+        crossing_emu
+            .write_mem(rsp, &0x1234_5678_9abc_def0_u64.to_le_bytes())
+            .unwrap();
+        seed_sleep_machine_state(
+            &mut crossing_emu,
+            u64::from(SYSTEM_INFORMATION_CLASS_MODULE_INFORMATION),
+            rsp,
+            0x1111_2222_3333_4444,
+        );
+        crossing_emu
+            .write_reg(RegisterX86::RDX, crossing_information)
+            .unwrap();
+        crossing_emu.write_reg(RegisterX86::R8, 4).unwrap();
+        crossing_emu.write_reg(RegisterX86::R9, 0).unwrap();
+        let crossing_cpu = sleep_machine_state(&crossing_emu);
+        assert!(dispatch(
+            &mut crossing_env,
+            &mut crossing_emu,
+            "NtQuerySystemInformation"
+        )
+        .is_err());
+        assert_eq!(sleep_machine_state(&crossing_emu), crossing_cpu);
+        assert_eq!(
+            crossing_emu.read_mem(crossing_information, 2).unwrap(),
+            vec![0xa5; 2]
+        );
+
+        let mut return_emu = Emu::new().unwrap();
+        let mut return_env = Win64Env::new(IMAGE_BASE);
+        let information = STACK_BASE + 0x900;
+        let invalid_rsp = 0x0000_0002_dead_3000;
+        return_emu.write_mem(information, &[0xa5; 8]).unwrap();
+        seed_sleep_machine_state(
+            &mut return_emu,
+            u64::from(SYSTEM_INFORMATION_CLASS_MODULE_INFORMATION),
+            invalid_rsp,
+            0x1111_2222_3333_4444,
+        );
+        return_emu.write_reg(RegisterX86::RDX, information).unwrap();
+        return_emu.write_reg(RegisterX86::R8, 4).unwrap();
+        return_emu.write_reg(RegisterX86::R9, 0).unwrap();
+        let return_cpu = sleep_machine_state(&return_emu);
+        assert!(dispatch(&mut return_env, &mut return_emu, "NtQuerySystemInformation").is_err());
+        assert_eq!(sleep_machine_state(&return_emu), return_cpu);
+        assert_eq!(return_emu.read_mem(information, 8).unwrap(), vec![0xa5; 8]);
+    }
+
+    #[test]
+    fn zw_query_information_process_reports_zero_debug_port_with_abi_widths() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x500;
+        let output = STACK_BASE + 0x900;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        assert_ne!(output >> 32, 0);
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_mem(rsp + 0x28, &0u64.to_le_bytes()).unwrap();
+        emu.write_mem(output, &[0xaa; 16]).unwrap();
+        emu.write_reg(RegisterX86::RCX, CURRENT_PROCESS_PSEUDO_HANDLE)
+            .unwrap();
+        emu.write_reg(RegisterX86::RDX, 0xaaaa_bbbb_0000_0007)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, output).unwrap();
+        emu.write_reg(RegisterX86::R9, 0xcccc_dddd_0000_0008)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "ZwQueryInformationProcess").unwrap(),
+            ApiOutcome::Handled {
+                name: "ZwQueryInformationProcess".to_owned(),
+                ret: 0,
+            }
+        );
+        assert_eq!(
+            emu.read_mem(output, 16).unwrap(),
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn zw_query_information_process_reports_absent_debug_object_handle() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x500;
+        let output = STACK_BASE + 0x900;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_mem(rsp + 0x28, &0u64.to_le_bytes()).unwrap();
+        emu.write_mem(output, &[0xaa; 16]).unwrap();
+        emu.write_reg(RegisterX86::RCX, CURRENT_PROCESS_PSEUDO_HANDLE)
+            .unwrap();
+        emu.write_reg(RegisterX86::RDX, 0xaaaa_bbbb_0000_001e)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, output).unwrap();
+        emu.write_reg(RegisterX86::R9, 0xcccc_dddd_0000_0008)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "ZwQueryInformationProcess").unwrap(),
+            ApiOutcome::Handled {
+                name: "ZwQueryInformationProcess".to_owned(),
+                ret: u64::from(STATUS_PORT_NOT_SET),
+            }
+        );
+        assert_eq!(
+            emu.read_mem(output, 16).unwrap(),
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa]
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            u64::from(STATUS_PORT_NOT_SET)
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn zw_query_information_process_rejects_unmodeled_shapes_before_output_access() {
+        for (process, class, length) in [
+            (0, PROCESS_INFORMATION_CLASS_DEBUG_PORT, 8u32),
+            (CURRENT_PROCESS_PSEUDO_HANDLE, 0, 8u32),
+            (
+                CURRENT_PROCESS_PSEUDO_HANDLE,
+                PROCESS_INFORMATION_CLASS_DEBUG_PORT,
+                4u32,
+            ),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.write_reg(RegisterX86::RCX, process).unwrap();
+            emu.write_reg(RegisterX86::RDX, u64::from(class)).unwrap();
+            emu.write_reg(RegisterX86::R8, 0x0000_0000_dead_1000)
+                .unwrap();
+            emu.write_reg(RegisterX86::R9, u64::from(length)).unwrap();
+            emu.write_reg(RegisterX86::RSP, 0x0000_0000_dead_0000)
+                .unwrap();
+            let initial_cpu = sleep_machine_state(&emu);
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "ZwQueryInformationProcess").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "ZwQueryInformationProcess".to_owned()
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), initial_cpu);
+        }
+
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x500;
+        let output = STACK_BASE + 0x900;
+        emu.write_mem(rsp + 0x28, &output.to_le_bytes()).unwrap();
+        emu.write_mem(output, &[0xaa; 8]).unwrap();
+        emu.write_reg(RegisterX86::RCX, CURRENT_PROCESS_PSEUDO_HANDLE)
+            .unwrap();
+        emu.write_reg(
+            RegisterX86::RDX,
+            PROCESS_INFORMATION_CLASS_DEBUG_OBJECT_HANDLE.into(),
+        )
+        .unwrap();
+        emu.write_reg(RegisterX86::R8, output).unwrap();
+        emu.write_reg(RegisterX86::R9, 8).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let initial_cpu = sleep_machine_state(&emu);
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "ZwQueryInformationProcess").unwrap(),
+            ApiOutcome::Unhandled { .. }
+        ));
+        assert_eq!(sleep_machine_state(&emu), initial_cpu);
+        assert_eq!(emu.read_mem(output, 8).unwrap(), vec![0xaa; 8]);
+    }
+
+    #[test]
+    fn zw_query_information_process_pointer_failures_are_atomic() {
+        let rsp = STACK_BASE + 0x500;
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.write_mem(rsp, &0x1234_5678_9abc_def0u64.to_le_bytes())
+            .unwrap();
+        emu.write_mem(rsp + 0x28, &0u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, CURRENT_PROCESS_PSEUDO_HANDLE)
+            .unwrap();
+        emu.write_reg(
+            RegisterX86::RDX,
+            PROCESS_INFORMATION_CLASS_DEBUG_OBJECT_HANDLE.into(),
+        )
+        .unwrap();
+        emu.write_reg(RegisterX86::R8, 0x0000_0000_dead_1000)
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, 8).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let initial_cpu = sleep_machine_state(&emu);
+        assert!(dispatch(&mut env, &mut emu, "ZwQueryInformationProcess").is_err());
+        assert_eq!(sleep_machine_state(&emu), initial_cpu);
+
+        let mut return_emu = Emu::new().unwrap();
+        let mut return_env = Win64Env::new(IMAGE_BASE);
+        let argument_page = 0x0000_0000_0700_0000;
+        let invalid_return_rsp = argument_page - 0x28;
+        let output = STACK_BASE + 0x900;
+        return_emu
+            .map_zeroed_rw(argument_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        return_emu
+            .write_mem(argument_page, &0u64.to_le_bytes())
+            .unwrap();
+        return_emu.write_mem(output, &[0xaa; 8]).unwrap();
+        return_emu
+            .write_reg(RegisterX86::RCX, CURRENT_PROCESS_PSEUDO_HANDLE)
+            .unwrap();
+        return_emu
+            .write_reg(
+                RegisterX86::RDX,
+                PROCESS_INFORMATION_CLASS_DEBUG_PORT.into(),
+            )
+            .unwrap();
+        return_emu.write_reg(RegisterX86::R8, output).unwrap();
+        return_emu.write_reg(RegisterX86::R9, 8).unwrap();
+        return_emu
+            .write_reg(RegisterX86::RSP, invalid_return_rsp)
+            .unwrap();
+        let return_cpu = sleep_machine_state(&return_emu);
+        assert!(dispatch(
+            &mut return_env,
+            &mut return_emu,
+            "ZwQueryInformationProcess"
+        )
+        .is_err());
+        assert_eq!(sleep_machine_state(&return_emu), return_cpu);
+        assert_eq!(return_emu.read_mem(output, 8).unwrap(), vec![0xaa; 8]);
     }
 
     #[test]
@@ -3964,6 +6667,626 @@ mod tests {
     }
 
     #[test]
+    fn reg_open_key_a_empty_registry_preserves_full_width_output() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let subkey = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let output = STACK_BASE + 0x900;
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        let output_before = [0xa5; 16];
+        emu.map_zeroed_rw(subkey, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(subkey, b"SOFTWARE\\Midas\0").unwrap();
+        emu.write_mem(output, &output_before).unwrap();
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        seed_sleep_machine_state(&mut emu, HKEY_LOCAL_MACHINE, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, subkey).unwrap();
+        emu.write_reg(RegisterX86::R8, output).unwrap();
+        emu.write_reg(RegisterX86::R9, 0xaaaa_bbbb_cccc_dddd)
+            .unwrap();
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "RegOpenKeyA").unwrap(),
+            ApiOutcome::Handled {
+                name: "RegOpenKeyA".to_owned(),
+                ret: u64::from(ERROR_FILE_NOT_FOUND),
+            }
+        );
+        for (register, value) in machine_before {
+            let expected = match register {
+                RegisterX86::RAX => u64::from(ERROR_FILE_NOT_FOUND),
+                RegisterX86::RIP => return_address,
+                RegisterX86::RSP => value + 8,
+                _ => value,
+            };
+            assert_eq!(emu.read_reg(register).unwrap(), expected);
+        }
+        assert_eq!(emu.read_mem(output, 16).unwrap(), output_before);
+        assert_eq!(sleep_environment_state(&env), environment_before);
+
+        let mut unmapped_output_emu = Emu::new().unwrap();
+        let mut unmapped_output_env = Win64Env::new(IMAGE_BASE);
+        let subkey = STACK_BASE + 0x900;
+        let output = 0x0000_0001_dead_1000;
+        unmapped_output_emu
+            .write_mem(subkey, b"HARDWARE\\Midas\0")
+            .unwrap();
+        unmapped_output_emu
+            .write_mem(rsp, &return_address.to_le_bytes())
+            .unwrap();
+        unmapped_output_emu
+            .write_reg(RegisterX86::RCX, HKEY_LOCAL_MACHINE)
+            .unwrap();
+        unmapped_output_emu
+            .write_reg(RegisterX86::RDX, subkey)
+            .unwrap();
+        unmapped_output_emu
+            .write_reg(RegisterX86::R8, output)
+            .unwrap();
+        unmapped_output_emu
+            .write_reg(RegisterX86::RSP, rsp)
+            .unwrap();
+        assert_eq!(
+            dispatch(
+                &mut unmapped_output_env,
+                &mut unmapped_output_emu,
+                "RegOpenKeyA"
+            )
+            .unwrap(),
+            ApiOutcome::Handled {
+                name: "RegOpenKeyA".to_owned(),
+                ret: u64::from(ERROR_FILE_NOT_FOUND),
+            }
+        );
+        assert_eq!(
+            unmapped_output_emu.read_reg(RegisterX86::R8).unwrap(),
+            output
+        );
+    }
+
+    #[test]
+    fn reg_open_key_a_rejects_unobserved_full_width_shapes_before_access() {
+        for (root, subkey, output) in [
+            (0xffff_ffff_8000_0002, 0x0000_0001_dead_1000, 1),
+            (HKEY_LOCAL_MACHINE + 1, 0x0000_0001_dead_1000, 1),
+            (HKEY_LOCAL_MACHINE, 0, 0x0000_0002_dead_2000),
+            (HKEY_LOCAL_MACHINE, 0x0000_0001_dead_1000, 0),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            seed_sleep_machine_state(&mut emu, root, 0x0000_0003_dead_3000, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, subkey).unwrap();
+            emu.write_reg(RegisterX86::R8, output).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "RegOpenKeyA").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "RegOpenKeyA".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+        }
+    }
+
+    #[test]
+    fn reg_open_key_a_enforces_printable_nonempty_subkey_cap() {
+        let subkey = STACK_BASE + 0x900;
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+
+        let mut maximum_emu = Emu::new().unwrap();
+        let mut maximum_env = Win64Env::new(IMAGE_BASE);
+        let mut maximum = vec![b'A'; REGISTRY_SUBKEY_BYTE_CAP - 1];
+        maximum.push(0);
+        maximum_emu.write_mem(subkey, &maximum).unwrap();
+        maximum_emu
+            .write_mem(rsp, &return_address.to_le_bytes())
+            .unwrap();
+        maximum_emu
+            .write_reg(RegisterX86::RCX, HKEY_LOCAL_MACHINE)
+            .unwrap();
+        maximum_emu.write_reg(RegisterX86::RDX, subkey).unwrap();
+        maximum_emu
+            .write_reg(RegisterX86::R8, 0x0000_0001_dead_1000)
+            .unwrap();
+        maximum_emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        assert!(matches!(
+            dispatch(&mut maximum_env, &mut maximum_emu, "RegOpenKeyA").unwrap(),
+            ApiOutcome::Handled { ret, .. } if ret == u64::from(ERROR_FILE_NOT_FOUND)
+        ));
+
+        for bytes in [
+            vec![0],
+            vec![b'A', 0x1f, 0],
+            vec![b'A'; REGISTRY_SUBKEY_BYTE_CAP],
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.write_mem(subkey, &bytes).unwrap();
+            seed_sleep_machine_state(
+                &mut emu,
+                HKEY_LOCAL_MACHINE,
+                0x0000_0003_dead_3000,
+                0x1111_2222_3333_4444,
+            );
+            emu.write_reg(RegisterX86::RDX, subkey).unwrap();
+            emu.write_reg(RegisterX86::R8, 0x0000_0002_dead_2000)
+                .unwrap();
+            let machine_before = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "RegOpenKeyA").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "RegOpenKeyA".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(emu.read_mem(subkey, bytes.len()).unwrap(), bytes);
+        }
+
+        let mut unmapped_emu = Emu::new().unwrap();
+        let mut unmapped_env = Win64Env::new(IMAGE_BASE);
+        let unmapped = 0x0000_0001_dead_1000;
+        unmapped_emu
+            .write_reg(RegisterX86::RCX, HKEY_LOCAL_MACHINE)
+            .unwrap();
+        unmapped_emu.write_reg(RegisterX86::RDX, unmapped).unwrap();
+        unmapped_emu
+            .write_reg(RegisterX86::R8, 0x0000_0002_dead_2000)
+            .unwrap();
+        let machine_before = sleep_machine_state(&unmapped_emu);
+        let error = dispatch(&mut unmapped_env, &mut unmapped_emu, "RegOpenKeyA").unwrap_err();
+        assert!(
+            matches!(error, EmuError::ReadMem { addr, size: 1, .. } if addr == unmapped),
+            "unexpected subkey error: {error:?}"
+        );
+        assert_eq!(sleep_machine_state(&unmapped_emu), machine_before);
+    }
+
+    #[test]
+    fn reg_open_key_a_invalid_return_frame_preserves_output_and_control() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let subkey = STACK_BASE + 0x900;
+        let output = STACK_BASE + 0xa00;
+        let output_before = [0xa5; 16];
+        emu.write_mem(subkey, b"SOFTWARE\\Midas\0").unwrap();
+        emu.write_mem(output, &output_before).unwrap();
+        seed_sleep_machine_state(
+            &mut emu,
+            HKEY_LOCAL_MACHINE,
+            0x0000_0003_dead_3000,
+            0x1111_2222_3333_4444,
+        );
+        emu.write_reg(RegisterX86::RDX, subkey).unwrap();
+        emu.write_reg(RegisterX86::R8, output).unwrap();
+        let machine_before = sleep_machine_state(&emu);
+
+        assert!(dispatch(&mut env, &mut emu, "RegOpenKeyA").is_err());
+        assert_eq!(sleep_machine_state(&emu), machine_before);
+        assert_eq!(emu.read_mem(output, 16).unwrap(), output_before);
+    }
+
+    #[test]
+    fn close_handle_removes_tracked_token_and_thread_handles() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let token = KERNEL_HANDLE_BASE;
+        let thread = token + KERNEL_HANDLE_STRIDE;
+        let next_handle = thread + KERNEL_HANDLE_STRIDE;
+        env.insert_kernel_handle(
+            token,
+            thread,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        env.insert_kernel_handle(
+            thread,
+            next_handle,
+            KernelHandle {
+                object: KernelObject::Thread { thread_id: 1 },
+                desired_access: LEGACY_THREAD_ALL_ACCESS,
+                inheritable: false,
+            },
+        );
+
+        assert_eq!(call_close_handle(&mut env, &mut emu, token), 1);
+        assert!(!env.kernel_handles.contains_key(&token));
+        assert!(env.kernel_handles.contains_key(&thread));
+        assert_eq!(env.next_kernel_handle, next_handle);
+
+        assert_eq!(call_close_handle(&mut env, &mut emu, thread), 1);
+        assert!(env.kernel_handles.is_empty());
+        assert_eq!(env.next_kernel_handle, next_handle);
+    }
+
+    #[test]
+    fn close_handle_rejects_repeated_unknown_and_pseudo_handles_without_registry_change() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let handle = KERNEL_HANDLE_BASE;
+        env.insert_kernel_handle(
+            handle,
+            handle + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        assert_eq!(call_close_handle(&mut env, &mut emu, handle), 1);
+        let cursor_after_close = env.next_kernel_handle;
+
+        for invalid in [
+            handle,
+            0,
+            handle + 7,
+            CURRENT_PROCESS_PSEUDO_HANDLE,
+            CURRENT_THREAD_PSEUDO_HANDLE,
+            EMULATED_PROCESS_HEAP_HANDLE,
+        ] {
+            let handles_before = env.kernel_handles.clone();
+            assert_eq!(call_close_handle(&mut env, &mut emu, invalid), 0);
+            assert_eq!(env.kernel_handles, handles_before);
+            assert_eq!(env.next_kernel_handle, cursor_after_close);
+        }
+    }
+
+    #[test]
+    fn close_handle_bad_return_frame_preserves_live_handle_and_control() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let handle = KERNEL_HANDLE_BASE;
+        env.insert_kernel_handle(
+            handle,
+            handle + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        let initial_rax = 0xaaaa_bbbb_cccc_dddd;
+        let initial_rip = 0x1111_2222_3333_4444;
+        emu.write_reg(RegisterX86::RAX, initial_rax).unwrap();
+        emu.write_reg(RegisterX86::RCX, handle).unwrap();
+        emu.write_reg(RegisterX86::RIP, initial_rip).unwrap();
+        emu.write_reg(RegisterX86::RSP, invalid_rsp).unwrap();
+
+        assert!(dispatch(&mut env, &mut emu, "CloseHandle").is_err());
+        assert!(env.kernel_handles.contains_key(&handle));
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), invalid_rsp);
+    }
+
+    #[test]
+    fn allocate_and_initialize_sid_encodes_observed_builtin_administrators_sid() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let authority_page = IMAGE_BASE + u64::from(DATA_RVA);
+        let authority = authority_page + 0x100;
+        let output = STACK_BASE + 0x900;
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        emu.map_zeroed_rw(authority_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_mem(authority, &[0, 0, 0, 0, 0, 5, 0xaa, 0xaa])
+            .unwrap();
+        emu.write_mem(output, &[0xcc; 16]).unwrap();
+        prepare_allocate_sid_call(
+            &mut emu,
+            authority,
+            0xaaaa_bbbb_cccc_0002,
+            [
+                0x1111_2222_0000_0020,
+                0x3333_4444_0000_0220,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            output,
+            rsp,
+            Some(return_address),
+        );
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "AllocateAndInitializeSid").unwrap(),
+            ApiOutcome::Handled {
+                name: "AllocateAndInitializeSid".to_owned(),
+                ret: 1,
+            }
+        );
+        let sid = read_u64_le(&emu.read_mem(output, 8).unwrap());
+        assert_eq!(sid, SID_ALLOCATION_ARENA_BASE);
+        assert_eq!(SID_ALLOCATION_ARENA_BASE, VIRTUAL_ALLOCATION_ARENA_END);
+        assert_eq!(
+            emu.read_mem(sid, 16).unwrap(),
+            vec![1, 2, 0, 0, 0, 0, 0, 5, 0x20, 0, 0, 0, 0x20, 2, 0, 0]
+        );
+        assert_eq!(&emu.read_mem(output, 16).unwrap()[8..], &[0xcc; 8]);
+        assert_eq!(
+            env.sid_allocations.get(&sid),
+            Some(&SidAllocation {
+                sid_size: 16,
+                mapped_size: u64::from(PAGE_SIZE),
+                sub_authority_count: 2,
+            })
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        let report = emu.run_observed(sid, 1).unwrap();
+        assert!(matches!(
+            report.stop_reason,
+            StopReason::MemoryFault(fault)
+                if fault.kind == FaultKind::FetchProt && fault.address == sid
+        ));
+    }
+
+    #[test]
+    fn allocate_and_initialize_sid_supports_count_bounds_and_distinct_deterministic_pages() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let authority_page = IMAGE_BASE + u64::from(DATA_RVA);
+        let authority = authority_page + 0x100;
+        let rsp = STACK_BASE + 0x500;
+        emu.map_zeroed_rw(authority_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_mem(authority, &[1, 2, 3, 4, 5, 6]).unwrap();
+
+        let first_output = STACK_BASE + 0x900;
+        prepare_allocate_sid_call(
+            &mut emu,
+            authority,
+            1,
+            [0xaaaa_bbbb_0000_0011, 0, 0, 0, 0, 0, 0, 0],
+            first_output,
+            rsp,
+            Some(0x1000),
+        );
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "AllocateAndInitializeSid").unwrap(),
+            ApiOutcome::Handled { ret: 1, .. }
+        ));
+        let first = read_u64_le(&emu.read_mem(first_output, 8).unwrap());
+        assert_eq!(first, SID_ALLOCATION_ARENA_BASE);
+        assert_eq!(
+            emu.read_mem(first, 12).unwrap(),
+            vec![1, 1, 1, 2, 3, 4, 5, 6, 0x11, 0, 0, 0]
+        );
+
+        let second_output = STACK_BASE + 0xa00;
+        let sub_authorities = [
+            0xaaaa_0000_0000_0001,
+            0xbbbb_0000_0000_0002,
+            0xcccc_0000_0000_0003,
+            0xdddd_0000_0000_0004,
+            0xeeee_0000_0000_0005,
+            0xffff_0000_0000_0006,
+            0x1111_0000_0000_0007,
+            0x2222_0000_0000_0008,
+        ];
+        prepare_allocate_sid_call(
+            &mut emu,
+            authority,
+            0xffff_ffff_ffff_0008,
+            sub_authorities,
+            second_output,
+            rsp,
+            Some(0x2000),
+        );
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "AllocateAndInitializeSid").unwrap(),
+            ApiOutcome::Handled { ret: 1, .. }
+        ));
+        let second = read_u64_le(&emu.read_mem(second_output, 8).unwrap());
+        assert_eq!(second, first + u64::from(PAGE_SIZE));
+        let mut expected = vec![1, 8, 1, 2, 3, 4, 5, 6];
+        for value in 1u32..=8 {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(emu.read_mem(second, expected.len()).unwrap(), expected);
+
+        let mut fresh_emu = Emu::new().unwrap();
+        let mut fresh_env = Win64Env::new(IMAGE_BASE);
+        fresh_emu
+            .map_zeroed_rw(authority_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        fresh_emu.write_mem(authority, &[1, 2, 3, 4, 5, 6]).unwrap();
+        prepare_allocate_sid_call(
+            &mut fresh_emu,
+            authority,
+            1,
+            [0x11, 0, 0, 0, 0, 0, 0, 0],
+            first_output,
+            rsp,
+            Some(0x3000),
+        );
+        dispatch(&mut fresh_env, &mut fresh_emu, "AllocateAndInitializeSid").unwrap();
+        assert_eq!(
+            read_u64_le(&fresh_emu.read_mem(first_output, 8).unwrap()),
+            first
+        );
+
+        for count in [0, 9] {
+            let output = STACK_BASE + 0xb00;
+            fresh_emu.write_mem(output, &[0xcc; 8]).unwrap();
+            let allocations_before = fresh_env.sid_allocations.clone();
+            let cursor_before = fresh_env.sid_allocation_cursor;
+            prepare_allocate_sid_call(
+                &mut fresh_emu,
+                0x0000_0000_dead_0000,
+                count,
+                [0; 8],
+                output,
+                rsp,
+                Some(0x4000 + count),
+            );
+            assert_eq!(
+                dispatch(&mut fresh_env, &mut fresh_emu, "AllocateAndInitializeSid").unwrap(),
+                ApiOutcome::Handled {
+                    name: "AllocateAndInitializeSid".to_owned(),
+                    ret: 0,
+                }
+            );
+            assert_eq!(fresh_emu.read_mem(output, 8).unwrap(), vec![0xcc; 8]);
+            assert_eq!(fresh_env.sid_allocations, allocations_before);
+            assert_eq!(fresh_env.sid_allocation_cursor, cursor_before);
+        }
+    }
+
+    #[test]
+    fn allocate_and_initialize_sid_pointer_and_exhaustion_failures_are_atomic() {
+        let rsp = STACK_BASE + 0x500;
+        let output = STACK_BASE + 0x900;
+
+        let mut authority_emu = Emu::new().unwrap();
+        let mut authority_env = Win64Env::new(IMAGE_BASE);
+        authority_emu.write_mem(output, &[0xcc; 8]).unwrap();
+        prepare_allocate_sid_call(
+            &mut authority_emu,
+            0x0000_0000_dead_0000,
+            2,
+            [0x20, 0x220, 0, 0, 0, 0, 0, 0],
+            output,
+            rsp,
+            Some(0x1000),
+        );
+        let authority_cpu = sleep_machine_state(&authority_emu);
+        assert!(dispatch(
+            &mut authority_env,
+            &mut authority_emu,
+            "AllocateAndInitializeSid"
+        )
+        .is_err());
+        assert_eq!(sleep_machine_state(&authority_emu), authority_cpu);
+        assert_eq!(authority_emu.read_mem(output, 8).unwrap(), vec![0xcc; 8]);
+        assert!(authority_env.sid_allocations.is_empty());
+        assert_eq!(
+            authority_env.sid_allocation_cursor,
+            SID_ALLOCATION_ARENA_BASE
+        );
+        assert!(authority_emu
+            .read_mem(SID_ALLOCATION_ARENA_BASE, 1)
+            .is_err());
+
+        let mut output_emu = Emu::new().unwrap();
+        let mut output_env = Win64Env::new(IMAGE_BASE);
+        let authority_page = IMAGE_BASE + u64::from(DATA_RVA);
+        let authority = authority_page + 0x100;
+        output_emu
+            .map_zeroed_rw(authority_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        output_emu
+            .write_mem(authority, &[0, 0, 0, 0, 0, 5])
+            .unwrap();
+        prepare_allocate_sid_call(
+            &mut output_emu,
+            authority,
+            2,
+            [0x20, 0x220, 0, 0, 0, 0, 0, 0],
+            0x0000_0000_dead_1000,
+            rsp,
+            Some(0x2000),
+        );
+        let output_cpu = sleep_machine_state(&output_emu);
+        assert!(dispatch(&mut output_env, &mut output_emu, "AllocateAndInitializeSid").is_err());
+        assert_eq!(sleep_machine_state(&output_emu), output_cpu);
+        assert!(output_env.sid_allocations.is_empty());
+        assert!(output_emu.read_mem(SID_ALLOCATION_ARENA_BASE, 1).is_err());
+
+        output_env.sid_allocation_cursor = SID_ALLOCATION_ARENA_END;
+        prepare_allocate_sid_call(
+            &mut output_emu,
+            0x0000_0000_dead_0000,
+            2,
+            [0; 8],
+            0x0000_0000_dead_1000,
+            rsp,
+            Some(0x3000),
+        );
+        assert_eq!(
+            dispatch(&mut output_env, &mut output_emu, "AllocateAndInitializeSid").unwrap(),
+            ApiOutcome::Handled {
+                name: "AllocateAndInitializeSid".to_owned(),
+                ret: 0,
+            }
+        );
+        assert!(output_env.sid_allocations.is_empty());
+        assert_eq!(output_env.sid_allocation_cursor, SID_ALLOCATION_ARENA_END);
+    }
+
+    #[test]
+    fn free_sid_logically_frees_exact_live_base_and_rejects_other_values() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let sid = SID_ALLOCATION_ARENA_BASE;
+        let next = sid + u64::from(PAGE_SIZE);
+        emu.map_zeroed_rw(sid, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(sid, &[0xa5; 16]).unwrap();
+        env.commit_sid_allocation(
+            sid,
+            next,
+            SidAllocation {
+                sid_size: 16,
+                mapped_size: u64::from(PAGE_SIZE),
+                sub_authority_count: 2,
+            },
+        );
+
+        assert_eq!(call_free_sid(&mut env, &mut emu, sid), 0);
+        assert!(!env.sid_allocations.contains_key(&sid));
+        assert_eq!(env.sid_allocation_cursor, next);
+        assert_eq!(emu.read_mem(sid, 16).unwrap(), vec![0xa5; 16]);
+
+        for invalid in [sid, sid + 1, 0, 0x0000_0000_dead_0000] {
+            let allocations_before = env.sid_allocations.clone();
+            assert_eq!(call_free_sid(&mut env, &mut emu, invalid), invalid);
+            assert_eq!(env.sid_allocations, allocations_before);
+            assert_eq!(env.sid_allocation_cursor, next);
+        }
+    }
+
+    #[test]
+    fn free_sid_bad_return_frame_preserves_live_allocation_and_control() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let sid = SID_ALLOCATION_ARENA_BASE;
+        env.commit_sid_allocation(
+            sid,
+            sid + u64::from(PAGE_SIZE),
+            SidAllocation {
+                sid_size: 16,
+                mapped_size: u64::from(PAGE_SIZE),
+                sub_authority_count: 2,
+            },
+        );
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        let initial_rax = 0xaaaa_bbbb_cccc_dddd;
+        let initial_rip = 0x1111_2222_3333_4444;
+        emu.write_reg(RegisterX86::RAX, initial_rax).unwrap();
+        emu.write_reg(RegisterX86::RCX, sid).unwrap();
+        emu.write_reg(RegisterX86::RIP, initial_rip).unwrap();
+        emu.write_reg(RegisterX86::RSP, invalid_rsp).unwrap();
+
+        assert!(dispatch(&mut env, &mut emu, "FreeSid").is_err());
+        assert!(env.sid_allocations.contains_key(&sid));
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), invalid_rsp);
+    }
+
+    #[test]
     fn get_token_information_reports_empty_groups_query_size() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -4009,22 +7332,378 @@ mod tests {
     }
 
     #[test]
-    fn get_token_information_rejects_unobserved_queries_before_stack_access() {
+    fn get_token_information_reads_empty_groups_into_full_width_outputs() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
-        emu.write_reg(RegisterX86::RCX, 0x1234).unwrap();
-        emu.write_reg(RegisterX86::RDX, TOKEN_INFORMATION_CLASS_GROUPS.into())
+        let token = KERNEL_HANDLE_BASE;
+        env.insert_kernel_handle(
+            token,
+            token + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        emu.map_zeroed_rw(VIRTUAL_ALLOCATION_ARENA_BASE, u64::from(PAGE_SIZE))
             .unwrap();
-        emu.write_reg(RegisterX86::R8, 0).unwrap();
-        emu.write_reg(RegisterX86::R9, 0).unwrap();
-        emu.write_reg(RegisterX86::RSP, 0x0000_0000_dead_0000)
+        let image_data = IMAGE_BASE + u64::from(DATA_RVA);
+        emu.map_zeroed_rw(image_data, u64::from(PAGE_SIZE)).unwrap();
+
+        let rsp = STACK_BASE + 0x500;
+        let information = VIRTUAL_ALLOCATION_ARENA_BASE + 0x100;
+        let return_length = image_data + 0x200;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        assert_ne!(information >> 32, 0);
+        assert_ne!(return_length >> 32, 0);
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_mem(rsp + 0x28, &return_length.to_le_bytes())
             .unwrap();
+        emu.write_mem(information, &[0xaa; 8]).unwrap();
+        emu.write_mem(return_length, &[0xbb; 8]).unwrap();
+        emu.write_reg(RegisterX86::RCX, token).unwrap();
+        emu.write_reg(RegisterX86::RDX, 0xaaaa_bbbb_0000_0002)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, information).unwrap();
+        emu.write_reg(RegisterX86::R9, 0xcccc_dddd_0000_0004)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
 
         assert_eq!(
             dispatch(&mut env, &mut emu, "GetTokenInformation").unwrap(),
-            ApiOutcome::Unhandled {
+            ApiOutcome::Handled {
                 name: "GetTokenInformation".to_owned(),
+                ret: 1,
             }
+        );
+        assert_eq!(
+            emu.read_mem(information, 8).unwrap(),
+            vec![0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa]
+        );
+        assert_eq!(
+            emu.read_mem(return_length, 8).unwrap(),
+            vec![4, 0, 0, 0, 0xbb, 0xbb, 0xbb, 0xbb]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn get_token_information_rejects_overlapping_outputs_but_accepts_adjacency() {
+        let output_page = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let information = output_page + 0x100;
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+
+        for return_length in [
+            information,
+            information + 1,
+            information + 3,
+            information - 1,
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            env.insert_kernel_handle(
+                KERNEL_HANDLE_BASE,
+                KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE,
+                KernelHandle {
+                    object: KernelObject::ProcessToken,
+                    desired_access: TOKEN_QUERY,
+                    inheritable: false,
+                },
+            );
+            emu.map_zeroed_rw(output_page, u64::from(PAGE_SIZE))
+                .unwrap();
+            emu.write_mem(information - 1, &[0xaa; 12]).unwrap();
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            emu.write_mem(rsp + 0x28, &return_length.to_le_bytes())
+                .unwrap();
+            emu.write_reg(RegisterX86::RAX, 0xaaaa_bbbb_cccc_dddd)
+                .unwrap();
+            emu.write_reg(RegisterX86::RIP, 0x1111_2222_3333_4444)
+                .unwrap();
+            emu.write_reg(RegisterX86::RCX, KERNEL_HANDLE_BASE).unwrap();
+            emu.write_reg(RegisterX86::RDX, TOKEN_INFORMATION_CLASS_GROUPS.into())
+                .unwrap();
+            emu.write_reg(RegisterX86::R8, information).unwrap();
+            emu.write_reg(RegisterX86::R9, EMPTY_TOKEN_GROUPS_SIZE.into())
+                .unwrap();
+            emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+            let initial_cpu = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "GetTokenInformation").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "GetTokenInformation".to_owned()
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), initial_cpu);
+            assert_eq!(emu.read_mem(information - 1, 12).unwrap(), vec![0xaa; 12]);
+        }
+
+        let mut adjacent_emu = Emu::new().unwrap();
+        let mut adjacent_env = Win64Env::new(IMAGE_BASE);
+        adjacent_env.insert_kernel_handle(
+            KERNEL_HANDLE_BASE,
+            KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        adjacent_emu
+            .map_zeroed_rw(output_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        adjacent_emu.write_mem(information, &[0xaa; 8]).unwrap();
+        adjacent_emu
+            .write_mem(rsp, &return_address.to_le_bytes())
+            .unwrap();
+        adjacent_emu
+            .write_mem(rsp + 0x28, &(information + 4).to_le_bytes())
+            .unwrap();
+        adjacent_emu
+            .write_reg(RegisterX86::RCX, KERNEL_HANDLE_BASE)
+            .unwrap();
+        adjacent_emu
+            .write_reg(RegisterX86::RDX, TOKEN_INFORMATION_CLASS_GROUPS.into())
+            .unwrap();
+        adjacent_emu
+            .write_reg(RegisterX86::R8, information)
+            .unwrap();
+        adjacent_emu
+            .write_reg(RegisterX86::R9, EMPTY_TOKEN_GROUPS_SIZE.into())
+            .unwrap();
+        adjacent_emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert_eq!(
+            dispatch(&mut adjacent_env, &mut adjacent_emu, "GetTokenInformation").unwrap(),
+            ApiOutcome::Handled {
+                name: "GetTokenInformation".to_owned(),
+                ret: 1,
+            }
+        );
+        assert_eq!(
+            adjacent_emu.read_mem(information, 8).unwrap(),
+            vec![0, 0, 0, 0, 4, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn get_token_information_rejects_unobserved_queries_before_stack_access() {
+        let output_page = VIRTUAL_ALLOCATION_ARENA_BASE;
+        let output = output_page + 0x100;
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        let cases = [
+            (0x1234, TOKEN_INFORMATION_CLASS_GROUPS, 0, 0),
+            (KERNEL_HANDLE_BASE, 1, output, EMPTY_TOKEN_GROUPS_SIZE),
+            (
+                KERNEL_HANDLE_BASE,
+                TOKEN_INFORMATION_CLASS_GROUPS,
+                0,
+                EMPTY_TOKEN_GROUPS_SIZE,
+            ),
+            (
+                KERNEL_HANDLE_BASE,
+                TOKEN_INFORMATION_CLASS_GROUPS,
+                output,
+                0,
+            ),
+            (
+                KERNEL_HANDLE_BASE,
+                TOKEN_INFORMATION_CLASS_GROUPS,
+                output,
+                EMPTY_TOKEN_GROUPS_SIZE + 1,
+            ),
+        ];
+
+        for (token, information_class, information, information_length) in cases {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            env.insert_kernel_handle(
+                KERNEL_HANDLE_BASE,
+                KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE,
+                KernelHandle {
+                    object: KernelObject::ProcessToken,
+                    desired_access: TOKEN_QUERY,
+                    inheritable: false,
+                },
+            );
+            emu.map_zeroed_rw(output_page, u64::from(PAGE_SIZE))
+                .unwrap();
+            emu.write_mem(output, &[0xaa; 8]).unwrap();
+            emu.write_reg(RegisterX86::RCX, token).unwrap();
+            emu.write_reg(RegisterX86::RDX, u64::from(information_class))
+                .unwrap();
+            emu.write_reg(RegisterX86::R8, information).unwrap();
+            emu.write_reg(RegisterX86::R9, u64::from(information_length))
+                .unwrap();
+            emu.write_reg(RegisterX86::RSP, invalid_rsp).unwrap();
+            let initial_cpu = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "GetTokenInformation").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "GetTokenInformation".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), initial_cpu);
+            assert_eq!(emu.read_mem(output, 8).unwrap(), vec![0xaa; 8]);
+        }
+    }
+
+    #[test]
+    fn get_token_information_preflights_all_outputs_before_writing() {
+        let rsp = STACK_BASE + 0x500;
+        let information = VIRTUAL_ALLOCATION_ARENA_BASE + 0x100;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+
+        let mut late_emu = Emu::new().unwrap();
+        let mut late_env = Win64Env::new(IMAGE_BASE);
+        late_env.insert_kernel_handle(
+            KERNEL_HANDLE_BASE,
+            KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        late_emu
+            .map_zeroed_rw(VIRTUAL_ALLOCATION_ARENA_BASE, u64::from(PAGE_SIZE))
+            .unwrap();
+        late_emu.write_mem(information, &[0xaa; 8]).unwrap();
+        late_emu
+            .write_mem(rsp, &return_address.to_le_bytes())
+            .unwrap();
+        let invalid_return_length: u64 = 0x0000_0000_dead_1000;
+        late_emu
+            .write_mem(rsp + 0x28, &invalid_return_length.to_le_bytes())
+            .unwrap();
+        late_emu
+            .write_reg(RegisterX86::RCX, KERNEL_HANDLE_BASE)
+            .unwrap();
+        late_emu
+            .write_reg(RegisterX86::RDX, TOKEN_INFORMATION_CLASS_GROUPS.into())
+            .unwrap();
+        late_emu.write_reg(RegisterX86::R8, information).unwrap();
+        late_emu
+            .write_reg(RegisterX86::R9, EMPTY_TOKEN_GROUPS_SIZE.into())
+            .unwrap();
+        late_emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let late_cpu = sleep_machine_state(&late_emu);
+
+        let error = dispatch(&mut late_env, &mut late_emu, "GetTokenInformation").unwrap_err();
+        assert!(matches!(
+            error,
+            EmuError::WriteUnmapped { addr, size: 4 }
+                if addr == invalid_return_length
+        ));
+        assert_eq!(sleep_machine_state(&late_emu), late_cpu);
+        assert_eq!(late_emu.read_mem(information, 8).unwrap(), vec![0xaa; 8]);
+
+        let mut early_emu = Emu::new().unwrap();
+        let mut early_env = Win64Env::new(IMAGE_BASE);
+        early_env.insert_kernel_handle(
+            KERNEL_HANDLE_BASE,
+            KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        let return_page = IMAGE_BASE + u64::from(DATA_RVA);
+        let return_length = return_page + 0x100;
+        early_emu
+            .map_zeroed_rw(return_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        early_emu.write_mem(return_length, &[0xbb; 8]).unwrap();
+        early_emu
+            .write_mem(rsp, &return_address.to_le_bytes())
+            .unwrap();
+        early_emu
+            .write_mem(rsp + 0x28, &return_length.to_le_bytes())
+            .unwrap();
+        let invalid_information = 0x0000_0000_dead_2000;
+        early_emu
+            .write_reg(RegisterX86::RCX, KERNEL_HANDLE_BASE)
+            .unwrap();
+        early_emu
+            .write_reg(RegisterX86::RDX, TOKEN_INFORMATION_CLASS_GROUPS.into())
+            .unwrap();
+        early_emu
+            .write_reg(RegisterX86::R8, invalid_information)
+            .unwrap();
+        early_emu
+            .write_reg(RegisterX86::R9, EMPTY_TOKEN_GROUPS_SIZE.into())
+            .unwrap();
+        early_emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        let early_cpu = sleep_machine_state(&early_emu);
+
+        let error = dispatch(&mut early_env, &mut early_emu, "GetTokenInformation").unwrap_err();
+        assert!(matches!(
+            error,
+            EmuError::WriteUnmapped { addr, size: 4 }
+                if addr == invalid_information
+        ));
+        assert_eq!(sleep_machine_state(&early_emu), early_cpu);
+        assert_eq!(early_emu.read_mem(return_length, 8).unwrap(), vec![0xbb; 8]);
+
+        let mut return_emu = Emu::new().unwrap();
+        let mut return_env = Win64Env::new(IMAGE_BASE);
+        return_env.insert_kernel_handle(
+            KERNEL_HANDLE_BASE,
+            KERNEL_HANDLE_BASE + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        return_emu
+            .map_zeroed_rw(VIRTUAL_ALLOCATION_ARENA_BASE, u64::from(PAGE_SIZE))
+            .unwrap();
+        return_emu
+            .map_zeroed_rw(return_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        return_emu.write_mem(information, &[0xaa; 8]).unwrap();
+        return_emu.write_mem(return_length, &[0xbb; 8]).unwrap();
+        let argument_page = 0x0000_0000_0700_0000;
+        let invalid_return_rsp = argument_page - 0x28;
+        return_emu
+            .map_zeroed_rw(argument_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        return_emu
+            .write_mem(argument_page, &return_length.to_le_bytes())
+            .unwrap();
+        return_emu
+            .write_reg(RegisterX86::RCX, KERNEL_HANDLE_BASE)
+            .unwrap();
+        return_emu
+            .write_reg(RegisterX86::RDX, TOKEN_INFORMATION_CLASS_GROUPS.into())
+            .unwrap();
+        return_emu.write_reg(RegisterX86::R8, information).unwrap();
+        return_emu
+            .write_reg(RegisterX86::R9, EMPTY_TOKEN_GROUPS_SIZE.into())
+            .unwrap();
+        return_emu
+            .write_reg(RegisterX86::RSP, invalid_return_rsp)
+            .unwrap();
+        let return_cpu = sleep_machine_state(&return_emu);
+
+        let error = dispatch(&mut return_env, &mut return_emu, "GetTokenInformation").unwrap_err();
+        assert!(matches!(
+            error,
+            EmuError::ReadMem { addr, size: 8, .. }
+                if addr == invalid_return_rsp
+        ));
+        assert_eq!(sleep_machine_state(&return_emu), return_cpu);
+        assert_eq!(return_emu.read_mem(information, 8).unwrap(), vec![0xaa; 8]);
+        assert_eq!(
+            return_emu.read_mem(return_length, 8).unwrap(),
+            vec![0xbb; 8]
         );
     }
 
@@ -4183,6 +7862,68 @@ mod tests {
     }
 
     #[test]
+    fn get_system_firmware_table_reports_no_host_firmware_for_observed_query() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x408;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(
+            RegisterX86::RCX,
+            0xaaaa_bbbb_0000_0000 | u64::from(FIRMWARE_PROVIDER_RSMB),
+        )
+        .unwrap();
+        emu.write_reg(RegisterX86::RDX, 0xcccc_dddd_0000_0000)
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, 0).unwrap();
+        emu.write_reg(RegisterX86::R9, 0xeeee_ffff_0000_0000)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "GetSystemFirmwareTable").unwrap(),
+            ApiOutcome::Handled {
+                name: "GetSystemFirmwareTable".to_owned(),
+                ret: 0,
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn get_system_firmware_table_rejects_other_shapes_before_memory_access() {
+        for (provider, table_id, buffer, buffer_size) in [
+            (0u32, 0u32, 0u64, 0u32),
+            (FIRMWARE_PROVIDER_RSMB, 1u32, 0u64, 0u32),
+            (FIRMWARE_PROVIDER_RSMB, 0u32, 0xdead_0000u64, 0u32),
+            (FIRMWARE_PROVIDER_RSMB, 0u32, 0u64, 1u32),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let invalid_rsp = 0x0000_0000_dead_1000;
+            emu.write_reg(RegisterX86::RCX, u64::from(provider))
+                .unwrap();
+            emu.write_reg(RegisterX86::RDX, u64::from(table_id))
+                .unwrap();
+            emu.write_reg(RegisterX86::R8, buffer).unwrap();
+            emu.write_reg(RegisterX86::R9, u64::from(buffer_size))
+                .unwrap();
+            emu.write_reg(RegisterX86::RSP, invalid_rsp).unwrap();
+            let before = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "GetSystemFirmwareTable").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "GetSystemFirmwareTable".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), before);
+        }
+    }
+
+    #[test]
     fn get_command_line_a_returns_stable_readonly_environment_storage() {
         let call = |env: &mut Win64Env, emu: &mut Emu, rsp: u64, return_address: u64| -> u64 {
             emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
@@ -4258,6 +7999,28 @@ mod tests {
             emu.read_reg(RegisterX86::RIP).unwrap(),
             0x1111_2222_3333_4444
         );
+    }
+
+    #[test]
+    fn is_user_an_admin_returns_false_under_empty_groups_policy() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x500;
+        let return_address = 0x1234_5678_9abc_def0_u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RAX, u64::MAX).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "IsUserAnAdmin").unwrap(),
+            ApiOutcome::Handled {
+                name: "IsUserAnAdmin".to_owned(),
+                ret: 0,
+            }
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
     }
 
     #[test]
@@ -4428,7 +8191,7 @@ mod tests {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
         let rsp = crate::emu::STACK_BASE + 0x400;
-        let return_address = 0x1234_5678_9abc_def0;
+        let return_address = 0x1234_5678_9abc_def0u64;
         let output = WIDE_STRING_ADDRESS + 0x100;
         let wide = "guest.exe\0"
             .encode_utf16()
@@ -4805,6 +8568,163 @@ mod tests {
             assert_eq!(sleep_machine_state(&emu), machine_before);
             assert_eq!(sleep_environment_state(&env), environment_before);
         }
+    }
+
+    #[test]
+    fn find_window_a_accepts_one_printable_selector_and_reports_no_match() {
+        let selector = WINDOW_CLASS_NAME_ADDRESS;
+        assert!(selector > u64::from(u32::MAX));
+        for (class_name, window_name, bytes) in [
+            (selector, 0, b"GeneralClass\0".as_slice()),
+            (0, selector, b"Arbitrary window title\0".as_slice()),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let rsp = STACK_BASE + 0x400;
+            let return_address = 0x1234_5678_9abc_def0_u64;
+            emu.write_mem(selector, bytes).unwrap();
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(&mut emu, class_name, rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, window_name).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+            let return_frame_before = emu.read_mem(rsp, 8).unwrap();
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "FindWindowA").unwrap(),
+                ApiOutcome::Handled {
+                    name: "FindWindowA".to_owned(),
+                    ret: 0,
+                }
+            );
+            for (register, value) in machine_before {
+                let expected = match register {
+                    RegisterX86::RAX => 0,
+                    RegisterX86::RIP => return_address,
+                    RegisterX86::RSP => value + 8,
+                    _ => value,
+                };
+                assert_eq!(
+                    emu.read_reg(register).unwrap(),
+                    expected,
+                    "unexpected {register:?} change"
+                );
+            }
+            assert_eq!(emu.read_mem(selector, bytes.len()).unwrap(), bytes);
+            assert_eq!(emu.read_mem(rsp, 8).unwrap(), return_frame_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn find_window_a_rejects_zero_or_ambiguous_selectors_before_access() {
+        for (class_name, window_name) in [(0, 0), (0x0000_0001_dead_1000, 0x0000_0002_dead_2000)] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let invalid_rsp = 0x0000_0003_dead_3000;
+            seed_sleep_machine_state(&mut emu, class_name, invalid_rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, window_name).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "FindWindowA").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "FindWindowA".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+        }
+    }
+
+    #[test]
+    fn find_window_a_fails_closed_on_invalid_selector_text_or_memory() {
+        for bytes in [
+            vec![0],
+            vec![b'A', 0x1f, 0],
+            vec![b'A'; WINDOW_CLASS_NAME_BYTE_CAP],
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let invalid_rsp = 0x0000_0003_dead_3000;
+            emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, &bytes).unwrap();
+            seed_sleep_machine_state(
+                &mut emu,
+                WINDOW_CLASS_NAME_ADDRESS,
+                invalid_rsp,
+                0x1111_2222_3333_4444,
+            );
+            emu.write_reg(RegisterX86::RDX, 0).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+            let environment_before = sleep_environment_state(&env);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "FindWindowA").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "FindWindowA".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+            assert_eq!(sleep_environment_state(&env), environment_before);
+            assert_eq!(
+                emu.read_mem(WINDOW_CLASS_NAME_ADDRESS, bytes.len())
+                    .unwrap(),
+                bytes
+            );
+        }
+
+        let mut unmapped_emu = Emu::new().unwrap();
+        let mut unmapped_env = Win64Env::new(IMAGE_BASE);
+        let unmapped = 0x0000_0001_dead_1000;
+        seed_sleep_machine_state(
+            &mut unmapped_emu,
+            0,
+            0x0000_0003_dead_3000,
+            0x1111_2222_3333_4444,
+        );
+        unmapped_emu.write_reg(RegisterX86::RDX, unmapped).unwrap();
+        let machine_before = sleep_machine_state(&unmapped_emu);
+        let environment_before = sleep_environment_state(&unmapped_env);
+        let error = dispatch(&mut unmapped_env, &mut unmapped_emu, "FindWindowA").unwrap_err();
+        assert!(
+            matches!(error, EmuError::ReadMem { addr, size: 1, .. } if addr == unmapped),
+            "unexpected selector error: {error:?}"
+        );
+        assert_eq!(sleep_machine_state(&unmapped_emu), machine_before);
+        assert_eq!(sleep_environment_state(&unmapped_env), environment_before);
+    }
+
+    #[test]
+    fn find_window_a_invalid_return_frame_is_failure_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let invalid_rsp = 0x0000_0003_dead_3000;
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"GeneralClass\0")
+            .unwrap();
+        seed_sleep_machine_state(
+            &mut emu,
+            WINDOW_CLASS_NAME_ADDRESS,
+            invalid_rsp,
+            0x1111_2222_3333_4444,
+        );
+        emu.write_reg(RegisterX86::RDX, 0).unwrap();
+        let machine_before = sleep_machine_state(&emu);
+        let environment_before = sleep_environment_state(&env);
+
+        let error = dispatch(&mut env, &mut emu, "FindWindowA").unwrap_err();
+
+        assert!(
+            matches!(error, EmuError::ReadMem { addr, size: 8, .. } if addr == invalid_rsp),
+            "unexpected return error: {error:?}"
+        );
+        assert_eq!(sleep_machine_state(&emu), machine_before);
+        assert_eq!(sleep_environment_state(&env), environment_before);
+        assert_eq!(
+            emu.read_mem(WINDOW_CLASS_NAME_ADDRESS, b"GeneralClass\0".len())
+                .unwrap(),
+            b"GeneralClass\0"
+        );
     }
 
     #[test]
@@ -5825,6 +9745,372 @@ mod tests {
     }
 
     #[test]
+    fn cooperative_child_changed_exception_continuation_propagates_before_cpu_discard() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        const HANDLER: u64 = IMAGE_BASE + IMAGE_SIZE as u64 + 0x1000;
+        const TARGET: u64 = IMAGE_BASE + IMAGE_SIZE as u64 + 0x3000;
+        const MAIN_CONTINUATION: u64 = IMAGE_BASE + CODE_RVA as u64;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+        let raise_stub = env.export_stub_by_base(kernel32, "RaiseException").unwrap();
+
+        let mut child_code = vec![0x48, 0x83, 0xec, 0x28]; // shadow + alignment
+        child_code.extend_from_slice(&[0x48, 0xb9]); // mov rcx, code
+        child_code.extend_from_slice(&0xc000_008e_u64.to_le_bytes());
+        child_code.extend_from_slice(&[0x31, 0xd2]); // xor edx,edx
+        child_code.extend_from_slice(&[0x45, 0x31, 0xc0]); // xor r8d,r8d
+        child_code.extend_from_slice(&[0x45, 0x31, 0xc9]); // xor r9d,r9d
+        child_code.extend_from_slice(&[0x48, 0xb8]); // mov rax, RaiseException
+        child_code.extend_from_slice(&raise_stub.to_le_bytes());
+        child_code.extend_from_slice(&[0xff, 0xd0]); // call rax
+        child_code.extend_from_slice(&[0x0f, 0x0b]); // must remain unexecuted
+        emu.map_code(CHILD_START, &child_code).unwrap();
+
+        let mut handler_code = vec![0x48, 0x8b, 0x41, 0x08]; // mov rax,[rcx+8]
+        handler_code.extend_from_slice(&[0x48, 0xba]); // mov rdx,TARGET
+        handler_code.extend_from_slice(&TARGET.to_le_bytes());
+        handler_code.extend_from_slice(&[0x48, 0x89, 0x90, 0xf8, 0, 0, 0]); // [rax+f8]=rdx
+        handler_code.extend_from_slice(&[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3]);
+        emu.map_code(HANDLER, &handler_code).unwrap();
+        emu.map_code(TARGET, &[0xeb, 0xfe]).unwrap();
+        emu.map_code(MAIN_CONTINUATION, &[0xc3]).unwrap();
+        assert_ne!(env.add_vectored_exception_handler(1, HANDLER), 0);
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+
+        let main_rsp = STACK_BASE + 0x20_000;
+        emu.write_mem(main_rsp, &MAIN_CONTINUATION.to_le_bytes())
+            .unwrap();
+        emu.write_mem(main_rsp + 8, &0u64.to_le_bytes()).unwrap();
+        seed_sleep_machine_state(&mut emu, 1, main_rsp, sleep_stub);
+        let main_before = sleep_machine_state(&emu);
+
+        let result =
+            run_with_cooperative_scheduler(&mut env, &mut emu, &image, sleep_stub, 1_000, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["Sleep".to_owned()]);
+        assert_eq!(result.stop, TrapStop::ExceptionContinuationObserved);
+        assert_eq!(result.main_instructions_after_first_yield, 0);
+        let [yielded] = result.cooperative_yields.as_slice() else {
+            panic!("expected one cooperative yield");
+        };
+        assert_eq!(yielded.thread_id, 2);
+        assert_eq!(
+            yielded.stop,
+            CooperativeThreadStop::Trap(TrapStop::ExceptionContinuationObserved)
+        );
+        let observation = env.changed_exception_continuation().unwrap();
+        assert_eq!(observation.thread_id, 2);
+        assert_eq!(observation.continuing_handler, HANDLER);
+        assert_eq!(observation.continuation_rip, TARGET);
+        assert_eq!(&observation.target_bytes[..2], &[0xeb, 0xfe]);
+        assert!(!env.pending_vectored_exceptions.contains_key(&2));
+        assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+        for (register, initial) in main_before {
+            let expected = match register {
+                RegisterX86::RIP => MAIN_CONTINUATION,
+                RegisterX86::RSP => initial + 8,
+                _ => initial,
+            };
+            assert_eq!(emu.read_reg(register).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn observing_scheduler_rearms_refuted_main_transfer_and_reaches_natural_terminal() {
+        const SOURCE: u64 = IMAGE_BASE + CODE_RVA as u64;
+        const TARGET: u64 = IMAGE_BASE + DATA_RVA as u64;
+        const MAIN_R15: u64 = 0x5152_5354_5556_5758;
+
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+
+        let mut source_code = vec![0x49, 0xbf]; // mov r15, MAIN_R15
+        source_code.extend_from_slice(&MAIN_R15.to_le_bytes());
+        source_code.extend_from_slice(&[0x48, 0xb8]); // mov rax, TARGET
+        source_code.extend_from_slice(&TARGET.to_le_bytes());
+        source_code.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        emu.map_code(SOURCE, &source_code).unwrap();
+        emu.map_code(TARGET, &[0xc3]).unwrap(); // ret through the zero sentinel
+        emu.configure_indirect_transfer_watch(
+            &[(SOURCE, SOURCE + u64::from(PAGE_SIZE))],
+            &[(TARGET, TARGET + u64::from(PAGE_SIZE))],
+            false,
+        )
+        .unwrap();
+
+        let rsp = STACK_BASE + 0x20_000;
+        emu.write_mem(rsp, &0u64.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        let mut callbacks = Vec::new();
+        let result = run_with_cooperative_scheduler_observing(
+            &mut env,
+            &mut emu,
+            &image,
+            SOURCE,
+            1_000,
+            8,
+            |context, observation| {
+                assert_eq!(context, IndirectTransferExecutionContext::Main);
+                assert_eq!(observation.source_rip, SOURCE + 20);
+                assert_eq!(observation.target_rip, TARGET);
+                assert_eq!(observation.source_bytes, vec![0xff, 0xe0]);
+                assert_eq!(observation.target_bytes.first(), Some(&0xc3));
+                assert_eq!(observed_register(observation, RegisterX86::RIP), TARGET);
+                assert_eq!(observed_register(observation, RegisterX86::RAX), TARGET);
+                assert_eq!(observed_register(observation, RegisterX86::R15), MAIN_R15);
+                assert_eq!(observed_register(observation, RegisterX86::RSP), rsp);
+                callbacks.push((context, observation.clone()));
+                IndirectTransferDisposition::ResumeAdjudicatedRefutation
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
+        assert!(result.handled.is_empty());
+        assert!(result.cooperative_yields.is_empty());
+        assert_eq!(result.main_instructions_after_first_yield, 0);
+        let [(context, observation)] = callbacks.as_slice() else {
+            panic!("expected exactly one main-thread transfer callback");
+        };
+        assert_eq!(*context, IndirectTransferExecutionContext::Main);
+        assert_eq!(observation.target_rip, TARGET);
+        assert!(emu.indirect_transfer_observation().is_none());
+        assert!(emu.indirect_transfer_capture_failure().is_none());
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        assert_eq!(emu.read_reg(RegisterX86::R15).unwrap(), MAIN_R15);
+        assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+    }
+
+    #[test]
+    fn observing_scheduler_rearms_refuted_child_before_restoring_main_context() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        const CHILD_TARGET: u64 = IMAGE_BASE + IMAGE_SIZE as u64 + 0x1000;
+        const CHILD_R15: u64 = 0x6162_6364_6566_6768;
+        const MAIN_R15: u64 = 0x7172_7374_7576_7778;
+        const MAIN_FS: u64 = 0x0000_0000_1234_5000;
+
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+
+        let mut child_code = vec![0x49, 0xbf]; // mov r15, CHILD_R15
+        child_code.extend_from_slice(&CHILD_R15.to_le_bytes());
+        child_code.extend_from_slice(&[0x48, 0xb8]); // mov rax, CHILD_TARGET
+        child_code.extend_from_slice(&CHILD_TARGET.to_le_bytes());
+        child_code.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        emu.map_code(CHILD_START, &child_code).unwrap();
+        emu.map_code(CHILD_TARGET, &[0xc3]).unwrap(); // ret to the child return guard
+        emu.map_code(image.entry_point_va(), &[0xc3]).unwrap(); // main ret to zero
+        emu.configure_indirect_transfer_watch(
+            &[(CHILD_START, CHILD_START + u64::from(PAGE_SIZE))],
+            &[(CHILD_TARGET, CHILD_TARGET + u64::from(PAGE_SIZE))],
+            false,
+        )
+        .unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+
+        let main_rsp = STACK_BASE + 0x20_000;
+        let main_stack_before = vec![0x5a; 0x40];
+        emu.write_mem(main_rsp, &main_stack_before).unwrap();
+        emu.write_mem(main_rsp, &image.entry_point_va().to_le_bytes())
+            .unwrap();
+        emu.write_mem(main_rsp + 8, &0u64.to_le_bytes()).unwrap();
+        let main_stack_expected = emu.read_mem(main_rsp, main_stack_before.len()).unwrap();
+        seed_sleep_machine_state(&mut emu, 1, main_rsp, sleep_stub);
+        emu.write_reg(RegisterX86::R15, MAIN_R15).unwrap();
+        emu.write_reg(RegisterX86::FS_BASE, MAIN_FS).unwrap();
+        emu.write_reg(RegisterX86::GS_BASE, crate::emu::TEB_BASE)
+            .unwrap();
+        let main_before = sleep_machine_state(&emu);
+
+        let mut callbacks = Vec::new();
+        let result = run_with_cooperative_scheduler_observing(
+            &mut env,
+            &mut emu,
+            &image,
+            sleep_stub,
+            1_000,
+            8,
+            |context, observation| {
+                assert_eq!(
+                    context,
+                    IndirectTransferExecutionContext::Child { thread_id: 2 }
+                );
+                assert_eq!(observation.source_rip, CHILD_START + 20);
+                assert_eq!(observation.target_rip, CHILD_TARGET);
+                assert_eq!(
+                    observed_register(observation, RegisterX86::RIP),
+                    CHILD_TARGET
+                );
+                assert_eq!(
+                    observed_register(observation, RegisterX86::RAX),
+                    CHILD_TARGET
+                );
+                assert_eq!(observed_register(observation, RegisterX86::R15), CHILD_R15);
+                assert_eq!(observation.source_bytes, vec![0xff, 0xe0]);
+                assert_eq!(observation.target_bytes.first(), Some(&0xc3));
+                callbacks.push((context, observation.clone()));
+                IndirectTransferDisposition::ResumeAdjudicatedRefutation
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.handled, vec!["Sleep".to_owned()]);
+        assert_eq!(result.stop, TrapStop::NullControlTransfer);
+        assert!(result.main_instructions_after_first_yield > 0);
+        let [yielded] = result.cooperative_yields.as_slice() else {
+            panic!("expected exactly one cooperative child turn");
+        };
+        assert_eq!(yielded.thread_id, 2);
+        assert_eq!(yielded.stop, CooperativeThreadStop::ReachedReturnGuard);
+        assert!(yielded.handled.is_empty());
+        assert!(yielded.instructions_executed > 0);
+
+        let [(context, observation)] = callbacks.as_slice() else {
+            panic!("expected exactly one child transfer callback");
+        };
+        assert_eq!(
+            *context,
+            IndirectTransferExecutionContext::Child { thread_id: 2 }
+        );
+        assert_eq!(
+            observed_register(observation, RegisterX86::RSP),
+            yielded.entry_rsp
+        );
+        assert!(emu.indirect_transfer_observation().is_none());
+        assert!(emu.indirect_transfer_capture_failure().is_none());
+
+        for (register, initial) in main_before {
+            let expected = match register {
+                RegisterX86::RIP => 0,
+                RegisterX86::RSP => initial + 16,
+                _ => initial,
+            };
+            assert_eq!(
+                emu.read_reg(register).unwrap(),
+                expected,
+                "child state leaked into restored main {register:?}"
+            );
+        }
+        assert_eq!(emu.read_reg(RegisterX86::FS_BASE).unwrap(), MAIN_FS);
+        assert_eq!(
+            emu.read_reg(RegisterX86::GS_BASE).unwrap(),
+            crate::emu::TEB_BASE
+        );
+        assert_eq!(
+            emu.read_mem(main_rsp, main_stack_expected.len()).unwrap(),
+            main_stack_expected
+        );
+        assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+        assert!(env.scheduled_thread_ids.contains(&2));
+        assert!(env.runnable_unscheduled_threads().next().is_none());
+    }
+
+    #[test]
+    fn observing_scheduler_stop_preserves_child_boundary_and_labels_context() {
+        const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
+        const CHILD_TARGET: u64 = IMAGE_BASE + IMAGE_SIZE as u64 + 0x1000;
+        const MAIN_CONTINUATION: u64 = IMAGE_BASE + CODE_RVA as u64;
+        const MAIN_R15: u64 = 0x8182_8384_8586_8788;
+
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let kernel32 = env.ensure_kernel32(&mut emu).unwrap();
+        let sleep_stub = env.export_stub_by_base(kernel32, "Sleep").unwrap();
+
+        let mut child_code = vec![0x48, 0xb8]; // mov rax, CHILD_TARGET
+        child_code.extend_from_slice(&CHILD_TARGET.to_le_bytes());
+        child_code.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        emu.map_code(CHILD_START, &child_code).unwrap();
+        emu.map_code(CHILD_TARGET, &[0x90, 0x0f, 0x0b]).unwrap();
+        emu.map_code(MAIN_CONTINUATION, &[0xc3]).unwrap();
+        emu.configure_indirect_transfer_watch(
+            &[(CHILD_START, CHILD_START + u64::from(PAGE_SIZE))],
+            &[(CHILD_TARGET, CHILD_TARGET + u64::from(PAGE_SIZE))],
+            false,
+        )
+        .unwrap();
+        env.create_thread(&mut emu, 0, 0, CHILD_START, 0, 0, 0)
+            .unwrap();
+
+        let main_rsp = STACK_BASE + 0x20_000;
+        emu.write_mem(main_rsp, &MAIN_CONTINUATION.to_le_bytes())
+            .unwrap();
+        emu.write_mem(main_rsp + 8, &0u64.to_le_bytes()).unwrap();
+        seed_sleep_machine_state(&mut emu, 1, main_rsp, sleep_stub);
+        emu.write_reg(RegisterX86::R15, MAIN_R15).unwrap();
+        let main_before = sleep_machine_state(&emu);
+
+        let mut callbacks = Vec::new();
+        let result = run_with_cooperative_scheduler_observing(
+            &mut env,
+            &mut emu,
+            &image,
+            sleep_stub,
+            1_000,
+            8,
+            |context, observation| {
+                callbacks.push((context, observation.clone()));
+                IndirectTransferDisposition::Stop
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.handled, vec!["Sleep".to_owned()]);
+        assert_eq!(result.stop, TrapStop::IndirectTransferObserved);
+        assert_eq!(result.main_instructions_after_first_yield, 0);
+        let [yielded] = result.cooperative_yields.as_slice() else {
+            panic!("expected one stopped cooperative child turn");
+        };
+        assert_eq!(yielded.thread_id, 2);
+        assert_eq!(
+            yielded.stop,
+            CooperativeThreadStop::Trap(TrapStop::IndirectTransferObserved)
+        );
+
+        let [(context, callback_observation)] = callbacks.as_slice() else {
+            panic!("expected exactly one stopped child callback");
+        };
+        assert_eq!(
+            *context,
+            IndirectTransferExecutionContext::Child { thread_id: 2 }
+        );
+        assert_eq!(callback_observation.source_rip, CHILD_START + 10);
+        assert_eq!(callback_observation.target_rip, CHILD_TARGET);
+        assert_eq!(
+            emu.indirect_transfer_observation().as_ref(),
+            Some(callback_observation)
+        );
+        assert!(emu.indirect_transfer_capture_failure().is_none());
+
+        for (register, initial) in main_before {
+            let expected = match register {
+                RegisterX86::RIP => MAIN_CONTINUATION,
+                RegisterX86::RSP => initial + 8,
+                _ => initial,
+            };
+            assert_eq!(
+                emu.read_reg(register).unwrap(),
+                expected,
+                "stopped child state leaked into main {register:?}"
+            );
+        }
+        assert_eq!(env.current_thread_id, EMULATED_CURRENT_THREAD_ID);
+    }
+
+    #[test]
     fn cooperative_return_guard_requires_consumed_entry_cell() {
         const CHILD_START: u64 = IMAGE_BASE + DATA_RVA as u64;
 
@@ -5839,14 +10125,19 @@ mod tests {
             .unwrap();
         let thread = *env.created_threads.get(&2).unwrap();
         let runtime = configure_cooperative_runtime(&mut env, &mut emu, 2, thread).unwrap();
+        let mut stop_at_transfer =
+            |_: IndirectTransferExecutionContext, _: &IndirectTransferObservation| {
+                IndirectTransferDisposition::Stop
+            };
 
         let (handled, stop, instructions_executed) = run_cooperative_child(
             &mut env,
             &mut emu,
             &image,
+            2,
             CHILD_START,
-            runtime.return_guard,
-            runtime.entry_rsp,
+            runtime,
+            &mut stop_at_transfer,
         )
         .unwrap();
 
@@ -6827,6 +11118,7 @@ mod tests {
             env.vectored_exception_handlers,
             vec![VectoredExceptionHandlerRegistration {
                 token,
+                first: 1,
                 handler: observed_handler,
             }]
         );
@@ -6839,6 +11131,29 @@ mod tests {
             emu.read_reg(RegisterX86::RSP).unwrap(),
             crate::emu::STACK_BASE + 0x408
         );
+    }
+
+    #[test]
+    fn rtl_add_vectored_exception_handler_invalid_return_is_failure_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        let initial_rax = 0xaaaa_bbbb_cccc_dddd;
+        let initial_rip = 0x1111_2222_3333_4444;
+        let initial_cursor = env.next_vectored_exception_handler_token;
+        emu.write_reg(RegisterX86::RAX, initial_rax).unwrap();
+        emu.write_reg(RegisterX86::RCX, 1).unwrap();
+        emu.write_reg(RegisterX86::RDX, 0x0000_0001_4006_aa83)
+            .unwrap();
+        emu.write_reg(RegisterX86::RIP, initial_rip).unwrap();
+        emu.write_reg(RegisterX86::RSP, invalid_rsp).unwrap();
+
+        assert!(dispatch(&mut env, &mut emu, "RtlAddVectoredExceptionHandler").is_err());
+        assert!(env.vectored_exception_handlers.is_empty());
+        assert_eq!(env.next_vectored_exception_handler_token, initial_cursor);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), invalid_rsp);
     }
 
     #[test]
@@ -6884,20 +11199,34 @@ mod tests {
             vec![
                 VectoredExceptionHandlerRegistration {
                     token: token_d,
+                    first: 0x8000_0000,
                     handler: handler_d,
                 },
                 VectoredExceptionHandlerRegistration {
                     token: token_c,
+                    first: 1,
                     handler: handler_c,
                 },
                 VectoredExceptionHandlerRegistration {
                     token: token_a,
+                    first: 0,
                     handler: handler_a,
                 },
                 VectoredExceptionHandlerRegistration {
                     token: token_b,
+                    first: 0,
                     handler: handler_b,
                 },
+            ]
+        );
+        assert_eq!(
+            env.vectored_exception_handler_registrations()
+                .collect::<Vec<_>>(),
+            vec![
+                (0, token_d, 0x8000_0000, handler_d),
+                (1, token_c, 1, handler_c),
+                (2, token_a, 0, handler_a),
+                (3, token_b, 0, handler_b),
             ]
         );
         assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), handler_d);
@@ -6925,14 +11254,17 @@ mod tests {
             vec![
                 VectoredExceptionHandlerRegistration {
                     token: first,
+                    first: 0,
                     handler: duplicate_handler,
                 },
                 VectoredExceptionHandlerRegistration {
                     token: zero,
+                    first: 0,
                     handler: 0,
                 },
                 VectoredExceptionHandlerRegistration {
                     token: duplicate,
+                    first: 0,
                     handler: duplicate_handler,
                 },
             ]
@@ -7045,6 +11377,522 @@ mod tests {
             second_env.next_vectored_exception_handler_token,
             VECTORED_EXCEPTION_HANDLER_TOKEN_BASE + VECTORED_EXCEPTION_HANDLER_TOKEN_STRIDE
         );
+    }
+
+    #[test]
+    fn rtl_remove_vectored_exception_handler_removes_exact_token_and_is_failure_atomic() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let first =
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, 0x1111_2222_3333_4444);
+        let second =
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, 0x5555_6666_7777_8888);
+        let rsp = STACK_BASE + 0x608;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, first).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "RtlRemoveVectoredExceptionHandler").unwrap(),
+            ApiOutcome::Handled {
+                name: "RtlRemoveVectoredExceptionHandler".to_owned(),
+                ret: 1,
+            }
+        );
+        assert_eq!(
+            env.vectored_exception_handlers
+                .iter()
+                .map(|registration| registration.token)
+                .collect::<Vec<_>>(),
+            vec![second]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_reg(RegisterX86::RCX, first).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "RtlRemoveVectoredExceptionHandler").unwrap(),
+            ApiOutcome::Handled {
+                name: "RtlRemoveVectoredExceptionHandler".to_owned(),
+                ret: 0,
+            }
+        );
+        assert_eq!(env.vectored_exception_handlers.len(), 1);
+
+        let registrations_before = env.vectored_exception_handlers.clone();
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        emu.write_reg(RegisterX86::RCX, second).unwrap();
+        emu.write_reg(RegisterX86::RSP, invalid_rsp).unwrap();
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "RtlRemoveVectoredExceptionHandler"),
+            Err(EmuError::ReadMem { addr, size: 8, .. }) if addr == invalid_rsp
+        ));
+        assert_eq!(env.vectored_exception_handlers, registrations_before);
+    }
+
+    #[test]
+    fn raise_exception_builds_bounded_zero_argument_frame_and_continues_via_first_handler() {
+        const HANDLER: u64 = IMAGE_BASE + 0x10_000;
+        const CONTINUATION: u64 = IMAGE_BASE + 0x12_000;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.map_code(HANDLER, &[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3])
+            .unwrap();
+        emu.map_code(CONTINUATION, &[0xeb, 0xfe]).unwrap();
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, HANDLER);
+        let rsp = STACK_BASE + 0x808;
+
+        assert_eq!(
+            begin_test_raise_exception(
+                &mut env,
+                &mut emu,
+                TestRaiseExceptionArgs {
+                    code: 0xaaaa_bbbb_c000_008e,
+                    flags: 0xcccc_dddd_0000_0000,
+                    argument_count: 0xeeee_ffff_0000_0000,
+                    arguments: 0,
+                    rsp,
+                    return_address: CONTINUATION,
+                },
+            ),
+            ApiOutcome::HandledVoid {
+                name: "RaiseException".to_owned()
+            }
+        );
+        let pending = env
+            .pending_vectored_exceptions
+            .get(&EMULATED_CURRENT_THREAD_ID)
+            .unwrap()
+            .clone();
+        assert_eq!(pending.return_guard, EXCEPTION_DISPATCH_ARENA_BASE);
+        assert_eq!(pending.exception_pointers & 0xf, 0);
+        assert_eq!(pending.context_record & 0xf, 0);
+        assert_eq!(pending.callback_rsp & 0xf, 8);
+        assert_eq!(
+            read_u64_at(&emu, pending.exception_pointers).unwrap(),
+            pending.exception_record
+        );
+        assert_eq!(
+            read_u64_at(&emu, pending.exception_pointers + 8).unwrap(),
+            pending.context_record
+        );
+        assert_eq!(
+            read_u32_at(&emu, pending.exception_record).unwrap(),
+            0xc000_008e
+        );
+        assert_eq!(read_u32_at(&emu, pending.exception_record + 4).unwrap(), 0);
+        assert_eq!(read_u64_at(&emu, pending.exception_record + 8).unwrap(), 0);
+        assert_eq!(
+            read_u64_at(&emu, pending.exception_record + 0x10).unwrap(),
+            CONTINUATION
+        );
+        assert_eq!(
+            read_u32_at(&emu, pending.exception_record + 0x18).unwrap(),
+            0
+        );
+        assert_eq!(
+            read_u32_at(
+                &emu,
+                pending.context_record + AMD64_CONTEXT_FLAGS_OFFSET as u64
+            )
+            .unwrap(),
+            CONTEXT_AMD64_CONTROL_INTEGER
+        );
+        assert_eq!(
+            read_u64_at(
+                &emu,
+                pending.context_record + AMD64_CONTEXT_RSP_OFFSET as u64
+            )
+            .unwrap(),
+            rsp + 8
+        );
+        assert_eq!(
+            read_u64_at(
+                &emu,
+                pending.context_record + AMD64_CONTEXT_RIP_OFFSET as u64
+            )
+            .unwrap(),
+            CONTINUATION
+        );
+        assert_eq!(
+            emu.read_reg(RegisterX86::RCX).unwrap(),
+            pending.exception_pointers
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), HANDLER);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RSP).unwrap(),
+            pending.callback_rsp
+        );
+        assert_eq!(
+            read_u64_at(&emu, pending.callback_rsp).unwrap(),
+            pending.return_guard
+        );
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, HANDLER, 32, 8).unwrap();
+        assert_eq!(result.handled, Vec::<String>::new());
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), CONTINUATION);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            0xaaaa_bbbb_cccc_dddd
+        );
+        assert!(!env.has_pending_vectored_exception());
+    }
+
+    #[test]
+    fn raise_exception_search_uses_snapshotted_order_then_continues() {
+        const SEARCH_HANDLER: u64 = IMAGE_BASE + 0x14_000;
+        const CONTINUE_HANDLER: u64 = IMAGE_BASE + 0x16_000;
+        const LATE_FIRST_HANDLER: u64 = IMAGE_BASE + 0x18_000;
+        const CONTINUATION: u64 = IMAGE_BASE + 0x1a_000;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.map_code(SEARCH_HANDLER, &[0x31, 0xc0, 0xc3]).unwrap();
+        emu.map_code(CONTINUE_HANDLER, &[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3])
+            .unwrap();
+        emu.map_code(CONTINUATION, &[0xeb, 0xfe]).unwrap();
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, SEARCH_HANDLER);
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, CONTINUE_HANDLER);
+        let rsp = STACK_BASE + 0xa08;
+        begin_test_raise_exception(
+            &mut env,
+            &mut emu,
+            TestRaiseExceptionArgs {
+                code: 0xc000_008e,
+                flags: 0,
+                argument_count: 0,
+                arguments: 0,
+                rsp,
+                return_address: CONTINUATION,
+            },
+        );
+
+        // Registrations made after RaiseException begins do not perturb the
+        // snapshot already walking on this thread.
+        assert_ne!(env.add_vectored_exception_handler(1, LATE_FIRST_HANDLER), 0);
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, SEARCH_HANDLER, 64, 8).unwrap();
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), CONTINUATION);
+        assert!(!env.has_pending_vectored_exception());
+    }
+
+    #[test]
+    fn raise_exception_attributes_changed_context_to_handler_returning_continue() {
+        const MUTATING_SEARCH_HANDLER: u64 = IMAGE_BASE + 0x32_000;
+        const CONTINUE_HANDLER: u64 = IMAGE_BASE + 0x34_000;
+        const TARGET: u64 = IMAGE_BASE + 0x36_000;
+        const CONTINUATION: u64 = IMAGE_BASE + 0x38_000;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let mut mutator = vec![0x48, 0x8b, 0x41, 0x08]; // mov rax,[rcx+8]
+        mutator.extend_from_slice(&[0x48, 0xba]); // mov rdx,TARGET
+        mutator.extend_from_slice(&TARGET.to_le_bytes());
+        mutator.extend_from_slice(&[0x48, 0x89, 0x90, 0xf8, 0, 0, 0]); // [rax+f8]=rdx
+        mutator.extend_from_slice(&[0x31, 0xc0, 0xc3]); // CONTINUE_SEARCH
+        emu.map_code(MUTATING_SEARCH_HANDLER, &mutator).unwrap();
+        emu.map_code(CONTINUE_HANDLER, &[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3])
+            .unwrap();
+        emu.map_code(TARGET, &[0xeb, 0xfe]).unwrap();
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, MUTATING_SEARCH_HANDLER);
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 0, CONTINUE_HANDLER);
+        begin_test_raise_exception(
+            &mut env,
+            &mut emu,
+            TestRaiseExceptionArgs {
+                code: 0xc000_008e,
+                flags: 0,
+                argument_count: 0,
+                arguments: 0,
+                rsp: STACK_BASE + 0x1608,
+                return_address: CONTINUATION,
+            },
+        );
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, MUTATING_SEARCH_HANDLER, 64, 8)
+                .unwrap();
+        assert_eq!(result.stop, TrapStop::ExceptionContinuationObserved);
+        let observation = env.changed_exception_continuation().unwrap();
+        assert_eq!(observation.original_rip, CONTINUATION);
+        assert_eq!(observation.continuation_rip, TARGET);
+        assert_eq!(observation.continuing_handler, CONTINUE_HANDLER);
+    }
+
+    #[test]
+    fn raise_exception_fails_closed_on_terminal_handler_dispositions() {
+        const HANDLER: u64 = IMAGE_BASE + 0x1c_000;
+        const CONTINUATION: u64 = IMAGE_BASE + 0x1e_000;
+        let image = test_image();
+        for (handler_bytes, flags, expected) in [
+            (
+                &[0x31, 0xc0, 0xc3][..],
+                0,
+                TrapStop::UnhandledSoftwareException { code: 0xc000_008e },
+            ),
+            (
+                &[0xb8, 1, 0, 0, 0, 0xc3][..],
+                0,
+                TrapStop::InvalidVectoredExceptionDisposition {
+                    code: 0xc000_008e,
+                    disposition: 1,
+                },
+            ),
+            (
+                &[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3][..],
+                1,
+                TrapStop::NoncontinuableContinuationAttempt { code: 0xc000_008e },
+            ),
+        ] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            emu.map_code(HANDLER, handler_bytes).unwrap();
+            call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, HANDLER);
+            begin_test_raise_exception(
+                &mut env,
+                &mut emu,
+                TestRaiseExceptionArgs {
+                    code: 0xc000_008e,
+                    flags,
+                    argument_count: 0,
+                    arguments: 0,
+                    rsp: STACK_BASE + 0xc08,
+                    return_address: CONTINUATION,
+                },
+            );
+            let result = run_with_import_trap(&mut env, &mut emu, &image, HANDLER, 16, 8).unwrap();
+            assert_eq!(result.stop, expected);
+            assert!(env.has_pending_vectored_exception());
+        }
+    }
+
+    #[test]
+    fn raise_exception_copies_bounded_arguments_and_rejects_bad_input_atomically() {
+        const HANDLER: u64 = IMAGE_BASE + 0x20_000;
+        const ARGUMENTS: u64 = 0x0000_000f_6000_0000;
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.map_code(HANDLER, &[0x31, 0xc0, 0xc3]).unwrap();
+        emu.map_zeroed_rw(ARGUMENTS, u64::from(PAGE_SIZE)).unwrap();
+        let values = (0..16u64).map(|value| value + 0x100).collect::<Vec<_>>();
+        for (index, value) in values.iter().enumerate() {
+            emu.write_mem(ARGUMENTS + index as u64 * 8, &value.to_le_bytes())
+                .unwrap();
+        }
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, HANDLER);
+        begin_test_raise_exception(
+            &mut env,
+            &mut emu,
+            TestRaiseExceptionArgs {
+                code: 0xaaaa_bbbb_c000_008e,
+                flags: 0,
+                argument_count: 0xcccc_dddd_0000_0010,
+                arguments: ARGUMENTS,
+                rsp: STACK_BASE + 0xe08,
+                return_address: IMAGE_BASE + 0x22_000,
+            },
+        );
+        let pending = env
+            .pending_vectored_exceptions
+            .get(&EMULATED_CURRENT_THREAD_ID)
+            .unwrap();
+        assert_eq!(
+            read_u32_at(&emu, pending.exception_record + 0x18).unwrap(),
+            EXCEPTION_MAXIMUM_PARAMETERS as u32
+        );
+        for (index, expected) in values[..EXCEPTION_MAXIMUM_PARAMETERS].iter().enumerate() {
+            assert_eq!(
+                read_u64_at(&emu, pending.exception_record + 0x20 + index as u64 * 8).unwrap(),
+                *expected
+            );
+        }
+
+        let mut bad_emu = Emu::new().unwrap();
+        let mut bad_env = Win64Env::new(IMAGE_BASE);
+        bad_emu.map_code(HANDLER, &[0x31, 0xc0, 0xc3]).unwrap();
+        call_rtl_add_vectored_exception_handler(&mut bad_env, &mut bad_emu, 1, HANDLER);
+        let cursor_before = bad_env.next_exception_dispatch_base;
+        let rsp = STACK_BASE + 0xe08;
+        bad_emu
+            .write_mem(rsp, &(IMAGE_BASE + 0x22_000).to_le_bytes())
+            .unwrap();
+        bad_emu.write_reg(RegisterX86::RCX, 0xc000_008e).unwrap();
+        bad_emu.write_reg(RegisterX86::RDX, 0).unwrap();
+        bad_emu.write_reg(RegisterX86::R8, 1).unwrap();
+        bad_emu.write_reg(RegisterX86::R9, 0xdead_0000).unwrap();
+        bad_emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        assert!(matches!(
+            dispatch(&mut bad_env, &mut bad_emu, "RaiseException"),
+            Err(EmuError::ReadMem { .. })
+        ));
+        assert_eq!(bad_env.next_exception_dispatch_base, cursor_before);
+        assert!(!bad_env.has_pending_vectored_exception());
+        assert!(bad_emu.read_mem(EXCEPTION_DISPATCH_ARENA_BASE, 1).is_err());
+    }
+
+    #[test]
+    fn raise_exception_rejects_undeclared_context_mutation() {
+        const HANDLER: u64 = IMAGE_BASE + 0x24_000;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.map_code(HANDLER, &[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3])
+            .unwrap();
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, HANDLER);
+        begin_test_raise_exception(
+            &mut env,
+            &mut emu,
+            TestRaiseExceptionArgs {
+                code: 0xc000_008e,
+                flags: 0,
+                argument_count: 0,
+                arguments: 0,
+                rsp: STACK_BASE + 0x1008,
+                return_address: IMAGE_BASE + 0x26_000,
+            },
+        );
+        let context = env
+            .pending_vectored_exceptions
+            .get(&EMULATED_CURRENT_THREAD_ID)
+            .unwrap()
+            .context_record;
+        emu.write_mem(context + 0x100, &[1]).unwrap();
+        let result = run_with_import_trap(&mut env, &mut emu, &image, HANDLER, 16, 8).unwrap();
+        assert_eq!(
+            result.stop,
+            TrapStop::InvalidVectoredExceptionContext { code: 0xc000_008e }
+        );
+        assert!(env.has_pending_vectored_exception());
+    }
+
+    #[test]
+    fn raise_exception_changed_rip_stops_before_target_without_consuming_oep_coverage() {
+        const HANDLER: u64 = IMAGE_BASE + 0x28_000;
+        const TARGET: u64 = IMAGE_BASE + 0x2a_000;
+        const CONTINUATION: u64 = IMAGE_BASE + 0x2c_000;
+        const RESTORED_RAX: u64 = 0xfeed_face_cafe_beef;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        emu.map_code(HANDLER, &[0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3])
+            .unwrap();
+        emu.map_code(TARGET, &[0xeb, 0xfe]).unwrap();
+        emu.configure_indirect_transfer_watch(
+            &[(HANDLER, HANDLER + 0x100)],
+            &[(TARGET, TARGET + 0x100)],
+            false,
+        )
+        .unwrap();
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, HANDLER);
+        begin_test_raise_exception(
+            &mut env,
+            &mut emu,
+            TestRaiseExceptionArgs {
+                code: 0xc000_008e,
+                flags: 0,
+                argument_count: 0,
+                arguments: 0,
+                rsp: STACK_BASE + 0x1208,
+                return_address: CONTINUATION,
+            },
+        );
+        let context_record = env
+            .pending_vectored_exceptions
+            .get(&EMULATED_CURRENT_THREAD_ID)
+            .unwrap()
+            .context_record;
+        emu.write_mem(
+            context_record + AMD64_CONTEXT_RIP_OFFSET as u64,
+            &TARGET.to_le_bytes(),
+        )
+        .unwrap();
+        emu.write_mem(
+            context_record + AMD64_CONTEXT_RAX_OFFSET as u64,
+            &RESTORED_RAX.to_le_bytes(),
+        )
+        .unwrap();
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, HANDLER, 32, 8).unwrap();
+        assert_eq!(result.stop, TrapStop::ExceptionContinuationObserved);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), TARGET);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), RESTORED_RAX);
+        assert!(emu.indirect_transfer_observation().is_none());
+        assert!(!env.has_pending_vectored_exception());
+        let observation = env.changed_exception_continuation().unwrap();
+        assert_eq!(observation.thread_id, EMULATED_CURRENT_THREAD_ID);
+        assert_eq!(observation.exception_code, 0xc000_008e);
+        assert_eq!(observation.continuing_handler, HANDLER);
+        assert_eq!(observation.original_rip, CONTINUATION);
+        assert_eq!(observation.continuation_rip, TARGET);
+        assert_eq!(observation.context_record, context_record);
+        assert_eq!(&observation.target_bytes[..2], &[0xeb, 0xfe]);
+        assert_eq!(observation.context_bytes.len(), AMD64_CONTEXT_SIZE);
+        assert_eq!(observation.registers.len(), 18);
+        assert_eq!(
+            observation
+                .registers
+                .iter()
+                .find_map(|(register, value)| (*register == RegisterX86::RAX).then_some(*value)),
+            Some(RESTORED_RAX)
+        );
+        let count_before_retry = emu.total_instructions_executed();
+        let retry = run_with_import_trap(&mut env, &mut emu, &image, TARGET, 32, 8).unwrap();
+        assert_eq!(retry.stop, TrapStop::ExceptionContinuationObserved);
+        assert!(retry.handled.is_empty());
+        assert_eq!(emu.total_instructions_executed(), count_before_retry);
+        assert!(emu.indirect_transfer_observation().is_none());
+    }
+
+    #[test]
+    fn raise_exception_preserves_xmm_and_mxcsr_state_across_observed_leaf_handler() {
+        const HANDLER: u64 = IMAGE_BASE + 0x2e_000;
+        const CONTINUATION: u64 = IMAGE_BASE + 0x30_000;
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        // mov dword [rsp+8],0x1f80; ldmxcsr [rsp+8];
+        // pxor xmm0,xmm0; mov eax,-1; ret
+        emu.map_code(
+            HANDLER,
+            &[
+                0xc7, 0x44, 0x24, 0x08, 0x80, 0x1f, 0, 0, 0x0f, 0xae, 0x54, 0x24, 0x08, 0x66, 0x0f,
+                0xef, 0xc0, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xc3,
+            ],
+        )
+        .unwrap();
+        emu.map_code(CONTINUATION, &[0xeb, 0xfe]).unwrap();
+        call_rtl_add_vectored_exception_handler(&mut env, &mut emu, 1, HANDLER);
+        let initial_xmm0 = [
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45,
+            0x23, 0x01,
+        ];
+        emu.write_reg_128(RegisterX86::XMM0, &initial_xmm0).unwrap();
+        let initial_mxcsr = 0x1f40;
+        emu.write_reg(RegisterX86::MXCSR, initial_mxcsr).unwrap();
+        begin_test_raise_exception(
+            &mut env,
+            &mut emu,
+            TestRaiseExceptionArgs {
+                code: 0xc000_008e,
+                flags: 0,
+                argument_count: 0,
+                arguments: 0,
+                rsp: STACK_BASE + 0x1408,
+                return_address: CONTINUATION,
+            },
+        );
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, HANDLER, 32, 8).unwrap();
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg_128(RegisterX86::XMM0).unwrap(), initial_xmm0);
+        assert_eq!(emu.read_reg(RegisterX86::MXCSR).unwrap(), initial_mxcsr);
     }
 
     #[test]
@@ -7754,6 +12602,682 @@ mod tests {
     }
 
     #[test]
+    fn virtual_alloc_handles_observed_commit_as_zeroed_writable_nx_memory() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x400;
+        let return_address = 0x1234_5678_9abc_def0;
+        let allocation = call_virtual_alloc(
+            &mut env,
+            &mut emu,
+            VirtualAllocArgs {
+                allocation_type: 0xaaaa_bbbb_0000_0000 | u64::from(MEM_COMMIT),
+                protection: 0xcccc_dddd_0000_0000 | u64::from(PAGE_READWRITE),
+                ..VirtualAllocArgs::observed(4)
+            },
+            rsp,
+            return_address,
+        );
+
+        assert_eq!(allocation, VIRTUAL_ALLOCATION_ARENA_BASE);
+        assert_ne!(allocation, 0);
+        assert!(allocation.is_multiple_of(VIRTUAL_ALLOCATION_GRANULARITY));
+        assert_eq!(
+            env.virtual_allocations.get(&allocation),
+            Some(&VirtualAllocation {
+                requested_size: 4,
+                mapped_size: u64::from(PAGE_SIZE),
+                allocation_type: MEM_COMMIT,
+                protection: PAGE_READWRITE,
+            })
+        );
+        assert_eq!(
+            env.virtual_allocation_cursor,
+            VIRTUAL_ALLOCATION_ARENA_BASE + VIRTUAL_ALLOCATION_GRANULARITY
+        );
+        assert_eq!(
+            emu.read_mem(allocation, PAGE_SIZE as usize).unwrap(),
+            vec![0; PAGE_SIZE as usize]
+        );
+        emu.write_mem(allocation, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(emu.read_mem(allocation, 4).unwrap(), vec![1, 2, 3, 4]);
+
+        let report = emu.run_observed(allocation, 1).unwrap();
+        assert!(matches!(
+            report.stop_reason,
+            StopReason::MemoryFault(fault)
+                if fault.kind == FaultKind::FetchProt && fault.address == allocation
+        ));
+    }
+
+    #[test]
+    fn virtual_alloc_repeats_without_overlap_and_is_deterministic() {
+        let sizes = [
+            17,
+            u64::from(PAGE_SIZE) + 1,
+            VIRTUAL_ALLOCATION_GRANULARITY + 1,
+        ];
+        let rsp = STACK_BASE + 0x400;
+
+        let mut first_emu = Emu::new().unwrap();
+        let mut first_env = Win64Env::new(IMAGE_BASE);
+        let first_addresses = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(index, size)| {
+                call_virtual_alloc(
+                    &mut first_env,
+                    &mut first_emu,
+                    VirtualAllocArgs::observed(size),
+                    rsp,
+                    0x1000 + index as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_addresses,
+            vec![
+                VIRTUAL_ALLOCATION_ARENA_BASE,
+                VIRTUAL_ALLOCATION_ARENA_BASE + VIRTUAL_ALLOCATION_GRANULARITY,
+                VIRTUAL_ALLOCATION_ARENA_BASE + 2 * VIRTUAL_ALLOCATION_GRANULARITY,
+            ]
+        );
+        for address in &first_addresses {
+            assert!(address.is_multiple_of(VIRTUAL_ALLOCATION_GRANULARITY));
+        }
+        assert_eq!(
+            first_env.virtual_allocations[&first_addresses[0]].mapped_size,
+            u64::from(PAGE_SIZE)
+        );
+        assert_eq!(
+            first_env.virtual_allocations[&first_addresses[1]].mapped_size,
+            2 * u64::from(PAGE_SIZE)
+        );
+        assert_eq!(
+            first_env.virtual_allocations[&first_addresses[2]].mapped_size,
+            VIRTUAL_ALLOCATION_GRANULARITY + u64::from(PAGE_SIZE)
+        );
+        first_emu
+            .write_mem(first_addresses[0], &[0xa5; 17])
+            .unwrap();
+        assert_eq!(
+            first_emu.read_mem(first_addresses[0], 17).unwrap(),
+            vec![0xa5; 17]
+        );
+        assert_eq!(
+            first_emu.read_mem(first_addresses[1], 17).unwrap(),
+            vec![0; 17]
+        );
+        assert!(first_emu
+            .read_mem(first_addresses[0] + u64::from(PAGE_SIZE), 1)
+            .is_err());
+
+        let mut second_emu = Emu::new().unwrap();
+        let mut second_env = Win64Env::new(IMAGE_BASE);
+        let second_addresses = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(index, size)| {
+                call_virtual_alloc(
+                    &mut second_env,
+                    &mut second_emu,
+                    VirtualAllocArgs::observed(size),
+                    rsp,
+                    0x2000 + index as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(second_addresses, first_addresses);
+        assert_eq!(
+            second_env.virtual_allocations,
+            first_env.virtual_allocations
+        );
+        assert_eq!(
+            second_env.virtual_allocation_cursor,
+            first_env.virtual_allocation_cursor
+        );
+    }
+
+    #[test]
+    fn virtual_alloc_rejects_unmodeled_shapes_before_return_stack_access() {
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        let cases = [
+            VirtualAllocArgs {
+                requested_address: u64::from(u32::MAX) + 1,
+                ..VirtualAllocArgs::observed(4)
+            },
+            VirtualAllocArgs {
+                allocation_type: 0xaaaa_bbbb_0000_2000,
+                ..VirtualAllocArgs::observed(4)
+            },
+            VirtualAllocArgs {
+                allocation_type: u64::from(MEM_COMMIT | 0x2000),
+                ..VirtualAllocArgs::observed(4)
+            },
+            VirtualAllocArgs {
+                protection: 0xcccc_dddd_0000_0002,
+                ..VirtualAllocArgs::observed(4)
+            },
+        ];
+
+        for args in cases {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            prepare_virtual_alloc_call(&mut emu, args, invalid_rsp, None);
+            let initial_cpu = sleep_machine_state(&emu);
+            let initial_cursor = env.virtual_allocation_cursor;
+            let initial_allocations = env.virtual_allocations.clone();
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "VirtualAlloc").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "VirtualAlloc".to_owned()
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), initial_cpu);
+            assert_eq!(env.virtual_allocation_cursor, initial_cursor);
+            assert_eq!(env.virtual_allocations, initial_allocations);
+            assert!(emu.read_mem(VIRTUAL_ALLOCATION_ARENA_BASE, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn virtual_alloc_handles_size_and_arena_bounds_without_partial_state() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x400;
+        let initial_cursor = env.virtual_allocation_cursor;
+
+        for (index, size) in [0, u64::MAX, VIRTUAL_ALLOCATION_ARENA_SIZE + 1]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                call_virtual_alloc(
+                    &mut env,
+                    &mut emu,
+                    VirtualAllocArgs::observed(size),
+                    rsp,
+                    0x3000 + index as u64,
+                ),
+                0
+            );
+            assert_eq!(env.virtual_allocation_cursor, initial_cursor);
+            assert!(env.virtual_allocations.is_empty());
+            assert!(emu.read_mem(VIRTUAL_ALLOCATION_ARENA_BASE, 1).is_err());
+        }
+
+        env.virtual_allocation_cursor =
+            VIRTUAL_ALLOCATION_ARENA_END - VIRTUAL_ALLOCATION_GRANULARITY;
+        let last = call_virtual_alloc(
+            &mut env,
+            &mut emu,
+            VirtualAllocArgs::observed(VIRTUAL_ALLOCATION_GRANULARITY),
+            rsp,
+            0x4000,
+        );
+        assert_eq!(
+            last,
+            VIRTUAL_ALLOCATION_ARENA_END - VIRTUAL_ALLOCATION_GRANULARITY
+        );
+        assert_eq!(env.virtual_allocation_cursor, VIRTUAL_ALLOCATION_ARENA_END);
+        let allocations_at_exhaustion = env.virtual_allocations.clone();
+        assert_eq!(
+            call_virtual_alloc(
+                &mut env,
+                &mut emu,
+                VirtualAllocArgs::observed(1),
+                rsp,
+                0x5000,
+            ),
+            0
+        );
+        assert_eq!(env.virtual_allocation_cursor, VIRTUAL_ALLOCATION_ARENA_END);
+        assert_eq!(env.virtual_allocations, allocations_at_exhaustion);
+    }
+
+    #[test]
+    fn virtual_alloc_preflights_return_and_preserves_state_on_mapping_failure() {
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        let mut invalid_emu = Emu::new().unwrap();
+        let mut invalid_env = Win64Env::new(IMAGE_BASE);
+        prepare_virtual_alloc_call(
+            &mut invalid_emu,
+            VirtualAllocArgs::observed(4),
+            invalid_rsp,
+            None,
+        );
+        let invalid_cpu = sleep_machine_state(&invalid_emu);
+        let error = dispatch(&mut invalid_env, &mut invalid_emu, "VirtualAlloc").unwrap_err();
+        assert!(matches!(
+            error,
+            EmuError::ReadMem { addr, size: 8, .. } if addr == invalid_rsp
+        ));
+        assert_eq!(sleep_machine_state(&invalid_emu), invalid_cpu);
+        assert_eq!(
+            invalid_env.virtual_allocation_cursor,
+            VIRTUAL_ALLOCATION_ARENA_BASE
+        );
+        assert!(invalid_env.virtual_allocations.is_empty());
+        assert!(invalid_emu
+            .read_mem(VIRTUAL_ALLOCATION_ARENA_BASE, 1)
+            .is_err());
+
+        let mut collision_emu = Emu::new().unwrap();
+        let mut collision_env = Win64Env::new(IMAGE_BASE);
+        collision_emu
+            .map_zeroed_rw(VIRTUAL_ALLOCATION_ARENA_BASE, u64::from(PAGE_SIZE))
+            .unwrap();
+        collision_emu
+            .write_mem(VIRTUAL_ALLOCATION_ARENA_BASE, &[0x5a; 16])
+            .unwrap();
+        let rsp = STACK_BASE + 0x400;
+        prepare_virtual_alloc_call(
+            &mut collision_emu,
+            VirtualAllocArgs::observed(4),
+            rsp,
+            Some(0x1234_5678_9abc_def0),
+        );
+        let collision_cpu = sleep_machine_state(&collision_emu);
+        let error = dispatch(&mut collision_env, &mut collision_emu, "VirtualAlloc").unwrap_err();
+        assert!(matches!(
+            error,
+            EmuError::Map { addr, size, .. }
+                if addr == VIRTUAL_ALLOCATION_ARENA_BASE
+                    && size == u64::from(PAGE_SIZE)
+        ));
+        assert_eq!(sleep_machine_state(&collision_emu), collision_cpu);
+        assert_eq!(
+            collision_env.virtual_allocation_cursor,
+            VIRTUAL_ALLOCATION_ARENA_BASE
+        );
+        assert!(collision_env.virtual_allocations.is_empty());
+        assert_eq!(
+            collision_emu
+                .read_mem(VIRTUAL_ALLOCATION_ARENA_BASE, 16)
+                .unwrap(),
+            vec![0x5a; 16]
+        );
+    }
+
+    #[test]
+    fn virtual_free_releases_exact_live_allocation_without_cursor_reuse() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x400;
+        let allocation = call_virtual_alloc(
+            &mut env,
+            &mut emu,
+            VirtualAllocArgs::observed(u64::from(PAGE_SIZE) + 1),
+            rsp,
+            0x1000,
+        );
+        let cursor_after_allocation = env.virtual_allocation_cursor;
+        emu.write_mem(allocation, &[0xa5; 16]).unwrap();
+
+        assert_eq!(
+            call_virtual_free(
+                &mut env,
+                &mut emu,
+                allocation + 1,
+                0xaaaa_bbbb_0000_0000 | u64::from(MEM_RELEASE),
+            ),
+            0
+        );
+        assert!(env.virtual_allocations.contains_key(&allocation));
+        assert_eq!(emu.read_mem(allocation, 16).unwrap(), vec![0xa5; 16]);
+
+        assert_eq!(
+            call_virtual_free(
+                &mut env,
+                &mut emu,
+                allocation,
+                0xaaaa_bbbb_0000_0000 | u64::from(MEM_RELEASE),
+            ),
+            1
+        );
+        assert!(!env.virtual_allocations.contains_key(&allocation));
+        assert_eq!(env.virtual_allocation_cursor, cursor_after_allocation);
+        assert!(emu.read_mem(allocation, 1).is_err());
+        assert!(emu.read_mem(allocation + u64::from(PAGE_SIZE), 1).is_err());
+        assert_eq!(
+            call_virtual_free(&mut env, &mut emu, allocation, u64::from(MEM_RELEASE)),
+            0
+        );
+
+        let next = call_virtual_alloc(
+            &mut env,
+            &mut emu,
+            VirtualAllocArgs::observed(4),
+            rsp,
+            0x2000,
+        );
+        assert_eq!(next, cursor_after_allocation);
+        assert_ne!(next, allocation);
+    }
+
+    #[test]
+    fn virtual_free_unmaps_allocation_after_virtual_protect_splits_permissions() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x408;
+        let old_protection = STACK_BASE + 0x900;
+        let allocation = call_virtual_alloc(
+            &mut env,
+            &mut emu,
+            VirtualAllocArgs::observed(u64::from(PAGE_SIZE) * 2),
+            STACK_BASE + 0x400,
+            0x1000,
+        );
+        emu.write_mem(rsp, &0x2222_3333_4444_5555u64.to_le_bytes())
+            .unwrap();
+        emu.write_mem(old_protection, &[0xa5; 8]).unwrap();
+        emu.write_reg(RegisterX86::RCX, allocation).unwrap();
+        emu.write_reg(RegisterX86::RDX, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, u64::from(PAGE_EXECUTE_READ))
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, old_protection).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "VirtualProtect").unwrap(),
+            ApiOutcome::Handled { ret: 1, .. }
+        ));
+
+        assert_eq!(
+            call_virtual_free(&mut env, &mut emu, allocation, u64::from(MEM_RELEASE)),
+            1
+        );
+        assert!(emu.read_mem(allocation, 1).is_err());
+        assert!(emu.read_mem(allocation + u64::from(PAGE_SIZE), 1).is_err());
+        assert!(!env.virtual_allocations.contains_key(&allocation));
+    }
+
+    #[test]
+    fn virtual_free_rejects_unmodeled_shapes_before_return_or_state_access() {
+        for (size, free_type) in [(1, MEM_RELEASE), (0, MEM_COMMIT), (0, MEM_RELEASE | 1)] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            env.virtual_allocations.insert(
+                VIRTUAL_ALLOCATION_ARENA_BASE,
+                VirtualAllocation {
+                    requested_size: 4,
+                    mapped_size: u64::from(PAGE_SIZE),
+                    allocation_type: MEM_COMMIT,
+                    protection: PAGE_READWRITE,
+                },
+            );
+            let invalid_rsp = 0x0000_0000_dead_0000;
+            prepare_virtual_free_call(
+                &mut emu,
+                VIRTUAL_ALLOCATION_ARENA_BASE,
+                size,
+                u64::from(free_type),
+                invalid_rsp,
+                None,
+            );
+            let initial_cpu = sleep_machine_state(&emu);
+            let allocations_before = env.virtual_allocations.clone();
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "VirtualFree").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "VirtualFree".to_owned()
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), initial_cpu);
+            assert_eq!(env.virtual_allocations, allocations_before);
+        }
+    }
+
+    #[test]
+    fn virtual_free_bad_return_preserves_live_mapping_metadata_and_control() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let allocation = call_virtual_alloc(
+            &mut env,
+            &mut emu,
+            VirtualAllocArgs::observed(4),
+            STACK_BASE + 0x400,
+            0x1000,
+        );
+        emu.write_mem(allocation, &[0xa5; 16]).unwrap();
+        let invalid_rsp = 0x0000_0000_dead_0000;
+        let initial_rax = 0xaaaa_bbbb_cccc_dddd;
+        let initial_rip = 0x1111_2222_3333_4444;
+        prepare_virtual_free_call(
+            &mut emu,
+            allocation,
+            0,
+            u64::from(MEM_RELEASE),
+            invalid_rsp,
+            None,
+        );
+        emu.write_reg(RegisterX86::RAX, initial_rax).unwrap();
+        emu.write_reg(RegisterX86::RIP, initial_rip).unwrap();
+
+        assert!(dispatch(&mut env, &mut emu, "VirtualFree").is_err());
+        assert!(env.virtual_allocations.contains_key(&allocation));
+        assert_eq!(emu.read_mem(allocation, 16).unwrap(), vec![0xa5; 16]);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), initial_rax);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), initial_rip);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), invalid_rsp);
+    }
+
+    #[test]
+    fn virtual_protect_null_committed_page_probe_fails_without_output_write() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let rsp = STACK_BASE + 0x408;
+        let return_address = 0x1234_5678_9abc_def0u64;
+        let old_protection = STACK_BASE + 0x900;
+        let sentinel = 0xaaaa_bbbb_0000_0046u64.to_le_bytes();
+        emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+        emu.write_mem(old_protection, &sentinel).unwrap();
+        seed_sleep_machine_state(&mut emu, 0, rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, 0xaaaa_bbbb_0000_0040)
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, old_protection).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "VirtualProtect").unwrap(),
+            ApiOutcome::Handled {
+                name: "VirtualProtect".to_owned(),
+                ret: 0,
+            }
+        );
+        assert_eq!(
+            emu.read_mem(old_protection, sentinel.len()).unwrap(),
+            sentinel
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+    }
+
+    #[test]
+    fn virtual_protect_rejects_unsupported_protections_and_null_output_before_access() {
+        for (protection, old_protection) in [(0x08, 0xdead_0000), (0x104, 0xdead_0000), (0x20, 0)] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let invalid_rsp = 0x0000_0000_dead_1000;
+            seed_sleep_machine_state(&mut emu, 1, invalid_rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, u64::from(PAGE_SIZE))
+                .unwrap();
+            emu.write_reg(RegisterX86::R8, protection).unwrap();
+            emu.write_reg(RegisterX86::R9, old_protection).unwrap();
+            let machine_before = sleep_machine_state(&emu);
+
+            assert_eq!(
+                dispatch(&mut env, &mut emu, "VirtualProtect").unwrap(),
+                ApiOutcome::Unhandled {
+                    name: "VirtualProtect".to_owned(),
+                }
+            );
+            assert_eq!(sleep_machine_state(&emu), machine_before);
+        }
+    }
+
+    #[test]
+    fn virtual_protect_rejects_overlapping_old_protection_without_mutation() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let base = 0x0000_0000_0738_0000;
+        let output = base + 8;
+        let sentinel = [0xa5; 8];
+        emu.map_zeroed_rw(base, u64::from(PAGE_SIZE)).unwrap();
+        emu.write_mem(output, &sentinel).unwrap();
+        let invalid_rsp = 0x0000_0000_dead_1000;
+        seed_sleep_machine_state(&mut emu, base, invalid_rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, u64::from(PAGE_READONLY))
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, output).unwrap();
+        let machine_before = sleep_machine_state(&emu);
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "VirtualProtect").unwrap(),
+            ApiOutcome::Unhandled {
+                name: "VirtualProtect".to_owned(),
+            }
+        );
+        assert_eq!(sleep_machine_state(&emu), machine_before);
+        assert_eq!(emu.read_mem(output, sentinel.len()).unwrap(), sentinel);
+        emu.write_mem(base, &[0x5a]).unwrap();
+    }
+
+    #[test]
+    fn virtual_protect_changes_rounded_image_pages_and_reports_first_old_protection() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let base = 0x0000_0000_0740_0000;
+        let rsp = STACK_BASE + 0x408;
+        let old_protection = STACK_BASE + 0x900;
+        let sentinel = [0xa5; 8];
+        emu.map_code(base, &vec![0xc3; PAGE_SIZE as usize + 0x200])
+            .unwrap();
+        emu.write_mem(rsp, &0x1111_2222_3333_4444u64.to_le_bytes())
+            .unwrap();
+        emu.write_mem(old_protection, &sentinel).unwrap();
+        seed_sleep_machine_state(&mut emu, base + 0x10, rsp, 0x5555_6666_7777_8888);
+        emu.write_reg(RegisterX86::RDX, 0x1bf0).unwrap();
+        emu.write_reg(
+            RegisterX86::R8,
+            0xaaaa_bbbb_0000_0000 | u64::from(PAGE_READWRITE),
+        )
+        .unwrap();
+        emu.write_reg(RegisterX86::R9, old_protection).unwrap();
+
+        assert_eq!(
+            dispatch(&mut env, &mut emu, "VirtualProtect").unwrap(),
+            ApiOutcome::Handled {
+                name: "VirtualProtect".to_owned(),
+                ret: 1,
+            }
+        );
+        assert_eq!(
+            emu.read_mem(old_protection, sentinel.len()).unwrap(),
+            [PAGE_EXECUTE_READ.to_le_bytes().as_slice(), &sentinel[4..]].concat()
+        );
+        emu.write_mem(base, &[0x90]).unwrap();
+        emu.write_mem(base + u64::from(PAGE_SIZE), &[0x90]).unwrap();
+        let report = emu.resume(base, 1).unwrap();
+        assert!(matches!(
+            report.stop_reason,
+            StopReason::MemoryFault(crate::emu::MemFault {
+                kind: FaultKind::FetchProt,
+                address,
+            }) if address == base
+        ));
+
+        emu.write_mem(rsp, &0x9999_aaaa_bbbb_ccccu64.to_le_bytes())
+            .unwrap();
+        emu.write_mem(old_protection, &sentinel).unwrap();
+        emu.write_reg(RegisterX86::RCX, base).unwrap();
+        emu.write_reg(RegisterX86::RDX, 0x1c00).unwrap();
+        emu.write_reg(RegisterX86::R8, u64::from(PAGE_EXECUTE_READ))
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, old_protection).unwrap();
+        emu.write_reg(RegisterX86::RSP, rsp).unwrap();
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "VirtualProtect").unwrap(),
+            ApiOutcome::Handled { ret: 1, .. }
+        ));
+        assert_eq!(
+            emu.read_mem(old_protection, 4).unwrap(),
+            PAGE_READWRITE.to_le_bytes()
+        );
+        assert!(matches!(
+            emu.write_mem(base, &[0xcc]),
+            Err(EmuError::WriteProt { .. })
+        ));
+        assert_eq!(
+            emu.resume(base, 1).unwrap().stop_reason,
+            StopReason::ReachedInstructionCap
+        );
+    }
+
+    #[test]
+    fn virtual_protect_unmapped_and_overflowing_ranges_fail_without_output_access() {
+        for (address, size) in [(0x0000_0000_0750_0000, 0x1000), (u64::MAX - 7, 16)] {
+            let mut emu = Emu::new().unwrap();
+            let mut env = Win64Env::new(IMAGE_BASE);
+            let rsp = STACK_BASE + 0x408;
+            let return_address = 0x1234_5678_9abc_def0u64;
+            emu.write_mem(rsp, &return_address.to_le_bytes()).unwrap();
+            seed_sleep_machine_state(&mut emu, address, rsp, 0x1111_2222_3333_4444);
+            emu.write_reg(RegisterX86::RDX, size).unwrap();
+            emu.write_reg(RegisterX86::R8, u64::from(PAGE_READWRITE))
+                .unwrap();
+            emu.write_reg(RegisterX86::R9, 0x0000_0000_dead_0000)
+                .unwrap();
+
+            assert!(matches!(
+                dispatch(&mut env, &mut emu, "VirtualProtect").unwrap(),
+                ApiOutcome::Handled { ret: 0, .. }
+            ));
+            assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), return_address);
+            assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), rsp + 8);
+        }
+    }
+
+    #[test]
+    fn virtual_protect_failure_preflights_return_without_touching_output() {
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let protected_base = 0x0000_0000_0760_0000;
+        emu.map_code(protected_base, &[0xc3]).unwrap();
+        let old_protection = STACK_BASE + 0x900;
+        let sentinel = [0x5a; 8];
+        emu.write_mem(old_protection, &sentinel).unwrap();
+        let invalid_rsp = 0x0000_0000_dead_1000;
+        seed_sleep_machine_state(&mut emu, protected_base, invalid_rsp, 0x1111_2222_3333_4444);
+        emu.write_reg(RegisterX86::RDX, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_reg(RegisterX86::R8, u64::from(PAGE_READWRITE))
+            .unwrap();
+        emu.write_reg(RegisterX86::R9, old_protection).unwrap();
+        let machine_before = sleep_machine_state(&emu);
+
+        assert!(matches!(
+            dispatch(&mut env, &mut emu, "VirtualProtect"),
+            Err(EmuError::ReadMem { addr, size: 8, .. }) if addr == invalid_rsp
+        ));
+        assert_eq!(sleep_machine_state(&emu), machine_before);
+        assert_eq!(
+            emu.read_mem(old_protection, sentinel.len()).unwrap(),
+            sentinel
+        );
+        assert!(matches!(
+            emu.write_mem(protected_base, &[0x90]),
+            Err(EmuError::WriteProt { .. })
+        ));
+    }
+
+    #[test]
     fn rtl_allocate_heap_handles_observed_zeroed_page_request() {
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
@@ -8046,6 +13570,208 @@ mod tests {
     }
 
     #[test]
+    fn trap_dispatches_close_handle_via_kernel32_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.ensure_kernel32(&mut emu).unwrap();
+        let stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("CloseHandle")
+            .unwrap();
+        let handle = KERNEL_HANDLE_BASE;
+        env.insert_kernel_handle(
+            handle,
+            handle + KERNEL_HANDLE_STRIDE,
+            KernelHandle {
+                object: KernelObject::ProcessToken,
+                desired_access: TOKEN_QUERY,
+                inheritable: false,
+            },
+        );
+        emu.write_reg(RegisterX86::RCX, handle).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["CloseHandle".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert!(!env.kernel_handles.contains_key(&handle));
+    }
+
+    #[test]
+    fn trap_dispatches_is_bad_read_ptr_via_kernel32_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.ensure_kernel32(&mut emu).unwrap();
+        let stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("IsBadReadPtr")
+            .unwrap();
+        let pointer = STACK_BASE + 0x900;
+        emu.write_mem(pointer, &[0xde, 0xad, 0xbe, 0xef]).unwrap();
+        emu.write_reg(RegisterX86::RCX, pointer).unwrap();
+        emu.write_reg(RegisterX86::RDX, 4).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["IsBadReadPtr".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), pointer);
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), 4);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(
+            emu.read_mem(pointer, 4).unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+    }
+
+    #[test]
+    fn trap_dispatches_allocate_and_initialize_sid_via_advapi32_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let advapi = env.ensure_loaded_module(&mut emu, "advapi32.dll").unwrap();
+        let stub = env
+            .export_stub_by_base(advapi, "AllocateAndInitializeSid")
+            .unwrap();
+        let authority_page = IMAGE_BASE + u64::from(DATA_RVA);
+        let authority = authority_page + 0x100;
+        emu.map_zeroed_rw(authority_page, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_mem(authority, &[0, 0, 0, 0, 0, 5]).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let output = STACK_BASE + 0x900;
+        emu.write_mem(initial_rsp + 0x50, &output.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, authority).unwrap();
+        emu.write_reg(RegisterX86::RDX, 2).unwrap();
+        emu.write_reg(RegisterX86::R8, 0x20).unwrap();
+        emu.write_reg(RegisterX86::R9, 0x220).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["AllocateAndInitializeSid".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        let sid = read_u64_le(&emu.read_mem(output, 8).unwrap());
+        assert_eq!(sid, SID_ALLOCATION_ARENA_BASE);
+        assert_eq!(
+            emu.read_mem(sid, 16).unwrap(),
+            vec![1, 2, 0, 0, 0, 0, 0, 5, 0x20, 0, 0, 0, 0x20, 2, 0, 0]
+        );
+    }
+
+    #[test]
+    fn trap_dispatches_free_sid_via_advapi32_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let advapi = env.ensure_loaded_module(&mut emu, "advapi32.dll").unwrap();
+        let stub = env.export_stub_by_base(advapi, "FreeSid").unwrap();
+        let sid = SID_ALLOCATION_ARENA_BASE;
+        env.commit_sid_allocation(
+            sid,
+            sid + u64::from(PAGE_SIZE),
+            SidAllocation {
+                sid_size: 16,
+                mapped_size: u64::from(PAGE_SIZE),
+                sub_authority_count: 2,
+            },
+        );
+        emu.write_reg(RegisterX86::RCX, sid).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["FreeSid".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert!(!env.sid_allocations.contains_key(&sid));
+    }
+
+    #[test]
+    fn trap_dispatches_reg_open_key_a_via_advapi32_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let advapi = env.ensure_loaded_module(&mut emu, "advapi32.dll").unwrap();
+        let stub = env
+            .export_stub_by_base(advapi, "RegOpenKeyA")
+            .expect("RegOpenKeyA seed");
+        let subkey = STACK_BASE + 0x900;
+        let output = STACK_BASE + 0xa00;
+        let output_before = [0xa5; 16];
+        emu.write_mem(subkey, b"SOFTWARE\\Midas\0").unwrap();
+        emu.write_mem(output, &output_before).unwrap();
+        emu.write_reg(RegisterX86::RCX, HKEY_LOCAL_MACHINE).unwrap();
+        emu.write_reg(RegisterX86::RDX, subkey).unwrap();
+        emu.write_reg(RegisterX86::R8, output).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["RegOpenKeyA".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RAX).unwrap(),
+            u64::from(ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RCX).unwrap(), HKEY_LOCAL_MACHINE);
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), subkey);
+        assert_eq!(emu.read_reg(RegisterX86::R8).unwrap(), output);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(emu.read_mem(output, 16).unwrap(), output_before);
+    }
+
+    #[test]
     fn trap_dispatches_current_pseudo_handles_via_export_stubs() {
         for (name, expected) in [
             ("GetCurrentProcess", CURRENT_PROCESS_PSEUDO_HANDLE),
@@ -8080,6 +13806,57 @@ mod tests {
                 image.entry_point_va() + 12
             );
             assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        }
+    }
+
+    #[test]
+    fn trap_dispatches_get_thread_context_via_kernel32_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.ensure_kernel32(&mut emu).unwrap();
+        let stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("GetThreadContext")
+            .unwrap();
+        let context = STACK_BASE + 0x800;
+        emu.write_mem(
+            context + AMD64_CONTEXT_FLAGS_OFFSET as u64,
+            &CONTEXT_AMD64_DEBUG_REGISTERS.to_le_bytes(),
+        )
+        .unwrap();
+        for &offset in &AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS {
+            emu.write_mem(
+                context + offset as u64,
+                &0xfeed_face_cafe_beef_u64.to_le_bytes(),
+            )
+            .unwrap();
+        }
+        emu.write_reg(RegisterX86::RCX, CURRENT_THREAD_PSEUDO_HANDLE)
+            .unwrap();
+        emu.write_reg(RegisterX86::RDX, context).unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["GetThreadContext".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(
+            read_u32_at(&emu, context + AMD64_CONTEXT_FLAGS_OFFSET as u64).unwrap(),
+            CONTEXT_AMD64_DEBUG_REGISTERS
+        );
+        for &offset in &AMD64_CONTEXT_DEBUG_REGISTER_OFFSETS {
+            assert_eq!(read_u64_at(&emu, context + offset as u64).unwrap(), 0);
         }
     }
 
@@ -8407,6 +14184,32 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_user32_send_message_a_remains_a_names_only_boundary() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let user32 = env.ensure_loaded_module(&mut emu, "user32.dll").unwrap();
+        let module = env.synthetic_modules.get("user32.dll").unwrap();
+        let rva = *module.exports.get("SendMessageA").unwrap();
+        let stub = user32 + u64::from(rva);
+        assert_eq!(
+            env.callable_stub_name_at(stub).as_deref(),
+            Some("SendMessageA")
+        );
+
+        let result = run_with_import_trap(&mut env, &mut emu, &image, stub, 32, 8).unwrap();
+
+        assert!(result.handled.is_empty());
+        assert_eq!(
+            result.stop,
+            TrapStop::UnhandledApi {
+                name: "SendMessageA".to_owned(),
+                rva,
+            }
+        );
+    }
+
+    #[test]
     fn synthetic_kernel32_export_traps_get_command_line_a() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
@@ -8477,7 +14280,13 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["CreateWindowExA", "LoadCursorA", "RegisterClassExA"]
+            vec![
+                "CreateWindowExA",
+                "FindWindowA",
+                "LoadCursorA",
+                "RegisterClassExA",
+                "SendMessageA"
+            ]
         );
         let stub = module.export_stub("LoadCursorA").unwrap();
         assert_eq!(
@@ -8520,6 +14329,57 @@ mod tests {
             emu.read_reg(RegisterX86::RDX).unwrap(),
             PREDEFINED_HAND_CURSOR_ID
         );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn synthetic_user32_export_traps_find_window_a() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let user32_base = env.ensure_loaded_module(&mut emu, "user32.dll").unwrap();
+        let stub = env
+            .export_stub_by_base(user32_base, "FindWindowA")
+            .expect("FindWindowA seed");
+        assert_eq!(
+            env.callable_stub_name_at(stub).as_deref(),
+            Some("FindWindowA")
+        );
+        assert_eq!(
+            env.resolve_proc(&mut emu, user32_base, "FindWindowA")
+                .unwrap(),
+            stub
+        );
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"GeneralClass\0")
+            .unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]); // sub rsp,20h
+        code.extend_from_slice(&[0x48, 0xb9]); // mov rcx,selector
+        code.extend_from_slice(&WINDOW_CLASS_NAME_ADDRESS.to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xd2]); // xor edx,edx
+        code.extend_from_slice(&[0x49, 0xbb]); // mov r11,stub
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11
+        code.extend_from_slice(&[0x48, 0x83, 0xc4, 0x20]); // add rsp,20h
+        code.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["FindWindowA".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RCX).unwrap(),
+            WINDOW_CLASS_NAME_ADDRESS
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), 0);
         assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
         assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
     }
@@ -8989,6 +14849,46 @@ mod tests {
     }
 
     #[test]
+    fn trap_dispatches_zw_query_information_process_via_ntdll_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let ntdll = env.ensure_loaded_module(&mut emu, "ntdll.dll").unwrap();
+        let stub = env
+            .export_stub_by_base(ntdll, "ZwQueryInformationProcess")
+            .unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let output = STACK_BASE + 0x900;
+        emu.write_mem(initial_rsp + 0x20, &0u64.to_le_bytes())
+            .unwrap();
+        emu.write_mem(output, &[0xaa; 16]).unwrap();
+        emu.write_reg(RegisterX86::RCX, CURRENT_PROCESS_PSEUDO_HANDLE)
+            .unwrap();
+        emu.write_reg(
+            RegisterX86::RDX,
+            PROCESS_INFORMATION_CLASS_DEBUG_PORT.into(),
+        )
+        .unwrap();
+        emu.write_reg(RegisterX86::R8, output).unwrap();
+        emu.write_reg(RegisterX86::R9, 8).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["ZwQueryInformationProcess".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(&emu.read_mem(output, 16).unwrap()[..8], &[0; 8]);
+        assert_eq!(&emu.read_mem(output, 16).unwrap()[8..], &[0xaa; 8]);
+    }
+
+    #[test]
     fn trap_dispatches_name_resolved_ntdll_rtl_add_vectored_exception_handler_stub() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
@@ -9037,6 +14937,7 @@ mod tests {
             env.vectored_exception_handlers,
             vec![VectoredExceptionHandlerRegistration {
                 token,
+                first: 1,
                 handler: observed_handler,
             }]
         );
@@ -9103,8 +15004,11 @@ mod tests {
     #[test]
     fn synthetic_kernel32_stub_region_is_readable() {
         let mut emu = Emu::new().unwrap();
-        let module =
-            SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", KERNEL32_EXPORTS);
+        let module = SyntheticModule::build(
+            FAKE_MODULE_BASE_START,
+            "kernel32.dll",
+            KERNEL32_EXPORTS.as_slice(),
+        );
         let stub_rva = *module.exports.get("VirtualAlloc").unwrap();
         let stub_addr = module.base + u64::from(stub_rva);
         module.map_into(&mut emu).unwrap();
@@ -9209,8 +15113,11 @@ mod tests {
 
     #[test]
     fn stub_name_reverse_maps_resolved_export() {
-        let module =
-            SyntheticModule::build(FAKE_MODULE_BASE_START, "kernel32.dll", KERNEL32_EXPORTS);
+        let module = SyntheticModule::build(
+            FAKE_MODULE_BASE_START,
+            "kernel32.dll",
+            KERNEL32_EXPORTS.as_slice(),
+        );
         let rva = *module.exports.get("VirtualAlloc").unwrap();
 
         assert_eq!(
@@ -9515,7 +15422,8 @@ mod tests {
         let kernel32_base = env.ensure_kernel32(&mut emu).unwrap();
 
         let mut data = vec![0u8; 0x1000];
-        data[..b"SetLastError\0".len()].copy_from_slice(b"SetLastError\0");
+        data[..b"MidasDynamicProcedureForTest\0".len()]
+            .copy_from_slice(b"MidasDynamicProcedureForTest\0");
         emu.map_code(IMAGE_BASE + u64::from(DATA_RVA), &data)
             .unwrap();
 
@@ -9748,41 +15656,132 @@ mod tests {
     }
 
     #[test]
-    fn trap_reports_unhandled_kernel32_export_call_by_name() {
+    fn trap_dispatches_virtual_alloc_via_kernel32_export_stub() {
         let image = test_image();
         let mut emu = Emu::new().unwrap();
         let mut env = Win64Env::new(IMAGE_BASE);
-        env.ensure_module(&mut emu, "kernel32.dll", KERNEL32_EXPORTS)
+        env.ensure_module(&mut emu, "kernel32.dll", KERNEL32_EXPORTS.as_slice())
             .unwrap();
         let module = env.synthetic_modules.get("kernel32.dll").unwrap();
         let virtual_alloc_rva = *module.exports.get("VirtualAlloc").unwrap();
         let virtual_alloc_addr = module.base + u64::from(virtual_alloc_rva);
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
 
         let mut code = Vec::new();
-        code.extend_from_slice(&[0x48, 0xb9]);
-        code.extend_from_slice(&(IMAGE_BASE + u64::from(DATA_RVA)).to_le_bytes());
-        code.extend_from_slice(&[0x48, 0xb8]);
-        code.extend_from_slice(&u64::from(IMPORT_RVA).to_le_bytes());
-        code.extend_from_slice(&[0xff, 0xd0]);
+        code.extend_from_slice(&[0x31, 0xc9]); // xor ecx,ecx
+        code.push(0xba); // mov edx,4
+        code.extend_from_slice(&4u32.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xb8]); // mov r8d,MEM_COMMIT
+        code.extend_from_slice(&MEM_COMMIT.to_le_bytes());
+        code.extend_from_slice(&[0x41, 0xb9]); // mov r9d,PAGE_READWRITE
+        code.extend_from_slice(&PAGE_READWRITE.to_le_bytes());
         code.extend_from_slice(&[0x48, 0xb8]);
         code.extend_from_slice(&virtual_alloc_addr.to_le_bytes());
         code.extend_from_slice(&[0xff, 0xd0]);
+        code.extend_from_slice(&[0xc7, 0x00, 0x11, 0x22, 0x33, 0x44]);
         code.extend_from_slice(&[0xeb, 0xfe]);
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
 
         emu.map_code(image.entry_point_va(), &code).unwrap();
-        map_import_name(&mut emu);
-        map_module_name(&mut emu);
 
         let result =
             run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
                 .unwrap();
 
-        assert_eq!(result.handled, vec!["GetModuleHandleA".to_owned()]);
+        assert_eq!(result.handled, vec!["VirtualAlloc".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        let allocation = emu.read_reg(RegisterX86::RAX).unwrap();
+        assert_eq!(allocation, VIRTUAL_ALLOCATION_ARENA_BASE);
+        assert_eq!(
+            env.virtual_allocations.get(&allocation),
+            Some(&VirtualAllocation {
+                requested_size: 4,
+                mapped_size: u64::from(PAGE_SIZE),
+                allocation_type: MEM_COMMIT,
+                protection: PAGE_READWRITE,
+            })
+        );
+        assert_eq!(
+            emu.read_mem(allocation, 8).unwrap(),
+            vec![0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0]
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_virtual_free_via_kernel32_export_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.ensure_kernel32(&mut emu).unwrap();
+        let stub = env
+            .synthetic_modules
+            .get("kernel32.dll")
+            .unwrap()
+            .export_stub("VirtualFree")
+            .unwrap();
+        let allocation = VIRTUAL_ALLOCATION_ARENA_BASE;
+        emu.map_zeroed_rw(allocation, u64::from(PAGE_SIZE)).unwrap();
+        env.virtual_allocations.insert(
+            allocation,
+            VirtualAllocation {
+                requested_size: 4,
+                mapped_size: u64::from(PAGE_SIZE),
+                allocation_type: MEM_COMMIT,
+                protection: PAGE_READWRITE,
+            },
+        );
+        env.virtual_allocation_cursor = allocation + VIRTUAL_ALLOCATION_GRANULARITY;
+        emu.write_reg(RegisterX86::RCX, allocation).unwrap();
+        emu.write_reg(RegisterX86::RDX, 0).unwrap();
+        emu.write_reg(RegisterX86::R8, u64::from(MEM_RELEASE))
+            .unwrap();
+        let initial_rsp = emu.read_reg(RegisterX86::RSP).unwrap();
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["VirtualFree".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 1);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert!(!env.virtual_allocations.contains_key(&allocation));
+        assert!(emu.read_mem(allocation, 1).is_err());
+    }
+
+    #[test]
+    fn trap_reports_other_unhandled_kernel32_export_call_by_name() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        env.ensure_module(&mut emu, "kernel32.dll", KERNEL32_EXPORTS.as_slice())
+            .unwrap();
+        let module = env.synthetic_modules.get("kernel32.dll").unwrap();
+        let virtual_protect_rva = *module.exports.get("VirtualProtect").unwrap();
+        let virtual_protect_addr = module.base + u64::from(virtual_protect_rva);
+
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&virtual_protect_addr.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert!(result.handled.is_empty());
         assert_eq!(
             result.stop,
             TrapStop::UnhandledApi {
-                name: "VirtualAlloc".to_owned(),
-                rva: virtual_alloc_rva
+                name: "VirtualProtect".to_owned(),
+                rva: virtual_protect_rva
             }
         );
     }
@@ -9796,7 +15795,8 @@ mod tests {
         // ensure_kernel32 path does), so the subsequent user32 load gets a
         // DISTINCT base instead of aliasing kernel32's.
         let kernel32_base = env.module_base("kernel32.dll");
-        let module = SyntheticModule::build(kernel32_base, "kernel32.dll", KERNEL32_EXPORTS);
+        let module =
+            SyntheticModule::build(kernel32_base, "kernel32.dll", KERNEL32_EXPORTS.as_slice());
         let load_library_rva = *module.exports.get("LoadLibraryA").unwrap();
         let load_library_addr = module.base + u64::from(load_library_rva);
         module.map_into(&mut emu).unwrap();
@@ -9828,6 +15828,123 @@ mod tests {
         let user32_base = emu.read_reg(RegisterX86::RAX).unwrap();
         assert_ne!(user32_base, 0);
         assert_ne!(user32_base, kernel32_base);
+    }
+
+    #[test]
+    fn trap_dispatches_is_user_an_admin_resolved_from_loaded_shell32() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let shell32 = env.ensure_loaded_module(&mut emu, "shell32.dll").unwrap();
+        let name_address = IMAGE_BASE + u64::from(DATA_RVA);
+        emu.map_code(name_address, b"IsUserAnAdmin\0").unwrap();
+        let get_proc_rsp = STACK_BASE + 0x500;
+        emu.write_mem(get_proc_rsp, &0x1234_5678_9abc_def0u64.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, shell32).unwrap();
+        emu.write_reg(RegisterX86::RDX, name_address).unwrap();
+        emu.write_reg(RegisterX86::RSP, get_proc_rsp).unwrap();
+        let outcome = dispatch(&mut env, &mut emu, "GetProcAddress").unwrap();
+        let ApiOutcome::Handled { ret: stub, .. } = outcome else {
+            panic!("expected GetProcAddress to resolve IsUserAnAdmin");
+        };
+        assert_ne!(stub, 0);
+        assert_eq!(env.proc_stubs.get("IsUserAnAdmin"), Some(&stub));
+
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+        let run_rsp = STACK_BASE + 0x808;
+        emu.write_reg(RegisterX86::RSP, run_rsp).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 64, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["IsUserAnAdmin".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), run_rsp);
+    }
+
+    #[test]
+    fn trap_dispatches_dynamic_nt_query_system_information_stub() {
+        let image = test_image();
+        let mut emu = Emu::new().unwrap();
+        let mut env = Win64Env::new(IMAGE_BASE);
+        let ntdll = env.ensure_loaded_module(&mut emu, "ntdll.dll").unwrap();
+        assert!(!NTDLL_EXPORTS.contains(&"NtQuerySystemInformation"));
+        assert!(env
+            .synthetic_modules
+            .get("ntdll.dll")
+            .unwrap()
+            .export_stub("NtQuerySystemInformation")
+            .is_none());
+
+        emu.write_mem(WINDOW_CLASS_NAME_ADDRESS, b"NtQuerySystemInformation\0")
+            .unwrap();
+        let lookup_rsp = STACK_BASE + 0x500;
+        emu.write_mem(lookup_rsp, &0x1234_5678_9abc_def0_u64.to_le_bytes())
+            .unwrap();
+        emu.write_reg(RegisterX86::RCX, ntdll).unwrap();
+        emu.write_reg(RegisterX86::RDX, WINDOW_CLASS_NAME_ADDRESS)
+            .unwrap();
+        emu.write_reg(RegisterX86::RSP, lookup_rsp).unwrap();
+        let lookup = dispatch(&mut env, &mut emu, "GetProcAddress").unwrap();
+        let ApiOutcome::Handled { ret: stub, .. } = lookup else {
+            panic!("expected GetProcAddress to resolve dynamic stub");
+        };
+        assert_eq!(env.proc_stubs.get("NtQuerySystemInformation"), Some(&stub));
+        assert!(env.stub_export_at(stub).is_none());
+        assert_eq!(
+            env.proc_stub_at(stub).map(|(name, _)| name),
+            Some("NtQuerySystemInformation".to_owned())
+        );
+
+        let information = VIRTUAL_ALLOCATION_ARENA_BASE;
+        emu.map_zeroed_rw(information, u64::from(PAGE_SIZE))
+            .unwrap();
+        emu.write_mem(information, &[0xa5; 8]).unwrap();
+        let initial_rsp = STACK_BASE + 0x808;
+        let mut code = Vec::new();
+        code.extend_from_slice(&[0x48, 0xb9]); // mov rcx,class
+        code.extend_from_slice(&0xaaaa_bbbb_0000_000b_u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xba]); // mov rdx,buffer
+        code.extend_from_slice(&information.to_le_bytes());
+        code.extend_from_slice(&[0x49, 0xb8]); // mov r8,length
+        code.extend_from_slice(&0xcccc_dddd_0001_0000_u64.to_le_bytes());
+        code.extend_from_slice(&[0x45, 0x31, 0xc9]); // xor r9d,r9d
+        code.extend_from_slice(&[0x48, 0xb8]); // mov rax,stub
+        code.extend_from_slice(&stub.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]); // call rax; jmp $
+        let loop_address = image.entry_point_va() + code.len() as u64 - 2;
+        emu.map_code(image.entry_point_va(), &code).unwrap();
+        emu.write_reg(RegisterX86::RSP, initial_rsp).unwrap();
+
+        let result =
+            run_with_import_trap(&mut env, &mut emu, &image, image.entry_point_va(), 128, 8)
+                .unwrap();
+
+        assert_eq!(result.handled, vec!["NtQuerySystemInformation".to_owned()]);
+        assert_eq!(result.stop, TrapStop::InstructionCap);
+        assert_eq!(emu.read_reg(RegisterX86::RAX).unwrap(), 0);
+        assert_eq!(
+            emu.read_reg(RegisterX86::RCX).unwrap(),
+            0xaaaa_bbbb_0000_000b
+        );
+        assert_eq!(emu.read_reg(RegisterX86::RDX).unwrap(), information);
+        assert_eq!(
+            emu.read_reg(RegisterX86::R8).unwrap(),
+            0xcccc_dddd_0001_0000
+        );
+        assert_eq!(emu.read_reg(RegisterX86::R9).unwrap(), 0);
+        assert_eq!(emu.read_reg(RegisterX86::RIP).unwrap(), loop_address);
+        assert_eq!(emu.read_reg(RegisterX86::RSP).unwrap(), initial_rsp);
+        assert_eq!(
+            emu.read_mem(information, 8).unwrap(),
+            vec![0, 0, 0, 0, 0xa5, 0xa5, 0xa5, 0xa5]
+        );
     }
 
     #[test]

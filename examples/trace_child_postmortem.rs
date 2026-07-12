@@ -44,8 +44,11 @@ const POST_POLL_API_BOUND: usize = 16;
 const POST_POLL_TAIL_LEN: usize = 64;
 const POST_POLL_API_NAME: &str = "GetCommandLineA";
 const POST_CREATE_CHILD_API_NAME: &str = "RtlFreeHeap";
-const PRODUCTION_API_BOUND: usize = 200;
-const PRODUCTION_TERMINAL_SUFFIX_TRACE_CAP: u64 = 1_000_000;
+const PRODUCTION_API_BOUND: usize = 512;
+// Broad names-only controls can lengthen one protected export walk by several
+// million instructions. Keep this diagnostic suffix finite while allowing the
+// exact production terminal to remain reproducible under those controls.
+const PRODUCTION_TERMINAL_SUFFIX_TRACE_CAP: u64 = 8_000_000;
 const PRODUCTION_TERMINAL_TAIL_LEN: usize = 64;
 
 const CHILD_STACK_BASE: u64 = 0x0000_000f_5000_0000;
@@ -878,6 +881,9 @@ fn run_production_terminal(config: &Config, image: &PeImage, bytes: &[u8]) -> Re
         .synthetic_module_image_ranges()
         .map(|(name, start, end)| (name.to_owned(), start, end))
         .collect::<Vec<_>>();
+    let vectored_exception_handlers = discovery_env
+        .vectored_exception_handler_registrations()
+        .collect::<Vec<_>>();
     if matches!(&discovery.stop, TrapStop::InstructionCap)
         || matches!(&discovery.stop, TrapStop::Other(message) if message == "max_calls reached")
     {
@@ -969,6 +975,16 @@ fn run_production_terminal(config: &Config, image: &PeImage, bytes: &[u8]) -> Re
         ));
     }
     let terminal_registers = read_cpu_state(&traced_emu)?;
+    let terminal_rsp = register_value(&terminal_registers, RegisterX86::RSP)
+        .ok_or_else(|| "production terminal snapshot is missing RSP".to_owned())?;
+    let terminal_stack_qwords = (0..=12)
+        .map(|index| {
+            let address = terminal_rsp
+                .checked_add(index * 8)
+                .ok_or_else(|| "production terminal stack observation overflows".to_owned())?;
+            read_u64(&traced_emu, address)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let transfer = classify_production_terminal_transfer(
         &traced_emu,
         &discovery.stop,
@@ -984,6 +1000,14 @@ fn run_production_terminal(config: &Config, image: &PeImage, bytes: &[u8]) -> Re
     }
     let tail_instructions = format_tail(&frozen_tail, &suffix_rips, PRODUCTION_TERMINAL_TAIL_LEN)?;
     let terminal_stub_name = traced_env.callable_stub_name_at(transfer.target_value());
+    let traced_vectored_exception_handlers = traced_env
+        .vectored_exception_handler_registrations()
+        .collect::<Vec<_>>();
+    if traced_vectored_exception_handlers != vectored_exception_handlers {
+        return Err(format!(
+            "production terminal handler registrations diverged: discovery={vectored_exception_handlers:?}, replay={traced_vectored_exception_handlers:?}"
+        ));
+    }
     let consumed_edge = match transfer.consumed_cell() {
         Some(consumed_cell) => Some(replay_production_consumed_cell(
             config,
@@ -1005,7 +1029,9 @@ fn run_production_terminal(config: &Config, image: &PeImage, bytes: &[u8]) -> Re
         discovery_total,
         suffix_cap,
         &synthetic_module_image_ranges,
+        &vectored_exception_handlers,
         &terminal_registers,
+        &terminal_stack_qwords,
         &frozen_tail,
         &tail_instructions,
         transfer,
@@ -4529,7 +4555,9 @@ fn print_production_terminal_summary(
     total_instructions: u64,
     suffix_cap: u64,
     synthetic_module_image_ranges: &[(String, u64, u64)],
+    vectored_exception_handlers: &[(usize, u64, u32, u64)],
     terminal_registers: &[(RegisterX86, u64)],
+    terminal_stack_qwords: &[u64],
     frozen_tail: &[FrozenInstruction],
     tail: &[FormattedInstruction],
     transfer: ProductionTerminalTransfer,
@@ -4556,6 +4584,15 @@ fn print_production_terminal_summary(
     );
     println!("stop:                  {:?}", discovery.stop);
     println!("total_instructions:    {total_instructions}");
+    println!(
+        "vectored_handlers:     {}",
+        vectored_exception_handlers.len()
+    );
+    for &(order, token, first, handler) in vectored_exception_handlers {
+        println!(
+            "  veh[{order}]: token=0x{token:016x} first=0x{first:08x} handler=0x{handler:016x}"
+        );
+    }
     println!("terminal_tail_rips:    {}", tail.len());
     println!("terminal_tail_digest:  0x{:016x}", trace_digest(&tail_rips));
     println!(
@@ -4630,6 +4667,10 @@ fn print_production_terminal_summary(
     println!(
         "terminal_registers:    {}",
         format_registers(terminal_registers)
+    );
+    println!(
+        "terminal_stack_qwords: [{}]",
+        format_qwords(terminal_stack_qwords)
     );
     println!(
         "terminal_fs_gs:        fs_base=0x{:016x} gs_base=0x{:016x}",
